@@ -11,7 +11,7 @@
 #include <stdint.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <linux/dma-heap.h>
+#include "drm-uapi/dma-heap.h"
 
 #include "msm_kgsl.h"
 #include "ion/ion.h"
