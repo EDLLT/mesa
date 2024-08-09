@@ -2337,7 +2337,7 @@ x11_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
       vk_free(pAllocator, chain);
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
-   /*
+
    bool bret = wsi_init_pthread_cond_monotonic(&chain->present_progress_cond);
    if (!bret) {
       pthread_mutex_destroy(&chain->present_progress_mutex);
@@ -2345,7 +2345,7 @@ x11_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
       vk_free(pAllocator, chain);
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
-   */
+
    struct wsi_base_image_params *image_params = NULL;
    struct wsi_cpu_image_params cpu_image_params;
    struct wsi_drm_image_params drm_image_params;

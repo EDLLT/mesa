@@ -281,6 +281,9 @@ struct wsi_device_options {
    bool extra_xwayland_image;
 };
 
+bool
+wsi_init_pthread_cond_monotonic(pthread_cond_t* cond);
+
 VkResult
 wsi_device_init(struct wsi_device *wsi,
                 VkPhysicalDevice pdevice,
