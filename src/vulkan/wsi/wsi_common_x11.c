@@ -1476,7 +1476,6 @@ x11_present_to_x11_dri3(struct x11_swapchain *chain, uint32_t image_index,
       free(error);
       return x11_swapchain_result(chain, VK_ERROR_SURFACE_LOST_KHR);
    }
-
    return x11_swapchain_result(chain, VK_SUCCESS);
 }
 
@@ -1942,15 +1941,24 @@ x11_image_init(VkDevice device_h, struct x11_swapchain *chain,
       int fd = os_dupfd_cloexec(image->base.dma_buf_fd);
       if (fd == -1)
          return VK_ERROR_OUT_OF_HOST_MEMORY;
+      xcb_dri3_pixmap_from_buffers_checked(chain->conn,
+                                           image->pixmap,
+                                           chain->window,
+                                           image->base.num_planes,
+                                           pCreateInfo->imageExtent.width,
+                                           pCreateInfo->imageExtent.height,
+                                           image->base.row_pitches[0],
+                                           image->base.offsets[0],
+                                           0,
+                                           0,
+                                           0,
+                                           0,
+                                           0,
+                                           0,
+                                           chain->depth, bpp,
+                                           1274,
+                                           &fd);
 
-      xcb_dri3_pixmap_from_buffer_checked(chain->conn,
-                                          image->pixmap,
-                                          chain->window,
-                                          image->base.sizes[0],
-                                          pCreateInfo->imageExtent.width,
-                                          pCreateInfo->imageExtent.height,
-                                          image->base.row_pitches[0],
-                                          chain->depth, bpp, fd);
    }
    
    image->sync_fence = xcb_generate_id(chain->conn);
@@ -1970,7 +1978,6 @@ x11_image_finish(struct x11_swapchain *chain,
    if (!chain->base.wsi->sw) {
       cookie = xcb_sync_destroy_fence(chain->conn, image->sync_fence);
       xcb_discard_reply(chain->conn, cookie.sequence);
-
       cookie = xcb_free_pixmap(chain->conn, image->pixmap);
       xcb_discard_reply(chain->conn, cookie.sequence);
    }
