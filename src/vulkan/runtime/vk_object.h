@@ -117,7 +117,9 @@ static inline void
 vk_object_base_assert_valid(ASSERTED struct vk_object_base *base,
                             ASSERTED VkObjectType obj_type)
 {
+   #if !defined(__TERMUX__)
    assert(base == NULL || base->type == obj_type);
+   #endif
 }
 
 static inline struct vk_object_base *

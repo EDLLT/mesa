@@ -1,5 +1,5 @@
 /* MESA: A hack to avoid #ifdefs in driver code. */
-#ifdef __ANDROID__
+#if defined __ANDROID__ && !defined(__TERMUX__)
 
 #include <cutils/native_handle.h>
 #if ANDROID_API_LEVEL < 28

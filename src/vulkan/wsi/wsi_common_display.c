@@ -1340,8 +1340,9 @@ wsi_display_wait_thread(void *data)
       .fd = wsi->fd,
       .events = POLLIN
    };
-
+   #if !defined(__TERMUX__)
    pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+   #endif
    for (;;) {
       int ret = poll(&pollfd, 1, -1);
       if (ret > 0) {
@@ -1371,7 +1372,9 @@ wsi_display_stop_wait_thread(struct wsi_display *wsi)
 {
    mtx_lock(&wsi->wait_mutex);
    if (wsi->wait_thread) {
+      #if !defined(__TERMUX__)
       pthread_cancel(wsi->wait_thread);
+      #endif
       pthread_join(wsi->wait_thread, NULL);
       wsi->wait_thread = 0;
    }
@@ -2351,7 +2354,9 @@ wsi_display_finish_wsi(struct wsi_device *wsi_device,
       wsi_display_stop_wait_thread(wsi);
 
       if (wsi->hotplug_thread) {
+         #if !defined(__TERMUX__)
          pthread_cancel(wsi->hotplug_thread);
+         #endif
          pthread_join(wsi->hotplug_thread, NULL);
       }
 

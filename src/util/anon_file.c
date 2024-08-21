@@ -37,7 +37,11 @@
 #include <errno.h>
 #include <stdlib.h>
 
-#if defined(HAVE_MEMFD_CREATE) || defined(__FreeBSD__) || defined(__OpenBSD__)
+#if defined(__TERMUX__)
+#include <sys/syscall.h>
+#include <linux/memfd.h>
+#include <bits/glibc-syscalls.h>
+#elif defined(HAVE_MEMFD_CREATE) || defined(__FreeBSD__) || defined(__OpenBSD__)
 #include <sys/mman.h>
 #elif DETECT_OS_ANDROID
 #include <sys/syscall.h>
@@ -117,11 +121,11 @@ int
 os_create_anonymous_file(int64_t size, const char *debug_name)
 {
    int fd, ret;
-#if defined(HAVE_MEMFD_CREATE)
+#if defined(HAVE_MEMFD_CREATE) && !defined(__TERMUX__)
    if (!debug_name)
       debug_name = "mesa-shared";
    fd = memfd_create(debug_name, MFD_CLOEXEC | MFD_ALLOW_SEALING);
-#elif DETECT_OS_ANDROID
+#elif DETECT_OS_ANDROID || defined(__TERMUX__)
    if (!debug_name)
       debug_name = "mesa-shared";
    fd = syscall(SYS_memfd_create, debug_name, MFD_CLOEXEC | MFD_ALLOW_SEALING);

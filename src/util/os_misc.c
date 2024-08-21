@@ -52,7 +52,7 @@
 #endif
 
 
-#if DETECT_OS_ANDROID
+#if DETECT_OS_ANDROID && !defined(__TERMUX__)
 #  define LOG_TAG "MESA"
 #  include <unistd.h>
 #  include <log/log.h>
@@ -130,13 +130,13 @@ os_log_message(const char *message)
    fflush(stdout);
    fputs(message, fout);
    fflush(fout);
-#  if DETECT_OS_ANDROID
+#  if DETECT_OS_ANDROID && !defined(__TERMUX__)
    LOG_PRI(ANDROID_LOG_ERROR, LOG_TAG, "%s", message);
 #  endif
 #endif
 }
 
-#if DETECT_OS_ANDROID
+#if DETECT_OS_ANDROID && !defined(__TERMUX__)
 #  include <ctype.h>
 #  include "c11/threads.h"
 
@@ -203,7 +203,7 @@ const char *
 os_get_option(const char *name)
 {
    const char *opt = getenv(name);
-#if DETECT_OS_ANDROID
+#if DETECT_OS_ANDROID && !defined(__TERMUX__)
    if (!opt) {
       opt = os_get_android_option(name);
    }

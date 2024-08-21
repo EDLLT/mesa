@@ -12,7 +12,9 @@
 extern "C" {
 #endif
 
+#if !defined(__TERMUX__)
 #include <cutils/native_handle.h>
+
 
 #include <stdbool.h>
 
@@ -75,6 +77,8 @@ int u_gralloc_get_front_rendering_usage(struct u_gralloc *gralloc,
                                         uint64_t *out_usage);
 
 int u_gralloc_get_type(struct u_gralloc *gralloc);
+
+#endif
 
 #ifdef __cplusplus
 }

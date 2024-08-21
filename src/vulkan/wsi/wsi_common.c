@@ -28,7 +28,9 @@
 #include "util/os_file.h"
 #include "util/os_time.h"
 #include "util/xmlconfig.h"
+#if !defined(__TERMUX__)
 #include <bits/pthreadtypes.h>
+#endif
 #include "vk_device.h"
 #include "vk_fence.h"
 #include "vk_format.h"

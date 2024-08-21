@@ -58,7 +58,7 @@
  *
  *   https://github.com/android/ndk/issues/1178
  */
-#elif DETECT_OS_ANDROID && !defined(__cplusplus)
+#elif DETECT_OS_ANDROID && !defined(__cplusplus) && !defined(__TERMUX__)
 
 #include <cutils/trace.h>
 

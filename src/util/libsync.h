@@ -44,7 +44,7 @@
 extern "C" {
 #endif
 
-#if DETECT_OS_ANDROID
+#if DETECT_OS_ANDROID && !defined(__TERMUX__)
 /* On Android, rely on the system's libsync instead of rolling our own
  * sync_wait() and sync_merge().  This gives us compatibility with pre-4.7
  * Android kernels.

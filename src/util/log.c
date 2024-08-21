@@ -293,7 +293,7 @@ logger_syslog(enum mesa_log_level level,
 
 #endif /* DETECT_OS_POSIX */
 
-#if DETECT_OS_ANDROID
+#if DETECT_OS_ANDROID && !defined(__TERMUX__)
 
 static inline android_LogPriority
 level_to_android(enum mesa_log_level l)
@@ -395,7 +395,7 @@ mesa_log_v(enum mesa_log_level level, const char *tag, const char *format,
 #if DETECT_OS_POSIX
       { MESA_LOG_CONTROL_SYSLOG, logger_syslog },
 #endif
-#if DETECT_OS_ANDROID
+#if DETECT_OS_ANDROID && !defined(__TERMUX__)
       { MESA_LOG_CONTROL_ANDROID, logger_android },
 #endif
 #if DETECT_OS_WINDOWS

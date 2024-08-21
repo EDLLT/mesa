@@ -1839,7 +1839,7 @@ fail:
 static uint8_t *
 alloc_shm(struct wsi_image *imagew, unsigned size)
 {
-#ifdef HAVE_SYS_SHM_H
+#if defined HAVE_SYS_SHM_H && !defined(__TERMUX__)
    struct x11_image *image = (struct x11_image *)imagew;
    image->shmid = shmget(IPC_PRIVATE, size, IPC_CREAT | 0600);
    if (image->shmid < 0)
@@ -1983,7 +1983,7 @@ x11_image_finish(struct x11_swapchain *chain,
    }
 
    wsi_destroy_image(&chain->base, &image->base);
-#ifdef HAVE_SYS_SHM_H
+#if defined HAVE_SYS_SHM_H && !defined(__TERMUX__)
    if (image->shmaddr)
       shmdt(image->shmaddr);
 #endif
