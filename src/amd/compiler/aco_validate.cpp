@@ -74,6 +74,63 @@ validate_ir(Program* program)
       }
    };
 
+   /* check reachability */
+   if (program->progress < CompilationProgress::after_lower_to_hw) {
+      std::map<uint32_t, std::pair<uint32_t, bool>> def_blocks;
+      for (Block& block : program->blocks) {
+         for (aco_ptr<Instruction>& instr : block.instructions) {
+            for (Definition def : instr->definitions) {
+               if (!def.isTemp())
+                  continue;
+               check(!def_blocks.count(def.tempId()), "Temporary defined twice", instr.get());
+               def_blocks[def.tempId()] = std::make_pair(block.index, false);
+            }
+         }
+      }
+
+      for (Block& block : program->blocks) {
+         for (aco_ptr<Instruction>& instr : block.instructions) {
+            for (unsigned i = 0; i < instr->operands.size(); i++) {
+               Operand op = instr->operands[i];
+               if (!op.isTemp())
+                  continue;
+
+               uint32_t use_block_idx = block.index;
+               if (instr->opcode == aco_opcode::p_phi || instr->opcode == aco_opcode::p_boolean_phi)
+                  use_block_idx = block.logical_preds[i];
+               else if (instr->opcode == aco_opcode::p_linear_phi)
+                  use_block_idx = block.linear_preds[i];
+
+               auto it = def_blocks.find(op.tempId());
+               if (it != def_blocks.end()) {
+                  Block& def_block = program->blocks[it->second.first];
+                  Block& use_block = program->blocks[use_block_idx];
+                  bool dominates =
+                     def_block.index == use_block_idx
+                        ? (use_block_idx == block.index ? it->second.second : true)
+                        : (op.regClass().is_linear() ? dominates_linear(def_block, use_block)
+                                                     : dominates_logical(def_block, use_block));
+                  if (!dominates) {
+                     char msg[256];
+                     snprintf(msg, sizeof(msg), "Definition of %%%u does not dominate use",
+                              op.tempId());
+                     check(false, msg, instr.get());
+                  }
+               } else {
+                  char msg[256];
+                  snprintf(msg, sizeof(msg), "%%%u never defined", op.tempId());
+                  check(false, msg, instr.get());
+               }
+            }
+
+            for (Definition def : instr->definitions) {
+               if (def.isTemp())
+                  def_blocks[def.tempId()].second = true;
+            }
+         }
+      }
+   }
+
    for (Block& block : program->blocks) {
       for (aco_ptr<Instruction>& instr : block.instructions) {
 
@@ -371,11 +428,6 @@ validate_ir(Program* program)
             if (op.isFixed() || !op.hasRegClass() || !op.regClass().is_linear_vgpr() ||
                 op.isUndefined())
                continue;
-
-            /* Check that linear vgprs are late kill: this is to ensure linear VGPR operands and
-             * normal VGPR definitions don't try to use the same register, which is problematic
-             * because of assignment restrictions. */
-            check(op.isLateKill(), "Linear VGPR operands must be late kill", instr.get());
 
             /* Only kill linear VGPRs in top-level blocks. Otherwise, we might have to move linear
              * VGPRs to make space for normal ones and that isn't possible inside control flow. */
@@ -941,6 +993,116 @@ validate_cfg(Program* program)
          for (unsigned pred : block.logical_preds)
             check_block(program->blocks[pred].logical_succs.size() == 1,
                         "logical critical edges are not allowed", &program->blocks[pred]);
+      }
+   }
+
+   return is_valid;
+}
+
+bool
+validate_live_vars(Program* program)
+{
+   if (!(debug_flags & DEBUG_VALIDATE_LIVE_VARS))
+      return true;
+
+   bool is_valid = true;
+   const int prev_num_waves = program->num_waves;
+   const monotonic_buffer_resource old_memory = std::move(program->live.memory);
+   const std::vector<IDSet> prev_live_in = std::move(program->live.live_in);
+   const RegisterDemand prev_max_demand = program->max_reg_demand;
+   std::vector<RegisterDemand> block_demands(program->blocks.size());
+   std::vector<RegisterDemand> live_in_demands(program->blocks.size());
+   std::vector<std::vector<RegisterDemand>> register_demands(program->blocks.size());
+
+   for (unsigned i = 0; i < program->blocks.size(); i++) {
+      Block& b = program->blocks[i];
+      block_demands[i] = b.register_demand;
+      live_in_demands[i] = b.live_in_demand;
+      register_demands[i].reserve(b.instructions.size());
+      for (unsigned j = 0; j < b.instructions.size(); j++)
+         register_demands[i].emplace_back(b.instructions[j]->register_demand);
+   }
+
+   aco::live_var_analysis(program);
+
+   /* Validate RegisterDemand calculation */
+   for (unsigned i = 0; i < program->blocks.size(); i++) {
+      Block& b = program->blocks[i];
+
+      if (!(b.register_demand == block_demands[i])) {
+         is_valid = false;
+         aco_err(program,
+                 "Register Demand not updated correctly for BB%d: got (%3u vgpr, %3u sgpr), but "
+                 "should be (%3u vgpr, %3u sgpr)",
+                 i, block_demands[i].vgpr, block_demands[i].sgpr, b.register_demand.vgpr,
+                 b.register_demand.sgpr);
+      }
+      if (!(b.live_in_demand == live_in_demands[i])) {
+         is_valid = false;
+         aco_err(program,
+                 "Live-in Demand not updated correctly for BB%d: got (%3u vgpr, %3u sgpr), but "
+                 "should be (%3u vgpr, %3u sgpr)",
+                 i, live_in_demands[i].vgpr, live_in_demands[i].sgpr, b.live_in_demand.vgpr,
+                 b.live_in_demand.sgpr);
+      }
+
+      for (unsigned j = 0; j < b.instructions.size(); j++) {
+         if (b.instructions[j]->register_demand == register_demands[i][j])
+            continue;
+
+         char* out;
+         size_t outsize;
+         struct u_memstream mem;
+         u_memstream_open(&mem, &out, &outsize);
+         FILE* const memf = u_memstream_get(&mem);
+
+         fprintf(memf,
+                 "Register Demand not updated correctly: got (%3u vgpr, %3u sgpr), but should be "
+                 "(%3u vgpr, %3u sgpr): \n\t",
+                 register_demands[i][j].vgpr, register_demands[i][j].sgpr,
+                 b.instructions[j]->register_demand.vgpr, b.instructions[j]->register_demand.sgpr);
+         aco_print_instr(program->gfx_level, b.instructions[j].get(), memf, print_kill);
+         u_memstream_close(&mem);
+
+         aco_err(program, "%s", out);
+         free(out);
+
+         is_valid = false;
+      }
+   }
+   if (!(program->max_reg_demand == prev_max_demand) || program->num_waves != prev_num_waves) {
+      is_valid = false;
+      aco_err(program,
+              "Max Register Demand and Num Waves not updated correctly: got (%3u vgpr, %3u sgpr) "
+              "and %2u waves, but should be (%3u vgpr, %3u sgpr) and %2u waves",
+              prev_max_demand.vgpr, prev_max_demand.sgpr, prev_num_waves,
+              program->max_reg_demand.vgpr, program->max_reg_demand.sgpr, program->num_waves);
+   }
+
+   /* Validate Live-in sets */
+   for (unsigned i = 0; i < program->blocks.size(); i++) {
+      if (prev_live_in[i] != program->live.live_in[i]) {
+         char* out;
+         size_t outsize;
+         struct u_memstream mem;
+         u_memstream_open(&mem, &out, &outsize);
+         FILE* const memf = u_memstream_get(&mem);
+
+         fprintf(memf, "Live-in set not updated correctly for BB%d:", i);
+         fprintf(memf, "\nMissing values: ");
+         for (unsigned t : program->live.live_in[i]) {
+            if (prev_live_in[i].count(t) == 0)
+               fprintf(memf, "%%%d, ", t);
+         }
+         fprintf(memf, "\nAdditional values: ");
+         for (unsigned t : prev_live_in[i]) {
+            if (program->live.live_in[i].count(t) == 0)
+               fprintf(memf, "%%%d, ", t);
+         }
+         u_memstream_close(&mem);
+         aco_err(program, "%s", out);
+         free(out);
+         is_valid = false;
       }
    }
 

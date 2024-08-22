@@ -31,6 +31,15 @@
 #include "ir3_nir.h"
 #include "ir3_shader.h"
 
+nir_def *
+ir3_get_shared_driver_ubo(nir_builder *b, const struct ir3_driver_ubo *ubo)
+{
+   assert(ubo->idx > 0);
+
+   /* Binning shader shared ir3_driver_ubo definitions but not shader info */
+   b->shader->info.num_ubos = MAX2(b->shader->info.num_ubos, ubo->idx + 1);
+   return nir_imm_int(b, ubo->idx);
+}
 
 nir_def *
 ir3_get_driver_ubo(nir_builder *b, struct ir3_driver_ubo *ubo)
@@ -42,13 +51,18 @@ ir3_get_driver_ubo(nir_builder *b, struct ir3_driver_ubo *ubo)
       if (b->shader->info.num_ubos == 0)
          b->shader->info.num_ubos++;
       ubo->idx = b->shader->info.num_ubos++;
-   } else {
-      assert(ubo->idx != 0);
-      /* Binning shader shared ir3_driver_ubo definitions but not shader info */
-      b->shader->info.num_ubos = MAX2(b->shader->info.num_ubos, ubo->idx + 1);
+      return nir_imm_int(b, ubo->idx);
    }
 
-   return nir_imm_int(b, ubo->idx);
+   return ir3_get_shared_driver_ubo(b, ubo);
+}
+
+nir_def *
+ir3_get_driver_consts_ubo(nir_builder *b, struct ir3_shader_variant *v)
+{
+   if (v->binning_pass)
+      return ir3_get_shared_driver_ubo(b, &ir3_const_state(v)->consts_ubo);
+   return ir3_get_driver_ubo(b, &ir3_const_state_mut(v)->consts_ubo);
 }
 
 nir_def *
@@ -120,6 +134,12 @@ ir3_nir_should_vectorize_mem(unsigned align_mul, unsigned align_offset,
    struct ir3_compiler *compiler = data;
    unsigned byte_size = bit_size / 8;
 
+   if (low->intrinsic == nir_intrinsic_load_const_ir3)
+      return bit_size <= 32 && num_components <= 4;
+
+   if (low->intrinsic == nir_intrinsic_store_const_ir3)
+      return bit_size == 32 && num_components <= 4;
+
    /* Don't vectorize load_ssbo's that we could otherwise lower to isam,
     * as the tex cache benefit outweighs the benefit of vectorizing. If we
     * support isam.v, we can vectorize this though.
@@ -156,6 +176,81 @@ ir3_nir_should_vectorize_mem(unsigned align_mul, unsigned align_offset,
       return false;
 
    return true;
+}
+
+static unsigned
+ir3_lower_bit_size(const nir_instr *instr, UNUSED void *data)
+{
+   if (instr->type == nir_instr_type_intrinsic) {
+      nir_intrinsic_instr *intrinsic = nir_instr_as_intrinsic(instr);
+      switch (intrinsic->intrinsic) {
+      case nir_intrinsic_exclusive_scan:
+      case nir_intrinsic_inclusive_scan:
+      case nir_intrinsic_quad_broadcast:
+      case nir_intrinsic_quad_swap_diagonal:
+      case nir_intrinsic_quad_swap_horizontal:
+      case nir_intrinsic_quad_swap_vertical:
+      case nir_intrinsic_reduce:
+         return intrinsic->def.bit_size == 8 ? 16 : 0;
+      default:
+         break;
+      }
+   }
+
+   if (instr->type == nir_instr_type_alu) {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      switch (alu->op) {
+      case nir_op_iabs:
+      case nir_op_iadd_sat:
+      case nir_op_imax:
+      case nir_op_imin:
+      case nir_op_ineg:
+      case nir_op_ishl:
+      case nir_op_ishr:
+      case nir_op_isub_sat:
+      case nir_op_uadd_sat:
+      case nir_op_umax:
+      case nir_op_umin:
+      case nir_op_ushr:
+         return alu->def.bit_size == 8 ? 16 : 0;
+      case nir_op_ieq:
+      case nir_op_ige:
+      case nir_op_ilt:
+      case nir_op_ine:
+      case nir_op_uge:
+      case nir_op_ult:
+         return nir_src_bit_size(alu->src[0].src) == 8 ? 16 : 0;
+      default:
+         break;
+      }
+   }
+
+   return 0;
+}
+
+static void
+ir3_get_variable_size_align_bytes(const glsl_type *type, unsigned *size, unsigned *align)
+{
+   switch (type->base_type) {
+   case GLSL_TYPE_ARRAY:
+   case GLSL_TYPE_INTERFACE:
+   case GLSL_TYPE_STRUCT:
+      glsl_size_align_handle_array_and_structs(type, ir3_get_variable_size_align_bytes,
+                                               size, align);
+      break;
+   case GLSL_TYPE_UINT8:
+   case GLSL_TYPE_INT8:
+      /* 8-bit values are handled through 16-bit half-registers, so the resulting size
+       * and alignment value has to be doubled to reflect the actual variable size
+       * requirement.
+       */
+      *size = 2 * glsl_get_components(type);
+      *align = 2;
+      break;
+   default:
+      glsl_get_natural_size_align_bytes(type, size, align);
+      break;
+   }
 }
 
 #define OPT(nir, pass, ...)                                                    \
@@ -221,6 +316,7 @@ ir3_optimize_loop(struct ir3_compiler *compiler, nir_shader *s)
       progress |= OPT(s, nir_opt_algebraic);
       progress |= OPT(s, nir_lower_alu);
       progress |= OPT(s, nir_lower_pack);
+      progress |= OPT(s, nir_lower_bit_size, ir3_lower_bit_size, NULL);
       progress |= OPT(s, nir_opt_constant_folding);
 
       const nir_opt_offsets_options offset_options = {
@@ -241,7 +337,7 @@ ir3_optimize_loop(struct ir3_compiler *compiler, nir_shader *s)
       progress |= OPT(s, nir_opt_offsets, &offset_options);
 
       nir_load_store_vectorize_options vectorize_opts = {
-         .modes = nir_var_mem_ubo | nir_var_mem_ssbo,
+         .modes = nir_var_mem_ubo | nir_var_mem_ssbo | nir_var_uniform,
          .callback = ir3_nir_should_vectorize_mem,
          .robust_modes = compiler->options.robust_buffer_access2 ?
                nir_var_mem_ubo | nir_var_mem_ssbo : 0,
@@ -728,6 +824,36 @@ lower_ucp_vs(struct ir3_shader_variant *so)
    return so->type == last_geom_stage;
 }
 
+static bool
+output_slot_used_for_binning(gl_varying_slot slot)
+{
+   return slot == VARYING_SLOT_POS || slot == VARYING_SLOT_PSIZ ||
+          slot == VARYING_SLOT_CLIP_DIST0 || slot == VARYING_SLOT_CLIP_DIST1 ||
+          slot == VARYING_SLOT_VIEWPORT;
+}
+
+static bool
+remove_nonbinning_output(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_store_output)
+      return false;
+
+   nir_io_semantics io = nir_intrinsic_io_semantics(intr);
+
+   if (output_slot_used_for_binning(io.location))
+      return false;
+
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
+static bool
+lower_binning(nir_shader *s)
+{
+   return nir_shader_intrinsics_pass(s, remove_nonbinning_output,
+                                     nir_metadata_control_flow, NULL);
+}
+
 void
 ir3_nir_lower_variant(struct ir3_shader_variant *so, nir_shader *s)
 {
@@ -774,6 +900,15 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so, nir_shader *s)
       }
    }
 
+   if (so->binning_pass) {
+      if (OPT(s, lower_binning)) {
+         progress = true;
+
+         /* outputs_written has changed. */
+         nir_shader_gather_info(s, nir_shader_get_entrypoint(s));
+      }
+   }
+
    /* Note that it is intentional to use the VS lowering pass for GS, since we
     * lower GS into something that looks more like a VS in ir3_nir_lower_gs():
     */
@@ -804,7 +939,8 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so, nir_shader *s)
     */
    if (so->compiler->has_pvtmem) {
       progress |= OPT(s, nir_lower_vars_to_scratch, nir_var_function_temp,
-                      16 * 16 /* bytes */, glsl_get_natural_size_align_bytes);
+                      16 * 16 /* bytes */,
+                      ir3_get_variable_size_align_bytes, glsl_get_natural_size_align_bytes);
    }
 
    /* Lower scratch writemasks */
@@ -880,11 +1016,11 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so, nir_shader *s)
    /* verify that progress is always set */
    assert(!ir3_optimize_loop(so->compiler, s));
 
-   /* Fixup indirect load_uniform's which end up with a const base offset
+   /* Fixup indirect load_const_ir3's which end up with a const base offset
     * which is too large to encode.  Do this late(ish) so we actually
     * can differentiate indirect vs non-indirect.
     */
-   if (OPT(s, ir3_nir_fixup_load_uniform))
+   if (OPT(s, ir3_nir_fixup_load_const_ir3))
       ir3_optimize_loop(so->compiler, s);
 
    /* Do late algebraic optimization to turn add(a, neg(b)) back into
@@ -946,7 +1082,7 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so, nir_shader *s)
     * passes:
     */
    if (!so->binning_pass)
-      ir3_setup_const_state(s, so, ir3_const_state(so));
+      ir3_setup_const_state(s, so, ir3_const_state_mut(so));
 }
 
 bool

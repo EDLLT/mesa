@@ -1647,6 +1647,14 @@ static const __DRIkopperLoaderExtension kopper_loader_extension = {
    .SetSurfaceCreateInfo = kopperSetSurfaceCreateInfo,
 };
 
+static const __DRIextension *kopper_loader_extensions[] = {
+   &swrast_loader_extension.base,
+   &image_lookup_extension.base,
+   &kopper_loader_extension.base,
+   &use_invalidate.base,
+   NULL,
+};
+
 static const __DRIextension *swrast_loader_extensions[] = {
    &swrast_loader_extension.base,
    &image_lookup_extension.base,
@@ -1783,7 +1791,7 @@ dri2_x11_check_multibuffers(_EGLDisplay *disp)
 
 #ifdef HAVE_DRI3_MODIFIERS
    bool err;
-   dri2_dpy->multibuffers_available = x11_dri3_check_multibuffer(dri2_dpy->conn, &err);
+   dri2_dpy->multibuffers_available = x11_dri3_check_multibuffer(dri2_dpy->conn, &err, &dri2_dpy->explicit_modifiers);
 
    if (disp->Options.Zink && !disp->Options.ForceSoftware &&
        !dri2_dpy->multibuffers_available &&
@@ -1813,24 +1821,26 @@ dri2_initialize_x11_swrast(_EGLDisplay *disp)
    if (disp->Options.Zink &&
        !debug_get_bool_option("LIBGL_DRI3_DISABLE", false) &&
        !debug_get_bool_option("LIBGL_KOPPER_DRI2", false))
-      dri3_x11_connect(dri2_dpy, disp->Options.ForceSoftware);
+      dri3_x11_connect(dri2_dpy, disp->Options.Zink, disp->Options.ForceSoftware);
 #endif
    if (!dri2_load_driver(disp))
       goto cleanup;
 
-   if (check_xshm(dri2_dpy)) {
+   if (disp->Options.Zink && !disp->Options.ForceSoftware) {
+      dri2_dpy->loader_extensions = kopper_loader_extensions;
+   } else if (check_xshm(dri2_dpy)) {
       dri2_dpy->loader_extensions = swrast_loader_shm_extensions;
    } else {
       dri2_dpy->loader_extensions = swrast_loader_extensions;
    }
 
-   if (!dri2_create_screen(disp))
-      goto cleanup;
-
    if (!dri2_x11_check_multibuffers(disp))
       goto cleanup;
 
-   if (!dri2_setup_device(disp, true)) {
+   if (!dri2_create_screen(disp))
+      goto cleanup;
+
+   if (!dri2_setup_device(disp, disp->Options.ForceSoftware)) {
       _eglError(EGL_NOT_INITIALIZED, "DRI2: failed to setup EGLDevice");
       goto cleanup;
    }
@@ -1898,7 +1908,7 @@ dri2_initialize_x11_dri3(_EGLDisplay *disp)
    if (!dri2_get_xcb_connection(disp, dri2_dpy))
       goto cleanup;
 
-   status = dri3_x11_connect(dri2_dpy, disp->Options.ForceSoftware);
+   status = dri3_x11_connect(dri2_dpy, disp->Options.Zink, disp->Options.ForceSoftware);
    if (status != DRI2_EGL_DRIVER_LOADED)
       goto cleanup;
 
@@ -1910,10 +1920,10 @@ dri2_initialize_x11_dri3(_EGLDisplay *disp)
    dri2_dpy->swap_available = true;
    dri2_dpy->invalidate_available = true;
 
-   if (!dri2_create_screen(disp))
+   if (!dri2_x11_check_multibuffers(disp))
       goto cleanup;
 
-   if (!dri2_x11_check_multibuffers(disp))
+   if (!dri2_create_screen(disp))
       goto cleanup;
 
    if (!dri2_setup_device(disp, false)) {
@@ -2013,10 +2023,10 @@ dri2_initialize_x11_dri2(_EGLDisplay *disp)
    dri2_dpy->swap_available = (dri2_dpy->dri2_minor >= 2);
    dri2_dpy->invalidate_available = (dri2_dpy->dri2_minor >= 3);
 
-   if (!dri2_create_screen(disp))
+   if (!dri2_x11_check_multibuffers(disp))
       goto cleanup;
 
-   if (!dri2_x11_check_multibuffers(disp))
+   if (!dri2_create_screen(disp))
       goto cleanup;
 
    if (!dri2_setup_device(disp, false)) {

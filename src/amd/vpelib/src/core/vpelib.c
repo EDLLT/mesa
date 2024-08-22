@@ -203,31 +203,6 @@ void vpe_destroy(struct vpe **vpe)
     *vpe = NULL;
 }
 
-/*
- * Geometric scaling feature has two requirement when enabled:
- * 1. only support single input stream, no blending support.
- * 2. the target rect must equal to destination rect.
- */
-
-static enum vpe_status validate_geometric_scaling_support(const struct vpe_build_param *param)
-{
-    if (param->streams[0].flags.geometric_scaling)
-    {
-        /* only support 1 stream */
-        if (param->num_streams > 1)
-        {
-            return VPE_STATUS_GEOMETRICSCALING_ERROR;
-        }
-
-        /* dest rect must equal to target rect */
-        if (param->target_rect.height != param->streams[0].scaling_info.dst_rect.height ||
-                param->target_rect.width != param->streams[0].scaling_info.dst_rect.width ||
-                param->target_rect.x != param->streams[0].scaling_info.dst_rect.x ||
-                param->target_rect.y != param->streams[0].scaling_info.dst_rect.y)
-            return VPE_STATUS_GEOMETRICSCALING_ERROR;
-    }
-    return VPE_STATUS_OK;
-}
 
 /*****************************************************************************************
  * handle_zero_input
@@ -392,14 +367,6 @@ enum vpe_status vpe_check_support(
     if (!vpe_priv->stream_ctx)
         status = VPE_STATUS_NO_MEMORY;
 
-    // VPElib needs to cache whether or not the 3DLUT has been updated
-    //  This is to deal with case when 3DLUT has been updated but VPE rejects the job.
-    //  Need a sticky bit to tell vpe to program the 3dlut on next jobs submission even
-    //  if 3dlut has not changed
-    for (i = 0; i < param->num_streams; i++) {
-        vpe_cache_tone_map_params(&vpe_priv->stream_ctx[i], &param->streams[i]);
-    }
-
     if (status == VPE_STATUS_OK) {  
         // output checking - check per asic support
         status = vpe_check_output_support(vpe, param);
@@ -424,7 +391,7 @@ enum vpe_status vpe_check_support(
         for (i = 0; i < param->num_streams; i++) {
             status = vpe_check_tone_map_support(vpe, &param->streams[i], param);
             if (status != VPE_STATUS_OK) {
-                vpe_log("fail input support check. status %d\n", (int)status);
+                vpe_log("fail tone map support check. status %d\n", (int)status);
                 break;
             }
         }
@@ -504,7 +471,7 @@ enum vpe_status vpe_check_support(
     }
 
     if (status == VPE_STATUS_OK) {
-        status = validate_geometric_scaling_support(param);
+        status = vpe_validate_geometric_scaling_support(param);
     }
 
     if (vpe_priv->init.debug.assert_when_not_support)
@@ -613,7 +580,7 @@ enum vpe_status vpe_build_commands(
 
     if (status == VPE_STATUS_OK) {
         if (param->streams->flags.geometric_scaling) {
-            geometric_scaling_feature_skip(vpe_priv, param);
+            vpe_geometric_scaling_feature_skip(vpe_priv, param);
         }
 
         if (bufs->cmd_buf.size == 0 || bufs->emb_buf.size == 0) {
@@ -623,6 +590,7 @@ enum vpe_status vpe_build_commands(
              */
             bufs->cmd_buf.size = vpe_priv->bufs_required.cmd_buf_size;
             bufs->emb_buf.size = vpe_priv->bufs_required.emb_buf_size;
+
             return VPE_STATUS_OK;
         } else if ((bufs->cmd_buf.size < vpe_priv->bufs_required.cmd_buf_size) ||
                    (bufs->emb_buf.size < vpe_priv->bufs_required.emb_buf_size)) {
@@ -734,4 +702,16 @@ enum vpe_status vpe_build_commands(
         VPE_ASSERT(status == VPE_STATUS_OK);
 
     return status;
+}
+
+void vpe_get_optimal_num_of_taps(struct vpe *vpe, struct vpe_scaling_info *scaling_info)
+{
+    struct vpe_priv *vpe_priv;
+    struct dpp      *dpp;
+
+    vpe_priv = container_of(vpe, struct vpe_priv, pub);
+    dpp      = vpe_priv->resource.dpp[0];
+
+    dpp->funcs->get_optimal_number_of_taps(
+        &scaling_info->src_rect, &scaling_info->dst_rect, &scaling_info->taps);
 }

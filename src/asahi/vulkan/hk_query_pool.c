@@ -39,7 +39,7 @@ struct hk_query_report {
 static uint16_t *
 hk_pool_oq_index_ptr(const struct hk_query_pool *pool)
 {
-   return (uint16_t *)(pool->bo->ptr.cpu + pool->query_start);
+   return (uint16_t *)(pool->bo->map + pool->query_start);
 }
 
 static uint32_t
@@ -93,7 +93,7 @@ hk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
          bo_size += pool->query_stride * pool->vk.query_count;
 
       pool->bo =
-         agx_bo_create(&dev->dev, bo_size, AGX_BO_WRITEBACK, "Query pool");
+         agx_bo_create(&dev->dev, bo_size, 0, AGX_BO_WRITEBACK, "Query pool");
       if (!pool->bo) {
          hk_DestroyQueryPool(device, hk_query_pool_to_handle(pool), pAllocator);
          return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
@@ -140,7 +140,7 @@ hk_DestroyQueryPool(VkDevice device, VkQueryPool queryPool,
       hk_descriptor_table_remove(dev, &dev->occlusion_queries, oq_index[i]);
    }
 
-   agx_bo_unreference(pool->bo);
+   agx_bo_unreference(&dev->dev, pool->bo);
    vk_query_pool_destroy(&dev->vk, pAllocator, &pool->vk);
 }
 
@@ -148,14 +148,14 @@ static uint64_t
 hk_query_available_addr(struct hk_query_pool *pool, uint32_t query)
 {
    assert(query < pool->vk.query_count);
-   return pool->bo->ptr.gpu + query * sizeof(uint32_t);
+   return pool->bo->va->addr + query * sizeof(uint32_t);
 }
 
 static uint32_t *
 hk_query_available_map(struct hk_query_pool *pool, uint32_t query)
 {
    assert(query < pool->vk.query_count);
-   return (uint32_t *)pool->bo->ptr.cpu + query;
+   return (uint32_t *)pool->bo->map + query;
 }
 
 static uint64_t
@@ -171,10 +171,10 @@ hk_query_report_addr(struct hk_device *dev, struct hk_query_pool *pool,
 {
    if (pool->oq_queries) {
       uint16_t *oq_index = hk_pool_oq_index_ptr(pool);
-      return dev->occlusion_queries.bo->ptr.gpu +
+      return dev->occlusion_queries.bo->va->addr +
              (oq_index[query] * sizeof(uint64_t));
    } else {
-      return pool->bo->ptr.gpu + hk_query_offset(pool, query);
+      return pool->bo->va->addr + hk_query_offset(pool, query);
    }
 }
 
@@ -183,12 +183,12 @@ hk_query_report_map(struct hk_device *dev, struct hk_query_pool *pool,
                     uint32_t query)
 {
    if (pool->oq_queries) {
-      uint64_t *queries = (uint64_t *)dev->occlusion_queries.bo->ptr.cpu;
+      uint64_t *queries = (uint64_t *)dev->occlusion_queries.bo->map;
       uint16_t *oq_index = hk_pool_oq_index_ptr(pool);
 
       return (struct hk_query_report *)&queries[oq_index[query]];
    } else {
-      return (void *)((char *)pool->bo->ptr.cpu + hk_query_offset(pool, query));
+      return (void *)((char *)pool->bo->map + hk_query_offset(pool, query));
    }
 }
 
@@ -556,10 +556,10 @@ hk_CmdCopyQueryPoolResults(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
    hk_ensure_cs_has_space(cmd, cs, 0x2000 /* TODO */);
 
    const struct libagx_copy_query_push info = {
-      .availability = pool->bo->ptr.gpu,
-      .results = pool->oq_queries ? dev->occlusion_queries.bo->ptr.gpu
-                                  : pool->bo->ptr.gpu + pool->query_start,
-      .oq_index = pool->oq_queries ? pool->bo->ptr.gpu + pool->query_start : 0,
+      .availability = pool->bo->va->addr,
+      .results = pool->oq_queries ? dev->occlusion_queries.bo->va->addr
+                                  : pool->bo->va->addr + pool->query_start,
+      .oq_index = pool->oq_queries ? pool->bo->va->addr + pool->query_start : 0,
 
       .first_query = firstQuery,
       .dst_addr = hk_buffer_address(dst_buffer, dstOffset),

@@ -749,8 +749,10 @@ v3d_screen_get_compiler_options(struct pipe_screen *pscreen,
                         nir_lower_shift64 |
                         nir_lower_ufind_msb64,
                 .lower_fquantize2f16 = true,
+                .lower_ufind_msb = true,
                 .has_fsub = true,
                 .has_isub = true,
+                .has_uclz = true,
                 .divergence_analysis_options =
                        nir_divergence_multiple_workgroup_per_compute_subgroup,
                 /* This will enable loop unrolling in the state tracker so we won't
@@ -760,6 +762,8 @@ v3d_screen_get_compiler_options(struct pipe_screen *pscreen,
                  */
                 .max_unroll_iterations = 16,
                 .force_indirect_unrolling_sampler = true,
+                .has_ddx_intrinsics = true,
+                .scalarize_ddx = true,
         };
 
         if (!initialized) {

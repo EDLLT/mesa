@@ -117,6 +117,10 @@ panvk_lower_sysvals(nir_builder *b, nir_instr *instr, void *data)
       val = load_sysval_from_push_const(b, SYSVAL(graphics, blend.constants),
                                         bit_size, num_comps);
       break;
+   case nir_intrinsic_load_multisampled_pan:
+      val = load_sysval_from_push_const(b, SYSVAL(graphics, fs.multisampled),
+                                        bit_size, num_comps);
+      break;
 
    case nir_intrinsic_load_layer_id:
       assert(b->shader->info.stage == MESA_SHADER_FRAGMENT);
@@ -371,6 +375,9 @@ panvk_lower_nir(struct panvk_device *dev, nir_shader *nir,
 
    NIR_PASS_V(nir, panvk_per_arch(nir_lower_descriptors), dev, set_layout_count,
               set_layouts, shader);
+
+   NIR_PASS_V(nir, nir_split_var_copies);
+   NIR_PASS_V(nir, nir_lower_var_copies);
 
    NIR_PASS_V(nir, nir_lower_explicit_io, nir_var_mem_ubo,
               panvk_buffer_ubo_addr_format(rs->uniform_buffers));
@@ -1049,7 +1056,8 @@ emit_varying_attrs(struct panvk_pool *desc_pool,
 
 void
 panvk_per_arch(link_shaders)(struct panvk_pool *desc_pool,
-                             struct panvk_shader *vs, struct panvk_shader *fs,
+                             const struct panvk_shader *vs,
+                             const struct panvk_shader *fs,
                              struct panvk_shader_link *link)
 {
    BITSET_DECLARE(active_attrs, VARYING_SLOT_MAX) = {0};

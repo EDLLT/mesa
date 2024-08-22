@@ -1022,6 +1022,7 @@ bi_should_remove_store(nir_intrinsic_instr *intr, enum bi_idvs_mode idvs)
    switch (sem.location) {
    case VARYING_SLOT_POS:
    case VARYING_SLOT_PSIZ:
+   case VARYING_SLOT_LAYER:
       return idvs == BI_IDVS_VARYING;
    default:
       return idvs == BI_IDVS_POSITION;
@@ -1101,6 +1102,8 @@ bi_emit_store_vary(bi_builder *b, nir_intrinsic_instr *instr)
 
    bool psiz =
       (nir_intrinsic_io_semantics(instr).location == VARYING_SLOT_PSIZ);
+   bool layer =
+      (nir_intrinsic_io_semantics(instr).location == VARYING_SLOT_LAYER);
 
    bi_index a[4] = {bi_null()};
 
@@ -1116,20 +1119,30 @@ bi_emit_store_vary(bi_builder *b, nir_intrinsic_instr *instr)
                 bi_imm_u32(format), regfmt, nr - 1);
    } else if (b->shader->arch >= 9 && b->shader->idvs != BI_IDVS_NONE) {
       bi_index index = bi_preload(b, 59);
+      unsigned pos_attr_offset = 0;
+      unsigned src_bit_sz = nir_src_bit_size(instr->src[0]);
 
-      if (psiz) {
-         assert(T_size == 16 && "should've been lowered");
+      if (psiz || layer)
          index = bi_iadd_imm_i32(b, index, 4);
+
+      if (layer) {
+         assert(nr == 1 && src_bit_sz == 32);
+         src_bit_sz = 8;
+         pos_attr_offset = 2;
+         data = bi_byte(data, 0);
       }
+
+      if (psiz)
+         assert(T_size == 16 && "should've been lowered");
 
       bi_index address = bi_lea_buf_imm(b, index);
       bi_emit_split_i32(b, a, address, 2);
 
       bool varying = (b->shader->idvs == BI_IDVS_VARYING);
 
-      bi_store(b, nr * nir_src_bit_size(instr->src[0]), data, a[0], a[1],
+      bi_store(b, nr * src_bit_sz, data, a[0], a[1],
                varying ? BI_SEG_VARY : BI_SEG_POS,
-               varying ? bi_varying_offset(b->shader, instr) : 0);
+               varying ? bi_varying_offset(b->shader, instr) : pos_attr_offset);
    } else if (immediate) {
       bi_index address = bi_lea_attr_imm(b, bi_vertex_id(b), bi_instance_id(b),
                                          regfmt, imm_index);
@@ -1587,6 +1600,75 @@ bi_emit_ld_tile(bi_builder *b, nir_intrinsic_instr *instr)
    bi_emit_cached_split(b, dest, size * nr);
 }
 
+/*
+ * Older Bifrost hardware has a limited CLPER instruction. Add a safe helper
+ * that uses the hardware functionality if available and lowers otherwise.
+ */
+static bi_index
+bi_clper(bi_builder *b, bi_index s0, bi_index s1, enum bi_lane_op lop)
+{
+   if (b->shader->quirks & BIFROST_LIMITED_CLPER) {
+      if (lop == BI_LANE_OP_XOR) {
+         bi_index lane_id = bi_fau(BIR_FAU_LANE_ID, false);
+         s1 = bi_lshift_xor_i32(b, lane_id, s1, bi_imm_u8(0));
+      } else {
+         assert(lop == BI_LANE_OP_NONE);
+      }
+
+      return bi_clper_old_i32(b, s0, s1);
+   } else {
+      return bi_clper_i32(b, s0, s1, BI_INACTIVE_RESULT_ZERO, lop,
+                          BI_SUBGROUP_SUBGROUP4);
+   }
+}
+
+static bool
+bi_nir_all_uses_fabs(nir_def *def)
+{
+   nir_foreach_use(use, def) {
+      nir_instr *instr = nir_src_parent_instr(use);
+
+      if (instr->type != nir_instr_type_alu ||
+          nir_instr_as_alu(instr)->op != nir_op_fabs)
+         return false;
+   }
+
+   return true;
+}
+
+static void
+bi_emit_derivative(bi_builder *b, bi_index dst, nir_intrinsic_instr *instr,
+                   unsigned axis, bool coarse)
+{
+   bi_index left, right;
+   bi_index s0 = bi_src_index(&instr->src[0]);
+   unsigned sz = instr->def.bit_size;
+
+   /* If all uses are fabs, the sign of the derivative doesn't matter. This is
+    * inherently based on fine derivatives so we can't do it for coarse.
+    */
+   if (bi_nir_all_uses_fabs(&instr->def) && !coarse) {
+      left = s0;
+      right = bi_clper(b, s0, bi_imm_u32(axis), BI_LANE_OP_XOR);
+   } else {
+      bi_index lane1, lane2;
+      if (coarse) {
+         lane1 = bi_imm_u32(0);
+         lane2 = bi_imm_u32(axis);
+      } else {
+         lane1 = bi_lshift_and_i32(b, bi_fau(BIR_FAU_LANE_ID, false),
+                                   bi_imm_u32(0x3 & ~axis), bi_imm_u8(0));
+
+         lane2 = bi_iadd_u32(b, lane1, bi_imm_u32(axis), false);
+      }
+
+      left = bi_clper(b, s0, lane1, BI_LANE_OP_NONE);
+      right = bi_clper(b, s0, lane2, BI_LANE_OP_NONE);
+   }
+
+   bi_fadd_to(b, sz, dst, right, bi_neg(left));
+}
+
 static void
 bi_emit_intrinsic(bi_builder *b, nir_intrinsic_instr *instr)
 {
@@ -1834,6 +1916,26 @@ bi_emit_intrinsic(bi_builder *b, nir_intrinsic_instr *instr)
    case nir_intrinsic_shader_clock:
       bi_ld_gclk_u64_to(b, dst, BI_SOURCE_CYCLE_COUNTER);
       bi_split_def(b, &instr->def);
+      break;
+
+   case nir_intrinsic_ddx:
+   case nir_intrinsic_ddx_fine:
+      bi_emit_derivative(b, dst, instr, 1, false);
+      break;
+   case nir_intrinsic_ddx_coarse:
+      bi_emit_derivative(b, dst, instr, 1, true);
+      break;
+   case nir_intrinsic_ddy:
+   case nir_intrinsic_ddy_fine:
+      bi_emit_derivative(b, dst, instr, 2, false);
+      break;
+   case nir_intrinsic_ddy_coarse:
+      bi_emit_derivative(b, dst, instr, 2, true);
+      break;
+
+   case nir_intrinsic_load_layer_id:
+      assert(b->shader->arch >= 9);
+      bi_mov_i32_to(b, dst, bi_u8_to_u32(b, bi_byte(bi_preload(b, 62), 0)));
       break;
 
    default:
@@ -2137,24 +2239,6 @@ bi_lower_fsincos_32(bi_builder *b, bi_index dst, bi_index s0, bool cos)
 
    /* f(x) + e f'(x) - (e^2/2) f''(x) */
    bi_fadd_f32_to(b, dst, I->dest[0], cos ? cosx : sinx);
-}
-
-/*
- * The XOR lane op is useful for derivative calculations, but not all Bifrost
- * implementations have it. Add a safe helper that uses the hardware
- * functionality when available and lowers where unavailable.
- */
-static bi_index
-bi_clper_xor(bi_builder *b, bi_index s0, bi_index s1)
-{
-   if (!(b->shader->quirks & BIFROST_LIMITED_CLPER)) {
-      return bi_clper_i32(b, s0, s1, BI_INACTIVE_RESULT_ZERO, BI_LANE_OP_XOR,
-                          BI_SUBGROUP_SUBGROUP4);
-   }
-
-   bi_index lane_id = bi_fau(BIR_FAU_LANE_ID, false);
-   bi_index lane = bi_lshift_xor_i32(b, lane_id, s1, bi_imm_u8(0));
-   return bi_clper_old_i32(b, s0, lane);
 }
 
 static enum bi_cmpf
@@ -2637,73 +2721,6 @@ bi_emit_alu(bi_builder *b, nir_alu_instr *instr)
       bi_csel_to(b, nir_op_infos[instr->op].input_types[0], sz, dst, s0, s1, s0,
                  s1, BI_CMPF_GT);
       break;
-
-   case nir_op_fddx_must_abs_mali:
-   case nir_op_fddy_must_abs_mali: {
-      bi_index bit = bi_imm_u32(instr->op == nir_op_fddx_must_abs_mali ? 1 : 2);
-      bi_index adjacent = bi_clper_xor(b, s0, bit);
-      bi_fadd_to(b, sz, dst, adjacent, bi_neg(s0));
-      break;
-   }
-
-   case nir_op_fddx:
-   case nir_op_fddy:
-   case nir_op_fddx_coarse:
-   case nir_op_fddy_coarse:
-   case nir_op_fddx_fine:
-   case nir_op_fddy_fine: {
-      unsigned axis;
-      switch (instr->op) {
-      case nir_op_fddx:
-      case nir_op_fddx_coarse:
-      case nir_op_fddx_fine:
-         axis = 1;
-         break;
-      case nir_op_fddy:
-      case nir_op_fddy_coarse:
-      case nir_op_fddy_fine:
-         axis = 2;
-         break;
-      default:
-         unreachable("Invalid derivative op");
-      }
-
-      bi_index lane1, lane2;
-      switch (instr->op) {
-      case nir_op_fddx:
-      case nir_op_fddx_fine:
-      case nir_op_fddy:
-      case nir_op_fddy_fine:
-         lane1 = bi_lshift_and_i32(b, bi_fau(BIR_FAU_LANE_ID, false),
-                                   bi_imm_u32(0x3 & ~axis), bi_imm_u8(0));
-
-         lane2 = bi_iadd_u32(b, lane1, bi_imm_u32(axis), false);
-         break;
-      case nir_op_fddx_coarse:
-      case nir_op_fddy_coarse:
-         lane1 = bi_imm_u32(0);
-         lane2 = bi_imm_u32(axis);
-         break;
-      default:
-         unreachable("Invalid derivative op");
-      }
-
-      bi_index left, right;
-
-      if (b->shader->quirks & BIFROST_LIMITED_CLPER) {
-         left = bi_clper_old_i32(b, s0, lane1);
-         right = bi_clper_old_i32(b, s0, lane2);
-      } else {
-         left = bi_clper_i32(b, s0, lane1, BI_INACTIVE_RESULT_ZERO,
-                             BI_LANE_OP_NONE, BI_SUBGROUP_SUBGROUP4);
-
-         right = bi_clper_i32(b, s0, lane2, BI_INACTIVE_RESULT_ZERO,
-                              BI_LANE_OP_NONE, BI_SUBGROUP_SUBGROUP4);
-      }
-
-      bi_fadd_to(b, sz, dst, right, bi_neg(left));
-      break;
-   }
 
    case nir_op_f2f32:
       bi_f16_to_f32_to(b, dst, s0);
@@ -4057,6 +4074,7 @@ emit_loop(bi_context *ctx, nir_loop *nloop)
    ctx->continue_block = create_empty_block(ctx);
    ctx->break_block = create_empty_block(ctx);
    ctx->after_block = ctx->continue_block;
+   ctx->after_block->loop_header = true;
 
    /* Emit the body itself */
    emit_cf_list(ctx, &nloop->body);
@@ -4531,10 +4549,29 @@ mem_access_size_align_cb(nir_intrinsic_op intrin, uint8_t bytes,
    };
 }
 
+static bool
+mem_vectorize_cb(unsigned align_mul, unsigned align_offset, unsigned bit_size,
+                 unsigned num_components, nir_intrinsic_instr *low,
+                 nir_intrinsic_instr *high, void *data)
+{
+   /* Must be aligned to the size of the load */
+   unsigned align = nir_combined_align(align_mul, align_offset);
+   if ((bit_size / 8) > align)
+      return false;
+
+   if (num_components > 4)
+      return false;
+
+   if (bit_size > 32)
+      return false;
+
+   return true;
+}
+
 static void
 bi_optimize_nir(nir_shader *nir, unsigned gpu_id, bool is_blend)
 {
-   NIR_PASS(_, nir, nir_lower_pack);
+   NIR_PASS_V(nir, nir_opt_shrink_stores, true);
 
    bool progress;
 
@@ -4559,6 +4596,14 @@ bi_optimize_nir(nir_shader *nir, unsigned gpu_id, bool is_blend)
       NIR_PASS(progress, nir, nir_opt_shrink_vectors, false);
       NIR_PASS(progress, nir, nir_opt_loop_unroll);
    } while (progress);
+
+   NIR_PASS(
+      progress, nir, nir_opt_load_store_vectorize,
+      &(const nir_load_store_vectorize_options){
+         .modes = nir_var_mem_global | nir_var_mem_shared | nir_var_shader_temp,
+         .callback = mem_vectorize_cb,
+      });
+   NIR_PASS(progress, nir, nir_lower_pack);
 
    /* TODO: Why is 64-bit getting rematerialized?
     * KHR-GLES31.core.shader_image_load_store.basic-allTargets-atomicFS */
@@ -4937,12 +4982,12 @@ bifrost_preprocess_nir(nir_shader *nir, unsigned gpu_id)
     * (currently unconditional for Valhall), we force vec4 alignment for
     * scratch access.
     */
-   bool packed_tls = (gpu_id >= 0x9000);
-
+   glsl_type_size_align_func vars_to_scratch_size_align_func =
+      (gpu_id >= 0x9000) ? glsl_get_vec4_size_align_bytes
+                         : glsl_get_natural_size_align_bytes;
    /* Lower large arrays to scratch and small arrays to bcsel */
    NIR_PASS_V(nir, nir_lower_vars_to_scratch, nir_var_function_temp, 256,
-              packed_tls ? glsl_get_vec4_size_align_bytes
-                         : glsl_get_natural_size_align_bytes);
+              vars_to_scratch_size_align_func, vars_to_scratch_size_align_func);
    NIR_PASS_V(nir, nir_lower_indirect_derefs, nir_var_function_temp, ~0);
 
    NIR_PASS_V(nir, nir_split_var_copies);
@@ -5130,14 +5175,14 @@ bi_compile_variant_nir(nir_shader *nir,
        * mod_prop_backward to fuse VAR_TEX */
       if (ctx->arch == 7 && ctx->stage == MESA_SHADER_FRAGMENT &&
           !(bifrost_debug & BIFROST_DBG_NOPRELOAD)) {
-         bi_opt_dead_code_eliminate(ctx);
+         bi_opt_dce(ctx, false);
          bi_opt_message_preload(ctx);
          bi_opt_copy_prop(ctx);
       }
 
-      bi_opt_dead_code_eliminate(ctx);
+      bi_opt_dce(ctx, false);
       bi_opt_cse(ctx);
-      bi_opt_dead_code_eliminate(ctx);
+      bi_opt_dce(ctx, false);
       if (!ctx->inputs->no_ubo_to_push)
          bi_opt_reorder_push(ctx);
       bi_validate(ctx, "Optimization passes");
@@ -5163,7 +5208,7 @@ bi_compile_variant_nir(nir_shader *nir,
       /* We need to clean up after constant lowering */
       if (likely(optimize)) {
          bi_opt_cse(ctx);
-         bi_opt_dead_code_eliminate(ctx);
+         bi_opt_dce(ctx, false);
       }
 
       bi_validate(ctx, "Valhall passes");
@@ -5181,8 +5226,10 @@ bi_compile_variant_nir(nir_shader *nir,
     * under valid scheduling. Helpers are only defined for fragment
     * shaders, so this analysis is only required in fragment shaders.
     */
-   if (ctx->stage == MESA_SHADER_FRAGMENT)
+   if (ctx->stage == MESA_SHADER_FRAGMENT) {
+      bi_opt_dce(ctx, false);
       bi_analyze_helper_requirements(ctx);
+   }
 
    /* Fuse TEXC after analyzing helper requirements so the analysis
     * doesn't have to know about dual textures */
@@ -5200,7 +5247,7 @@ bi_compile_variant_nir(nir_shader *nir,
    /* Lowering FAU can create redundant moves. Run CSE+DCE to clean up. */
    if (likely(optimize)) {
       bi_opt_cse(ctx);
-      bi_opt_dead_code_eliminate(ctx);
+      bi_opt_dce(ctx, false);
    }
 
    bi_validate(ctx, "Late lowering");

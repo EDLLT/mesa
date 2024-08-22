@@ -60,6 +60,18 @@
     .reg_name = {BASE(reg##reg_name##_BASE_IDX) + reg##reg_name, reg##reg_name##_##DEFAULT,        \
         reg##reg_name##_##DEFAULT, false}
 
+#define SRIDFVL1(reg_name)                                                                          \
+    .reg_name = {BASE(reg##reg_name##_BASE_IDX) + reg##reg_name, reg##reg_name##_##DEFAULT,         \
+        reg##reg_name##_##DEFAULT, false}
+
+#define SRIDFVL2(reg_name, block, id)                                                                  \
+    .block##_##reg_name = {BASE(reg##block##id##_##reg_name##_BASE_IDX) + reg##block##id##_##reg_name, \
+        reg##block##id##_##reg_name##_##DEFAULT, reg##block##id##_##reg_name##_##DEFAULT, false}
+
+#define SRIDFVL3(reg_name, block, id)                                                                  \
+    .block##_##reg_name = {BASE(reg##block##_##reg_name##_BASE_IDX) + reg##block##_##reg_name,         \
+        reg##block##_##reg_name##_##DEFAULT, reg##block##_##reg_name##_##DEFAULT, false}
+
 /***************** CDC registers ****************/
 #define cdc_regs(id) [id] = {CDC_REG_LIST_VPE10(id)}
 
@@ -160,8 +172,12 @@ static struct vpe_caps caps = {
                 .yuy2                                        = 0},
             .max_upscale_factor          = 64000,
 
-            // 6:1 downscaling ratio: 1000/6 = 166.666
-            .max_downscale_factor = 167,
+            /*
+             * 4:1 downscaling ratio : 1000 / 4 = 250
+             * vpelib does not support more than 4:1 to preserve quality
+             * due to the limitation of using maximum number of 8 taps
+            */
+            .max_downscale_factor = 250,
 
             .pitch_alignment    = 256,
             .addr_alignment     = 256,
@@ -172,18 +188,19 @@ static struct vpe_caps caps = {
 static bool vpe10_init_scaler_data(struct vpe_priv *vpe_priv, struct stream_ctx *stream_ctx,
     struct scaler_data *scl_data, struct vpe_rect *src_rect, struct vpe_rect *dst_rect)
 {
-    struct dpp *dpp = vpe_priv->resource.dpp[0];
+    struct dpp *dpp;
+    dpp = vpe_priv->resource.dpp[0];
+
     calculate_scaling_ratios(scl_data, src_rect, dst_rect, stream_ctx->stream.surface_info.format);
 
-    if (vpe_priv->init.debug.skip_optimal_tap_check) {
-        scl_data->taps.v_taps   = stream_ctx->stream.scaling_info.taps.v_taps;
-        scl_data->taps.h_taps   = stream_ctx->stream.scaling_info.taps.h_taps;
-        scl_data->taps.v_taps_c = stream_ctx->stream.scaling_info.taps.v_taps_c;
-        scl_data->taps.h_taps_c = stream_ctx->stream.scaling_info.taps.h_taps_c;
-    } else {
-        if (!dpp->funcs->get_optimal_number_of_taps(
-                dpp, scl_data, &stream_ctx->stream.scaling_info.taps))
+    scl_data->taps.v_taps   = stream_ctx->stream.scaling_info.taps.v_taps;
+    scl_data->taps.h_taps   = stream_ctx->stream.scaling_info.taps.h_taps;
+    scl_data->taps.v_taps_c = stream_ctx->stream.scaling_info.taps.v_taps_c;
+    scl_data->taps.h_taps_c = stream_ctx->stream.scaling_info.taps.h_taps_c;
+    if (!vpe_priv->init.debug.skip_optimal_tap_check) {
+        if (!dpp->funcs->get_optimal_number_of_taps(src_rect, dst_rect, &scl_data->taps)) {
             return false;
+        }
     }
 
     if ((stream_ctx->stream.use_external_scaling_coeffs ==
@@ -663,39 +680,6 @@ static void build_clamping_params(
     }
 }
 
-static void frontend_config_callback(
-    void *ctx, uint64_t cfg_base_gpu, uint64_t cfg_base_cpu, uint64_t size)
-{
-    struct config_frontend_cb_ctx *cb_ctx     = (struct config_frontend_cb_ctx *)ctx;
-    struct vpe_priv               *vpe_priv   = cb_ctx->vpe_priv;
-    struct stream_ctx             *stream_ctx = &vpe_priv->stream_ctx[cb_ctx->stream_idx];
-    enum vpe_cmd_type              cmd_type;
-
-    if (cb_ctx->stream_sharing) {
-        VPE_ASSERT(stream_ctx->num_configs <
-                   (int)(sizeof(stream_ctx->configs) / sizeof(struct config_record)));
-
-        stream_ctx->configs[stream_ctx->num_configs].config_base_addr = cfg_base_gpu;
-        stream_ctx->configs[stream_ctx->num_configs].config_size      = size;
-        stream_ctx->num_configs++;
-    } else if (cb_ctx->stream_op_sharing) {
-        cmd_type = cb_ctx->cmd_type;
-
-        VPE_ASSERT(
-            stream_ctx->num_stream_op_configs[cmd_type] <
-            (int)(sizeof(stream_ctx->stream_op_configs[cmd_type]) / sizeof(struct config_record)));
-
-        stream_ctx->stream_op_configs[cmd_type][stream_ctx->num_stream_op_configs[cmd_type]]
-            .config_base_addr = cfg_base_gpu;
-        stream_ctx->stream_op_configs[cmd_type][stream_ctx->num_stream_op_configs[cmd_type]]
-            .config_size = size;
-        stream_ctx->num_stream_op_configs[cmd_type]++;
-    }
-
-    vpe_desc_writer_add_config_desc(
-        &vpe_priv->vpe_desc_writer, cfg_base_gpu, false, vpe_priv->config_writer.buf->tmz);
-}
-
 int32_t vpe10_program_frontend(struct vpe_priv *vpe_priv, uint32_t pipe_idx, uint32_t cmd_idx,
     uint32_t cmd_input_idx, bool seg_only)
 {
@@ -714,7 +698,7 @@ int32_t vpe10_program_frontend(struct vpe_priv *vpe_priv, uint32_t pipe_idx, uin
     vpe_priv->fe_cb_ctx.vpe_priv   = vpe_priv;
 
     config_writer_set_callback(
-        &vpe_priv->config_writer, &vpe_priv->fe_cb_ctx, frontend_config_callback);
+        &vpe_priv->config_writer, &vpe_priv->fe_cb_ctx, vpe_frontend_config_callback);
 
     config_writer_set_type(&vpe_priv->config_writer, CONFIG_TYPE_DIRECT);
 
@@ -789,26 +773,6 @@ int32_t vpe10_program_frontend(struct vpe_priv *vpe_priv, uint32_t pipe_idx, uin
     return 0;
 }
 
-static void backend_config_callback(
-    void *ctx, uint64_t cfg_base_gpu, uint64_t cfg_base_cpu, uint64_t size)
-{
-    struct config_backend_cb_ctx *cb_ctx     = (struct config_backend_cb_ctx *)ctx;
-    struct vpe_priv              *vpe_priv   = cb_ctx->vpe_priv;
-    struct output_ctx            *output_ctx = &vpe_priv->output_ctx;
-
-    if (cb_ctx->share) {
-        VPE_ASSERT(
-            output_ctx->num_configs < (sizeof(output_ctx->configs) / sizeof(struct config_record)));
-
-        output_ctx->configs[output_ctx->num_configs].config_base_addr = cfg_base_gpu;
-        output_ctx->configs[output_ctx->num_configs].config_size      = size;
-        output_ctx->num_configs++;
-    }
-
-    vpe_desc_writer_add_config_desc(
-        &vpe_priv->vpe_desc_writer, cfg_base_gpu, false, vpe_priv->config_writer.buf->tmz);
-}
-
 int32_t vpe10_program_backend(
     struct vpe_priv *vpe_priv, uint32_t pipe_idx, uint32_t cmd_idx, bool seg_only)
 {
@@ -827,7 +791,7 @@ int32_t vpe10_program_backend(
 
     vpe_priv->be_cb_ctx.vpe_priv = vpe_priv;
     config_writer_set_callback(
-        &vpe_priv->config_writer, &vpe_priv->be_cb_ctx, backend_config_callback);
+        &vpe_priv->config_writer, &vpe_priv->be_cb_ctx, vpe_backend_config_callback);
 
     config_writer_set_type(&vpe_priv->config_writer, CONFIG_TYPE_DIRECT);
 

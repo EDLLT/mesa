@@ -4278,6 +4278,16 @@ typedef struct nir_shader_compiler_options {
     */
    bool discard_is_demote;
 
+   /**
+    * Whether the new-style derivative intrinsics are supported. If false,
+    * legacy ALU derivative ops will be emitted. This transitional option will
+    * be removed once all drivers are converted to derivative intrinsics.
+    */
+   bool has_ddx_intrinsics;
+
+   /** Whether derivative intrinsics must be scalarized. */
+   bool scalarize_ddx;
+
    /** Options determining lowering and behavior of inputs and outputs. */
    nir_io_options io_options;
 
@@ -5434,7 +5444,8 @@ bool nir_lower_io_to_temporaries(nir_shader *shader,
 bool nir_lower_vars_to_scratch(nir_shader *shader,
                                nir_variable_mode modes,
                                int size_threshold,
-                               glsl_type_size_align_func size_align);
+                               glsl_type_size_align_func variable_size_align,
+                               glsl_type_size_align_func scratch_layout_size_align);
 
 void nir_lower_clip_halfz(nir_shader *shader);
 
@@ -5498,15 +5509,6 @@ void nir_assign_io_var_locations(nir_shader *shader,
                                  nir_variable_mode mode,
                                  unsigned *size,
                                  gl_shader_stage stage);
-
-typedef struct {
-   uint8_t num_linked_io_vars;
-   uint8_t num_linked_patch_io_vars;
-} nir_linked_io_var_info;
-
-nir_linked_io_var_info
-nir_assign_linked_io_var_locations(nir_shader *producer,
-                                   nir_shader *consumer);
 
 typedef enum {
    /* If set, this causes all 64-bit IO operations to be lowered on-the-fly
@@ -6510,6 +6512,8 @@ bool nir_lower_continue_constructs(nir_shader *shader);
 bool nir_shader_uses_view_index(nir_shader *shader);
 bool nir_can_lower_multiview(nir_shader *shader);
 bool nir_lower_multiview(nir_shader *shader, uint32_t view_mask);
+
+bool nir_lower_view_index_to_device_index(nir_shader *shader);
 
 typedef enum {
    nir_lower_fp16_rtz = (1 << 0),

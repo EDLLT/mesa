@@ -89,6 +89,9 @@ get_device_extensions(const struct panvk_physical_device *device,
       .EXT_private_data = true,
       .EXT_shader_module_identifier = true,
       .EXT_vertex_attribute_divisor = true,
+      .GOOGLE_decorate_string = true,
+      .GOOGLE_hlsl_functionality1 = true,
+      .GOOGLE_user_type = true,
    };
 }
 
@@ -649,13 +652,6 @@ panvk_physical_device_init(struct panvk_physical_device *device,
    int fd;
    int master_fd = -1;
 
-   if (!getenv("PAN_I_WANT_A_BROKEN_VULKAN_DRIVER")) {
-      return vk_errorf(
-         instance, VK_ERROR_INCOMPATIBLE_DRIVER,
-         "WARNING: panvk is not a conformant vulkan implementation, "
-         "pass PAN_I_WANT_A_BROKEN_VULKAN_DRIVER=1 if you know what you're doing.");
-   }
-
    fd = open(path, O_RDWR | O_CLOEXEC);
    if (fd < 0) {
       return vk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
@@ -680,6 +676,14 @@ panvk_physical_device_init(struct panvk_physical_device *device,
 
    drmFreeVersion(version);
 
+   if (!getenv("PAN_I_WANT_A_BROKEN_VULKAN_DRIVER")) {
+      close(fd);
+      return vk_errorf(
+         instance, VK_ERROR_INCOMPATIBLE_DRIVER,
+         "WARNING: panvk is not a conformant vulkan implementation, "
+         "pass PAN_I_WANT_A_BROKEN_VULKAN_DRIVER=1 if you know what you're doing.");
+   }
+
    if (instance->debug_flags & PANVK_DEBUG_STARTUP)
       vk_logi(VK_LOG_NO_OBJS(instance), "Found compatible device '%s'.", path);
 
@@ -692,6 +696,9 @@ panvk_physical_device_init(struct panvk_physical_device *device,
    }
 
    pan_kmod_dev_query_props(device->kmod.dev, &device->kmod.props);
+
+   device->model = panfrost_get_model(device->kmod.props.gpu_prod_id,
+                                      device->kmod.props.gpu_variant);
 
    unsigned arch = pan_arch(device->kmod.props.gpu_prod_id);
 
@@ -710,8 +717,6 @@ panvk_physical_device_init(struct panvk_physical_device *device,
 
    device->master_fd = master_fd;
 
-   device->model = panfrost_get_model(device->kmod.props.gpu_prod_id,
-                                      device->kmod.props.gpu_variant);
    device->formats.all = panfrost_format_table(arch);
    device->formats.blendable = panfrost_blendable_format_table(arch);
 
@@ -917,26 +922,47 @@ panvk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    panvk_arch_dispatch(arch, destroy_device, device, pAllocator);
 }
 
+static bool
+format_is_supported(struct panvk_physical_device *physical_device,
+                    const struct panfrost_format fmt)
+{
+   /* If the format ID is zero, it's not supported. */
+   if (!fmt.hw)
+      return false;
+
+   /* Compressed formats (ID < 32) are optional. We need to check against
+    * the supported formats reported by the GPU. */
+   unsigned idx = MALI_EXTRACT_INDEX(fmt.hw);
+   if (MALI_EXTRACT_TYPE(idx) == MALI_FORMAT_COMPRESSED) {
+      uint32_t supported_compr_fmts =
+         panfrost_query_compressed_formats(&physical_device->kmod.props);
+
+      assert(idx < 32);
+
+      if (!(BITFIELD_BIT(idx) & supported_compr_fmts))
+         return false;
+   }
+
+   return true;
+}
+
 static void
 get_format_properties(struct panvk_physical_device *physical_device,
                       VkFormat format, VkFormatProperties *out_properties)
 {
    VkFormatFeatureFlags tex = 0, buffer = 0;
    enum pipe_format pfmt = vk_format_to_pipe_format(format);
+
+   if (pfmt == PIPE_FORMAT_NONE)
+      goto end;
+
    const struct panfrost_format fmt = physical_device->formats.all[pfmt];
 
-   if (!pfmt || !fmt.hw)
+   if (!format_is_supported(physical_device, fmt))
       goto end;
 
    /* 3byte formats are not supported by the buffer <-> image copy helpers. */
    if (util_format_get_blocksize(pfmt) == 3)
-      goto end;
-
-   /* We don't support compressed formats yet: this is causing trouble when
-    * doing a vkCmdCopyImage() between a compressed and a non-compressed format
-    * on a tiled/AFBC resource.
-    */
-   if (util_format_is_compressed(pfmt))
       goto end;
 
    buffer |=
@@ -1065,10 +1091,6 @@ get_image_format_properties(struct panvk_physical_device *physical_device,
    }
 
    if (format_feature_flags == 0)
-      goto unsupported;
-
-   if (info->type != VK_IMAGE_TYPE_2D &&
-       util_format_is_depth_or_stencil(format))
       goto unsupported;
 
    switch (info->type) {

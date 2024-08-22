@@ -239,6 +239,7 @@ struct ir3_compiler {
 
    bool has_dp2acc;
    bool has_dp4acc;
+   bool has_compliant_dp4acc;
 
    /* Type to use for 1b nir bools: */
    type_t bool_type;
@@ -290,6 +291,9 @@ struct ir3_compiler {
     * whether the shader can use early preamble in ir3.
     */
    bool has_early_preamble;
+
+   /* True if (rptN) is supported for bary.f. */
+   bool has_rpt_bary_f;
 };
 
 void ir3_compiler_destroy(struct ir3_compiler *compiler);
@@ -344,6 +348,7 @@ enum ir3_shader_debug {
    IR3_DBG_FULLNOP = BITFIELD_BIT(16),
    IR3_DBG_NOEARLYPREAMBLE = BITFIELD_BIT(17),
    IR3_DBG_NODESCPREFETCH = BITFIELD_BIT(18),
+   IR3_DBG_EXPANDRPT = BITFIELD_BIT(19),
 
    /* MESA_DEBUG-only options: */
    IR3_DBG_SCHEDMSGS = BITFIELD_BIT(20),

@@ -27,6 +27,7 @@ libasahi_lib_files = files(
   'agx_nir_prolog_epilog.c',
   'agx_ppp.h',
   'agx_scratch.c',
+  'agx_va.c',
   'pool.c',
 )
 
@@ -36,6 +37,8 @@ libasahi_decode_files = files(
 
 libagx_shader_files = files(
   'shaders/libagx.h',
+  'shaders/draws.cl',
+  'shaders/draws.h',
   'shaders/geometry.cl',
   'shaders/geometry.h',
   'shaders/query.cl',

@@ -128,8 +128,9 @@ struct stream_ctx {
     enum color_transfer_func tf;
     enum color_space         cs;
     bool                     enable_3dlut;
-    bool                     update_3dlut;
     uint64_t                 UID_3DLUT;                 // UID for current 3D LUT params
+    bool                     geometric_scaling;
+    bool                     is_yuv_input;
 
     union {
         struct {

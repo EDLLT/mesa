@@ -234,19 +234,20 @@ hk_hash_graphics_state(struct vk_physical_device *device,
 
 static bool
 lower_load_global_constant_offset_instr(nir_builder *b,
-                                        nir_intrinsic_instr *intrin,
-                                        UNUSED void *_data)
+                                        nir_intrinsic_instr *intrin, void *data)
 {
    if (intrin->intrinsic != nir_intrinsic_load_global_constant_offset &&
        intrin->intrinsic != nir_intrinsic_load_global_constant_bounded)
       return false;
 
    b->cursor = nir_before_instr(&intrin->instr);
+   bool *has_soft_fault = data;
 
    nir_def *base_addr = intrin->src[0].ssa;
    nir_def *offset = intrin->src[1].ssa;
 
    nir_def *zero = NULL;
+   nir_def *in_bounds = NULL;
    if (intrin->intrinsic == nir_intrinsic_load_global_constant_bounded) {
       nir_def *bound = intrin->src[2].ssa;
 
@@ -260,10 +261,15 @@ lower_load_global_constant_offset_instr(nir_builder *b,
 
       nir_def *sat_offset =
          nir_umin(b, offset, nir_imm_int(b, UINT32_MAX - (load_size - 1)));
-      nir_def *in_bounds =
-         nir_ilt(b, nir_iadd_imm(b, sat_offset, load_size - 1), bound);
+      in_bounds = nir_ilt(b, nir_iadd_imm(b, sat_offset, load_size - 1), bound);
 
-      nir_push_if(b, in_bounds);
+      /* If we do not have soft fault, we branch to bounds check. This is slow,
+       * fortunately we always have soft fault for release drivers.
+       *
+       * With soft fault, we speculatively load and smash to zero at the end.
+       */
+      if (!(*has_soft_fault))
+         nir_push_if(b, in_bounds);
    }
 
    nir_def *val = nir_build_load_global_constant(
@@ -274,12 +280,15 @@ lower_load_global_constant_offset_instr(nir_builder *b,
       .access = nir_intrinsic_access(intrin));
 
    if (intrin->intrinsic == nir_intrinsic_load_global_constant_bounded) {
-      nir_pop_if(b, NULL);
-      val = nir_if_phi(b, val, zero);
+      if (*has_soft_fault) {
+         val = nir_bcsel(b, in_bounds, val, zero);
+      } else {
+         nir_pop_if(b, NULL);
+         val = nir_if_phi(b, val, zero);
+      }
    }
 
-   nir_def_rewrite_uses(&intrin->def, val);
-
+   nir_def_replace(&intrin->def, val);
    return true;
 }
 
@@ -593,8 +602,11 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
             hk_buffer_addr_format(rs->storage_buffers));
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ubo,
             hk_buffer_addr_format(rs->uniform_buffers));
+
+   bool soft_fault = agx_has_soft_fault(&dev->dev);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass,
-            lower_load_global_constant_offset_instr, nir_metadata_none, NULL);
+            lower_load_global_constant_offset_instr, nir_metadata_none,
+            &soft_fault);
 
    if (!nir->info.shared_memory_explicit_layout) {
       /* There may be garbage in shared_size, but it's the job of
@@ -659,10 +671,10 @@ hk_upload_shader(struct hk_device *dev, struct hk_shader *shader)
       size_t size = shader->b.binary_size - offs;
       assert(size > 0);
 
-      shader->bo = agx_bo_create(&dev->dev, size, AGX_BO_EXEC | AGX_BO_LOW_VA,
-                                 "Preamble");
-      memcpy(shader->bo->ptr.cpu, shader->b.binary + offs, size);
-      shader->preamble_addr = shader->bo->ptr.gpu;
+      shader->bo = agx_bo_create(&dev->dev, size, 0,
+                                 AGX_BO_EXEC | AGX_BO_LOW_VA, "Preamble");
+      memcpy(shader->bo->map, shader->b.binary + offs, size);
+      shader->preamble_addr = shader->bo->va->addr;
    }
 
    if (!shader->linked.ht) {
@@ -789,9 +801,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
 #endif
 
    struct agx_shader_key backend_key = {
-      .needs_g13x_coherency = (dev->dev.params.gpu_generation == 13 &&
-                               dev->dev.params.num_clusters_total > 1) ||
-                              dev->dev.params.num_dies > 1,
+      .dev = agx_gather_device_key(&dev->dev),
       .reserved_preamble = 128 /* TODO */,
       .libagx = dev->dev.libagx,
       .no_stop = nir->info.stage == MESA_SHADER_FRAGMENT,
@@ -859,30 +869,30 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
 static const struct vk_shader_ops hk_shader_ops;
 
 static void
-hk_destroy_linked_shader(struct hk_linked_shader *linked)
+hk_destroy_linked_shader(struct hk_device *dev, struct hk_linked_shader *linked)
 {
-   agx_bo_unreference(linked->b.bo);
+   agx_bo_unreference(&dev->dev, linked->b.bo);
    ralloc_free(linked);
 }
 
 static void
-hk_destroy_linked_shader_ht(struct hash_entry *he)
-{
-   hk_destroy_linked_shader(he->data);
-}
-
-static void
-hk_shader_destroy(struct hk_shader *s)
+hk_shader_destroy(struct hk_device *dev, struct hk_shader *s)
 {
    free((void *)s->code_ptr);
    free((void *)s->data_ptr);
-   agx_bo_unreference(s->bo);
+   agx_bo_unreference(&dev->dev, s->bo);
 
    simple_mtx_destroy(&s->linked.lock);
-   _mesa_hash_table_destroy(s->linked.ht, hk_destroy_linked_shader_ht);
 
    if (s->only_linked)
-      hk_destroy_linked_shader(s->only_linked);
+      hk_destroy_linked_shader(dev, s->only_linked);
+
+   if (s->linked.ht) {
+      hash_table_foreach(s->linked.ht, entry) {
+         hk_destroy_linked_shader(dev, entry->data);
+      }
+      _mesa_hash_table_destroy(s->linked.ht, NULL);
+   }
 }
 
 void
@@ -894,7 +904,7 @@ hk_api_shader_destroy(struct vk_device *vk_dev, struct vk_shader *vk_shader,
       container_of(vk_shader, struct hk_api_shader, vk);
 
    hk_foreach_variant(obj, shader) {
-      hk_shader_destroy(shader);
+      hk_shader_destroy(dev, shader);
    }
 
    vk_shader_free(&dev->vk, pAllocator, &obj->vk);
@@ -1420,7 +1430,7 @@ hk_fast_link(struct hk_device *dev, bool fragment, struct hk_shader *main,
 
    if (main && main->b.info.has_preamble) {
       agx_usc_pack(&b, PRESHADER, cfg) {
-         cfg.code = main->preamble_addr;
+         cfg.code = agx_usc_addr(&dev->dev, main->preamble_addr);
       }
    } else {
       agx_usc_pack(&b, NO_PRESHADER, cfg)

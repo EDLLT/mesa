@@ -218,8 +218,10 @@ v3dv_pipeline_get_nir_options(const struct v3d_device_info *devinfo)
       .lower_to_scalar = true,
       .lower_device_index_to_zero = true,
       .lower_fquantize2f16 = true,
+      .lower_ufind_msb = true,
       .has_fsub = true,
       .has_isub = true,
+      .has_uclz = true,
       .vertex_id_zero_based = false, /* FIXME: to set this to true, the intrinsic
                                       * needs to be supported */
       .lower_interpolate_at = true,
@@ -228,6 +230,8 @@ v3dv_pipeline_get_nir_options(const struct v3d_device_info *devinfo)
       .divergence_analysis_options =
          nir_divergence_multiple_workgroup_per_compute_subgroup,
       .discard_is_demote = true,
+      .has_ddx_intrinsics = true,
+      .scalarize_ddx = true,
    };
 
    if (!initialized) {

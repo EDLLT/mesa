@@ -299,10 +299,9 @@ set_speculate(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *_)
 bool
 ir3_nir_opt_preamble(nir_shader *nir, struct ir3_shader_variant *v)
 {
-   struct ir3_const_state *const_state = ir3_const_state(v);
-
    unsigned max_size;
    if (v->binning_pass) {
+      const struct ir3_const_state *const_state = ir3_const_state(v);
       max_size = const_state->preamble_size * 4;
    } else {
       struct ir3_const_state worst_case_const_state = {};
@@ -330,8 +329,10 @@ ir3_nir_opt_preamble(nir_shader *nir, struct ir3_shader_variant *v)
    unsigned size = 0;
    progress |= nir_opt_preamble(nir, &options, &size);
 
-   if (!v->binning_pass)
+   if (!v->binning_pass) {
+      struct ir3_const_state *const_state = ir3_const_state_mut(v);
       const_state->preamble_size = DIV_ROUND_UP(size, 4);
+   }
 
    return progress;
 }
@@ -613,7 +614,7 @@ get_preamble_offset(nir_def *def)
 bool
 ir3_nir_opt_prefetch_descriptors(nir_shader *nir, struct ir3_shader_variant *v)
 {
-   struct ir3_const_state *const_state = ir3_const_state(v);
+   const struct ir3_const_state *const_state = ir3_const_state(v);
 
    nir_function_impl *main = nir_shader_get_entrypoint(nir);
    struct set *instr_set = nir_instr_set_create(NULL);
@@ -760,9 +761,8 @@ ir3_nir_lower_preamble(nir_shader *nir, struct ir3_shader_variant *v)
          unsigned offset = preamble_base + nir_intrinsic_base(intrin);
          b->cursor = nir_before_instr(instr);
 
-         nir_def *new_dest =
-            nir_load_uniform(b, dest->num_components, 32, nir_imm_int(b, 0),
-                             .base = offset);
+         nir_def *new_dest = nir_load_const_ir3(
+            b, dest->num_components, 32, nir_imm_int(b, 0), .base = offset);
 
          if (dest->bit_size == 1) {
             new_dest = nir_i2b(b, new_dest);
@@ -810,7 +810,7 @@ ir3_nir_lower_preamble(nir_shader *nir, struct ir3_shader_variant *v)
             }
          }
 
-         nir_store_uniform_ir3(b, src, .base = offset);
+         nir_store_const_ir3(b, src, .base = offset);
          nir_instr_remove(instr);
          nir_instr_free(instr);
       }

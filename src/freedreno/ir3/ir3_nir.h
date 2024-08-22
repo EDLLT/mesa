@@ -61,6 +61,9 @@ void ir3_nir_lower_tess_eval(nir_shader *shader, struct ir3_shader_variant *v,
                              unsigned topology);
 void ir3_nir_lower_gs(nir_shader *shader);
 
+bool ir3_supports_vectorized_nir_op(nir_op op);
+uint8_t ir3_nir_vectorize_filter(const nir_instr *instr, const void *data);
+
 /*
  * 64b related lowering:
  */
@@ -82,7 +85,7 @@ bool ir3_nir_lower_load_constant(nir_shader *nir, struct ir3_shader_variant *v);
 void ir3_nir_analyze_ubo_ranges(nir_shader *nir, struct ir3_shader_variant *v);
 bool ir3_nir_lower_ubo_loads(nir_shader *nir, struct ir3_shader_variant *v);
 bool ir3_nir_lower_const_global_loads(nir_shader *nir, struct ir3_shader_variant *v);
-bool ir3_nir_fixup_load_uniform(nir_shader *nir);
+bool ir3_nir_fixup_load_const_ir3(nir_shader *nir);
 bool ir3_nir_opt_preamble(nir_shader *nir, struct ir3_shader_variant *v);
 bool ir3_nir_opt_prefetch_descriptors(nir_shader *nir, struct ir3_shader_variant *v);
 bool ir3_nir_lower_preamble(nir_shader *nir, struct ir3_shader_variant *v);
@@ -93,7 +96,11 @@ nir_def *ir3_nir_try_propagate_bit_shift(nir_builder *b,
 
 bool ir3_nir_opt_subgroups(nir_shader *nir, struct ir3_shader_variant *v);
 
+nir_def *ir3_get_shared_driver_ubo(nir_builder *b,
+                                   const struct ir3_driver_ubo *ubo);
 nir_def *ir3_get_driver_ubo(nir_builder *b, struct ir3_driver_ubo *ubo);
+nir_def *ir3_get_driver_consts_ubo(nir_builder *b,
+                                   struct ir3_shader_variant *v);
 nir_def *ir3_load_driver_ubo(nir_builder *b, unsigned components,
                              struct ir3_driver_ubo *ubo,
                              unsigned offset);
@@ -152,12 +159,12 @@ is_intrinsic_load(nir_intrinsic_op op)
    switch (op) {
    case nir_intrinsic_load_input:
    case nir_intrinsic_load_scratch:
-   case nir_intrinsic_load_uniform:
    case nir_intrinsic_load_ssbo:
    case nir_intrinsic_load_ubo:
    case nir_intrinsic_load_shared:
    case nir_intrinsic_load_global:
    case nir_intrinsic_load_global_ir3:
+   case nir_intrinsic_load_const_ir3:
       return true;
    default:
       return false;

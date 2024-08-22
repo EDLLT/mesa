@@ -268,6 +268,9 @@ vk_image_usage_to_format_features(VkImageUsageFlagBits usage_flag)
       return VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT;
    case VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT:
       return VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT;
+   case VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT:
+      return VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT |
+             VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT;
    default:
       return 0;
    }
@@ -1708,5 +1711,14 @@ nvk_queue_image_opaque_bind(struct nvk_queue *queue,
       }
    }
 
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+nvk_GetImageOpaqueCaptureDescriptorDataEXT(
+    VkDevice _device,
+    const VkImageCaptureDescriptorDataInfoEXT *pInfo,
+    void *pData)
+{
    return VK_SUCCESS;
 }

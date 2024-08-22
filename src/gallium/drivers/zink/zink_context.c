@@ -2754,7 +2754,7 @@ begin_rendering(struct zink_context *ctx, bool check_msaa_expand)
          else
             ctx->dynamic_fb.attachments[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
          if (use_tc_info) {
-            if (ctx->dynamic_fb.tc_info.cbuf_invalidate & BITFIELD_BIT(i))
+            if (!ctx->dynamic_fb.tc_info.has_resolve && ctx->dynamic_fb.tc_info.cbuf_invalidate & BITFIELD_BIT(i))
                ctx->dynamic_fb.attachments[i].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
             else
                ctx->dynamic_fb.attachments[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -2924,8 +2924,14 @@ begin_rendering(struct zink_context *ctx, bool check_msaa_expand)
    if (has_swapchain) {
       ASSERTED struct zink_resource *res = zink_resource(ctx->fb_state.cbufs[0]->texture);
       zink_render_fixup_swapchain(ctx);
-      if (res->use_damage)
+      if (res->use_damage) {
          ctx->dynamic_fb.info.renderArea = res->damage;
+      } else {
+         ctx->dynamic_fb.info.renderArea.offset.x = 0;
+         ctx->dynamic_fb.info.renderArea.offset.y = 0;
+         ctx->dynamic_fb.info.renderArea.extent.width = ctx->fb_state.width;
+         ctx->dynamic_fb.info.renderArea.extent.height = ctx->fb_state.height;
+      }
       /* clamp for late swapchain resize */
       if (res->base.b.width0 < ctx->dynamic_fb.info.renderArea.extent.width)
          ctx->dynamic_fb.info.renderArea.extent.width = res->base.b.width0;

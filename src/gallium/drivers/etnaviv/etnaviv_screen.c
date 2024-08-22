@@ -230,9 +230,9 @@ etna_screen_get_param(struct pipe_screen *pscreen, enum pipe_cap param)
    case PIPE_CAP_MAX_TEXTURE_2D_SIZE:
       return screen->specs.max_texture_size;
    case PIPE_CAP_MAX_TEXTURE_ARRAY_LAYERS: /* TODO: verify */
-      return screen->specs.halti >= 0 ? screen->specs.max_texture_size : 0;
+      return screen->info->halti >= 0 ? screen->specs.max_texture_size : 0;
    case PIPE_CAP_MAX_TEXTURE_3D_LEVELS:
-      if (screen->specs.halti < 0)
+      if (screen->info->halti < 0)
          return 0;
       FALLTHROUGH;
    case PIPE_CAP_MAX_TEXTURE_CUBE_LEVELS:
@@ -313,6 +313,8 @@ etna_screen_get_param(struct pipe_screen *pscreen, enum pipe_cap param)
       return 0;
    case PIPE_CAP_UMA:
       return 1;
+   case PIPE_CAP_GRAPHICS:
+      return !VIV_FEATURE(screen, ETNA_FEATURE_COMPUTE_ONLY);
    default:
       return u_pipe_screen_get_param_defaults(pscreen, param);
    }
@@ -357,7 +359,7 @@ etna_screen_get_shader_param(struct pipe_screen *pscreen,
                              enum pipe_shader_cap param)
 {
    struct etna_screen *screen = etna_screen(pscreen);
-   bool ubo_enable = screen->specs.halti >= 2;
+   bool ubo_enable = screen->info->halti >= 2;
 
    if (DBG_ENABLED(ETNA_DBG_DEQP))
       ubo_enable = true;
@@ -416,7 +418,7 @@ etna_screen_get_shader_param(struct pipe_screen *pscreen,
    case PIPE_SHADER_CAP_GLSL_16BIT_CONSTS:
       return 0;
    case PIPE_SHADER_CAP_INTEGERS:
-      return screen->specs.halti >= 2;
+      return screen->info->halti >= 2;
    case PIPE_SHADER_CAP_MAX_TEXTURE_SAMPLERS:
    case PIPE_SHADER_CAP_MAX_SAMPLER_VIEWS:
       return shader == PIPE_SHADER_FRAGMENT
@@ -452,7 +454,7 @@ gpu_supports_texture_target(struct etna_screen *screen,
       return false;
 
    /* pre-halti has no array/3D */
-   if (screen->specs.halti < 0 &&
+   if (screen->info->halti < 0 &&
        (target == PIPE_TEXTURE_1D_ARRAY ||
         target == PIPE_TEXTURE_2D_ARRAY ||
         target == PIPE_TEXTURE_3D))
@@ -827,7 +829,7 @@ static void
 etna_determine_sampler_limits(struct etna_screen *screen)
 {
    /* vertex and fragment samplers live in one address space */
-   if (screen->specs.halti >= 1) {
+   if (screen->info->halti >= 1) {
       screen->specs.vertex_sampler_offset = 16;
       screen->specs.fragment_sampler_count = 16;
       screen->specs.vertex_sampler_count = 16;
@@ -881,24 +883,9 @@ etna_get_specs(struct etna_screen *screen)
          screen->specs.nn_core_version = 6;
    }
 
-   /* Figure out gross GPU architecture. See rnndb/common.xml for a specific
-    * description of the differences. */
-   if (VIV_FEATURE(screen, ETNA_FEATURE_HALTI5))
-      screen->specs.halti = 5; /* New GC7000/GC8x00  */
-   else if (VIV_FEATURE(screen, ETNA_FEATURE_HALTI4))
-      screen->specs.halti = 4; /* Old GC7000/GC7400 */
-   else if (VIV_FEATURE(screen, ETNA_FEATURE_HALTI3))
-      screen->specs.halti = 3; /* None? */
-   else if (VIV_FEATURE(screen, ETNA_FEATURE_HALTI2))
-      screen->specs.halti = 2; /* GC2500/GC3000/GC5000/GC6400 */
-   else if (VIV_FEATURE(screen, ETNA_FEATURE_HALTI1))
-      screen->specs.halti = 1; /* GC900/GC4000/GC7000UL */
-   else if (VIV_FEATURE(screen, ETNA_FEATURE_HALTI0))
-      screen->specs.halti = 0; /* GC880/GC2000/GC7000TM */
-   else
-      screen->specs.halti = -1; /* GC7000nanolite / pre-GC2000 except GC880 */
-   if (screen->specs.halti >= 0)
-      DBG("etnaviv: GPU arch: HALTI%d", screen->specs.halti);
+   screen->info->halti = info->halti;
+   if (screen->info->halti >= 0)
+      DBG("etnaviv: GPU arch: HALTI%d", screen->info->halti);
    else
       DBG("etnaviv: GPU arch: pre-HALTI");
 
@@ -934,7 +921,7 @@ etna_get_specs(struct etna_screen *screen)
       (screen->info->model != 0x880) && /* Seamless cubemap is broken on GC880? */
       VIV_FEATURE(screen, ETNA_FEATURE_SEAMLESS_CUBE_MAP);
 
-   if (screen->specs.halti >= 5) {
+   if (screen->info->halti >= 5) {
       /* GC7000 - this core must load shaders from memory. */
       screen->specs.vs_offset = 0;
       screen->specs.ps_offset = 0;
@@ -980,11 +967,11 @@ etna_get_specs(struct etna_screen *screen)
    etna_determine_uniform_limits(screen);
    etna_determine_sampler_limits(screen);
 
-   if (screen->specs.halti >= 5) {
+   if (screen->info->halti >= 5) {
       screen->specs.has_unified_uniforms = true;
       screen->specs.vs_uniforms_offset = VIVS_SH_HALTI5_UNIFORMS_MIRROR(0);
       screen->specs.ps_uniforms_offset = VIVS_SH_HALTI5_UNIFORMS(screen->specs.max_vs_uniforms*4);
-   } else if (screen->specs.halti >= 1) {
+   } else if (screen->info->halti >= 1) {
       /* unified uniform memory on GC3000 - HALTI1 feature bit is just a guess
       */
       screen->specs.has_unified_uniforms = true;
@@ -1126,7 +1113,7 @@ etna_screen_create(struct etna_device *dev, struct etna_gpu *gpu,
 
    etna_get_specs(screen);
 
-   if (screen->specs.halti >= 5 && !etnaviv_device_softpin_capable(dev)) {
+   if (screen->info->halti >= 5 && !etnaviv_device_softpin_capable(dev)) {
       DBG("halti5 requires softpin");
       goto fail;
    }
@@ -1173,7 +1160,7 @@ etna_screen_create(struct etna_device *dev, struct etna_gpu *gpu,
    screen->dummy_rt_reloc.offset = 0;
    screen->dummy_rt_reloc.flags = ETNA_RELOC_READ | ETNA_RELOC_WRITE;
 
-   if (screen->specs.halti >= 5) {
+   if (screen->info->halti >= 5) {
       void *buf;
 
       /* create an empty dummy texture descriptor */

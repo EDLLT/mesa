@@ -423,7 +423,10 @@ legalize_block(struct ir3_legalize_ctx *ctx, struct ir3_block *block)
       if (is_input(n)) {
          struct ir3_register *inloc = n->srcs[0];
          assert(inloc->flags & IR3_REG_IMMED);
-         ctx->max_bary = MAX2(ctx->max_bary, inloc->iim_val);
+
+         int last_inloc =
+            inloc->iim_val + ((inloc->flags & IR3_REG_R) ? n->repeat : 0);
+         ctx->max_bary = MAX2(ctx->max_bary, last_inloc);
       }
 
       if ((last_n && is_barrier(last_n)) || n->opc == OPC_SHPE) {
@@ -644,7 +647,7 @@ legalize_block(struct ir3_legalize_ctx *ctx, struct ir3_block *block)
              * need to wait for previous ones.
              */
             foreach_src (reg, n) {
-               if (reg->flags & IR3_REG_SHARED) {
+               if ((reg->flags & IR3_REG_SHARED) || is_reg_a0(reg)) {
                   regmask_set(&state->needs_ss_scalar_war, reg);
                }
             }
@@ -1347,8 +1350,7 @@ dbg_sync_sched(struct ir3 *ir, struct ir3_shader_variant *so)
 {
    foreach_block (block, &ir->block_list) {
       foreach_instr_safe (instr, &block->instr_list) {
-         if (opc_cat(instr->opc) == 4 || opc_cat(instr->opc) == 5 ||
-             opc_cat(instr->opc) == 6) {
+         if (is_ss_producer(instr) || is_sy_producer(instr)) {
             struct ir3_instruction *nop = ir3_NOP(block);
             nop->flags |= IR3_INSTR_SS | IR3_INSTR_SY;
             ir3_instr_move_after(nop, instr);
@@ -1365,6 +1367,43 @@ dbg_nop_sched(struct ir3 *ir, struct ir3_shader_variant *so)
          struct ir3_instruction *nop = ir3_NOP(block);
          nop->repeat = 5;
          ir3_instr_move_before(nop, instr);
+      }
+   }
+}
+
+static void
+dbg_expand_rpt(struct ir3 *ir)
+{
+   foreach_block (block, &ir->block_list) {
+      foreach_instr_safe (instr, &block->instr_list) {
+         if (instr->repeat == 0 || instr->opc == OPC_NOP ||
+             instr->opc == OPC_SWZ || instr->opc == OPC_GAT ||
+             instr->opc == OPC_SCT) {
+            continue;
+         }
+
+         for (unsigned i = 0; i <= instr->repeat; ++i) {
+            struct ir3_instruction *rpt = ir3_instr_clone(instr);
+            ir3_instr_move_before(rpt, instr);
+            rpt->repeat = 0;
+
+            foreach_dst (dst, rpt) {
+               dst->num += i;
+               dst->wrmask = 1;
+            }
+
+            foreach_src (src, rpt) {
+               if (!(src->flags & IR3_REG_R))
+                  continue;
+
+               src->num += i;
+               src->uim_val += i;
+               src->wrmask = 1;
+               src->flags &= ~IR3_REG_R;
+            }
+         }
+
+         list_delinit(&instr->node);
       }
    }
 }
@@ -1694,6 +1733,10 @@ ir3_legalize(struct ir3 *ir, struct ir3_shader_variant *so, int *max_bary)
    }
 
    assert(ctx->early_input_release || ctx->compiler->gen >= 5);
+
+   if (ir3_shader_debug & IR3_DBG_EXPANDRPT) {
+      dbg_expand_rpt(ir);
+   }
 
    /* process each block: */
    do {

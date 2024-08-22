@@ -11466,7 +11466,7 @@ radv_dgc_execute_ib(struct radv_cmd_buffer *cmd_buffer, const VkGeneratedCommand
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const bool has_task_shader = radv_dgc_with_task_shader(pGeneratedCommandsInfo);
 
-   const uint32_t cmdbuf_size = radv_get_indirect_cmdbuf_size(pGeneratedCommandsInfo);
+   const uint32_t cmdbuf_size = radv_get_indirect_gfx_cmdbuf_size(pGeneratedCommandsInfo);
    const uint64_t ib_va =
       radv_buffer_get_va(prep_buffer->bo) + prep_buffer->offset + pGeneratedCommandsInfo->preprocessOffset;
 
@@ -12417,9 +12417,6 @@ radv_handle_depth_image_transition(struct radv_cmd_buffer *cmd_buffer, struct ra
       return;
 
    if (src_layout == VK_IMAGE_LAYOUT_UNDEFINED) {
-      radv_initialize_htile(cmd_buffer, image, range);
-   } else if (!radv_layout_is_htile_compressed(device, image, src_layout, src_queue_mask) &&
-              radv_layout_is_htile_compressed(device, image, dst_layout, dst_queue_mask)) {
       radv_initialize_htile(cmd_buffer, image, range);
    } else if (radv_layout_is_htile_compressed(device, image, src_layout, src_queue_mask) &&
               !radv_layout_is_htile_compressed(device, image, dst_layout, dst_queue_mask)) {

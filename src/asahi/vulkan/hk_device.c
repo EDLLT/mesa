@@ -43,19 +43,19 @@ static VkResult
 hk_upload_rodata(struct hk_device *dev)
 {
    dev->rodata.bo =
-      agx_bo_create(&dev->dev, AGX_SAMPLER_LENGTH, 0, "Read only data");
+      agx_bo_create(&dev->dev, AGX_SAMPLER_LENGTH, 0, 0, "Read only data");
 
    if (!dev->rodata.bo)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
 
-   uint8_t *map = dev->rodata.bo->ptr.cpu;
+   uint8_t *map = dev->rodata.bo->map;
    uint32_t offs = 0;
 
    offs = align(offs, 8);
    agx_pack(&dev->rodata.txf_sampler, USC_SAMPLER, cfg) {
       cfg.start = 0;
       cfg.count = 1;
-      cfg.buffer = dev->rodata.bo->ptr.gpu + offs;
+      cfg.buffer = dev->rodata.bo->va->addr + offs;
    }
 
    agx_pack(map + offs, SAMPLER, cfg) {
@@ -81,11 +81,11 @@ hk_upload_rodata(struct hk_device *dev)
    agx_pack(&dev->rodata.image_heap, USC_UNIFORM, cfg) {
       cfg.start_halfs = HK_IMAGE_HEAP_UNIFORM;
       cfg.size_halfs = 4;
-      cfg.buffer = dev->rodata.bo->ptr.gpu + offs;
+      cfg.buffer = dev->rodata.bo->va->addr + offs;
    }
 
-   uint64_t *image_heap_ptr = dev->rodata.bo->ptr.cpu + offs;
-   *image_heap_ptr = dev->images.bo->ptr.gpu;
+   uint64_t *image_heap_ptr = dev->rodata.bo->map + offs;
+   *image_heap_ptr = dev->images.bo->va->addr;
    offs += sizeof(uint64_t);
 
    /* The geometry state buffer isn't strictly readonly data, but we only have a
@@ -97,15 +97,15 @@ hk_upload_rodata(struct hk_device *dev)
     * So, we allocate it here for convenience.
     */
    offs = align(offs, sizeof(uint64_t));
-   dev->rodata.geometry_state = dev->rodata.bo->ptr.gpu + offs;
+   dev->rodata.geometry_state = dev->rodata.bo->va->addr + offs;
    offs += sizeof(struct agx_geometry_state);
 
    /* For null readonly buffers, we need to allocate 16 bytes of zeroes for
     * robustness2 semantics on read.
     */
    offs = align(offs, 16);
-   dev->rodata.zero_sink = dev->rodata.bo->ptr.gpu + offs;
-   memset(dev->rodata.bo->ptr.cpu + offs, 0, 16);
+   dev->rodata.zero_sink = dev->rodata.bo->va->addr + offs;
+   memset(dev->rodata.bo->map + offs, 0, 16);
    offs += 16;
 
    /* For null storage descriptors, we need to reserve 16 bytes to catch writes.
@@ -113,7 +113,7 @@ hk_upload_rodata(struct hk_device *dev)
     * without more work.
     */
    offs = align(offs, 16);
-   dev->rodata.null_sink = dev->rodata.bo->ptr.gpu + offs;
+   dev->rodata.null_sink = dev->rodata.bo->va->addr + offs;
    offs += 16;
 
    return VK_SUCCESS;
@@ -440,7 +440,7 @@ fail_mem_cache:
 fail_queue:
    hk_queue_finish(dev, &dev->queue);
 fail_rodata:
-   agx_bo_unreference(dev->rodata.bo);
+   agx_bo_unreference(&dev->dev, dev->rodata.bo);
 fail_bg_eot:
    agx_bg_eot_cleanup(&dev->bg_eot);
 fail_internal_shaders_2:
@@ -487,8 +487,8 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    hk_destroy_sampler_heap(dev, &dev->samplers);
    hk_descriptor_table_finish(dev, &dev->images);
    hk_descriptor_table_finish(dev, &dev->occlusion_queries);
-   agx_bo_unreference(dev->rodata.bo);
-   agx_bo_unreference(dev->heap);
+   agx_bo_unreference(&dev->dev, dev->rodata.bo);
+   agx_bo_unreference(&dev->dev, dev->heap);
    agx_bg_eot_cleanup(&dev->bg_eot);
    agx_close_device(&dev->dev);
    vk_free(&dev->vk.alloc, dev);

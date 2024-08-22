@@ -56,6 +56,10 @@ struct panvk_graphics_sysvals {
       uint32_t base_instance;
    } vs;
 
+   struct {
+      uint32_t multisampled;
+   } fs;
+
 #if PAN_ARCH <= 7
    /* gl_Layer on Bifrost is a bit of hack. We have to issue one draw per
     * layer, and filter primitives at the VS level.
@@ -156,8 +160,8 @@ panvk_shader_get_dev_addr(const struct panvk_shader *shader)
 }
 
 void panvk_per_arch(link_shaders)(struct panvk_pool *desc_pool,
-                                  struct panvk_shader *vs,
-                                  struct panvk_shader *fs,
+                                  const struct panvk_shader *vs,
+                                  const struct panvk_shader *fs,
                                   struct panvk_shader_link *link);
 
 static inline void

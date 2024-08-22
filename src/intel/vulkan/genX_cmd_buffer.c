@@ -464,6 +464,33 @@ transition_depth_buffer(struct anv_cmd_buffer *cmd_buffer,
    if (image->planes[depth_plane].aux_usage == ISL_AUX_USAGE_NONE)
       return;
 
+   /* Initialize the indirect clear color prior to first use. */
+   const struct anv_address clear_color_addr =
+      anv_image_get_clear_color_addr(cmd_buffer->device, image,
+                                     VK_IMAGE_ASPECT_DEPTH_BIT);
+   if (!anv_address_is_null(clear_color_addr) &&
+       (initial_layout == VK_IMAGE_LAYOUT_UNDEFINED ||
+        initial_layout == VK_IMAGE_LAYOUT_PREINITIALIZED)) {
+      const enum isl_format depth_format =
+         image->planes[depth_plane].primary_surface.isl.format;
+      assert(ANV_HZ_FC_VAL == 1.0f);
+      const uint32_t depth_value = depth_format == ISL_FORMAT_R32_FLOAT ?
+                                   0x3f800000 : ~0;
+
+      const uint32_t clear_pixel_offset = clear_color_addr.offset +
+         isl_get_sampler_clear_field_offset(cmd_buffer->device->info,
+                                            depth_format);
+      const struct anv_address clear_pixel_addr = {
+         .bo = clear_color_addr.bo,
+         .offset = clear_pixel_offset,
+      };
+
+      struct mi_builder b;
+      mi_builder_init(&b, cmd_buffer->device->info, &cmd_buffer->batch);
+      mi_builder_set_write_check(&b, true);
+      mi_store(&b, mi_mem32(clear_pixel_addr), mi_imm(depth_value));
+   }
+
    /* If will_full_fast_clear is set, the caller promises to fast-clear the
     * largest portion of the specified range as it can.
     */
@@ -1342,28 +1369,6 @@ transition_color_buffer(struct anv_cmd_buffer *cmd_buffer,
    if (resolve_op == ISL_AUX_OP_NONE)
       return;
 
-   /* Perform a resolve to synchronize data between the main and aux buffer.
-    * Before we begin, we must satisfy the cache flushing requirement specified
-    * in the Sky Lake PRM Vol. 7, "MCS Buffer for Render Target(s)":
-    *
-    *    Any transition from any value in {Clear, Render, Resolve} to a
-    *    different value in {Clear, Render, Resolve} requires end of pipe
-    *    synchronization.
-    *
-    * We perform a flush of the write cache before and after the clear and
-    * resolve operations to meet this requirement.
-    *
-    * Unlike other drawing, fast clear operations are not properly
-    * synchronized. The first PIPE_CONTROL here likely ensures that the
-    * contents of the previous render or clear hit the render target before we
-    * resolve and the second likely ensures that the resolve is complete before
-    * we do any more rendering or clearing.
-    */
-   anv_add_pending_pipe_bits(cmd_buffer,
-                             ANV_PIPE_RENDER_TARGET_CACHE_FLUSH_BIT |
-                             ANV_PIPE_END_OF_PIPE_SYNC_BIT,
-                             "before transition RT");
-
    for (uint32_t l = 0; l < level_count; l++) {
       uint32_t level = base_level + l;
 
@@ -1406,11 +1411,6 @@ transition_color_buffer(struct anv_cmd_buffer *cmd_buffer,
          }
       }
    }
-
-   anv_add_pending_pipe_bits(cmd_buffer,
-                             ANV_PIPE_RENDER_TARGET_CACHE_FLUSH_BIT |
-                             ANV_PIPE_END_OF_PIPE_SYNC_BIT,
-                             "after transition RT");
 }
 
 static MUST_CHECK VkResult
@@ -1851,14 +1851,6 @@ genX(cmd_buffer_apply_pipe_flushes)(struct anv_cmd_buffer *cmd_buffer)
       return;
    }
 
-   const bool trace_flush =
-      (bits & (ANV_PIPE_FLUSH_BITS |
-               ANV_PIPE_STALL_BITS |
-               ANV_PIPE_INVALIDATE_BITS |
-               ANV_PIPE_END_OF_PIPE_SYNC_BIT)) != 0;
-   if (trace_flush)
-      trace_intel_begin_stall(&cmd_buffer->trace);
-
    if (GFX_VER == 9 &&
        (bits & ANV_PIPE_CS_STALL_BIT) &&
        (bits & ANV_PIPE_VF_CACHE_INVALIDATE_BIT)) {
@@ -1870,7 +1862,6 @@ genX(cmd_buffer_apply_pipe_flushes)(struct anv_cmd_buffer *cmd_buffer)
       memset(&cmd_buffer->state.gfx.ib_dirty_range, 0,
              sizeof(cmd_buffer->state.gfx.ib_dirty_range));
    }
-
 
    enum anv_pipe_bits emitted_bits = 0;
    cmd_buffer->state.pending_pipe_bits =
@@ -1893,20 +1884,6 @@ genX(cmd_buffer_apply_pipe_flushes)(struct anv_cmd_buffer *cmd_buffer)
    }
 #endif
 
-   if (trace_flush) {
-      trace_intel_end_stall(&cmd_buffer->trace,
-                            bits & ~cmd_buffer->state.pending_pipe_bits,
-                            anv_pipe_flush_bit_to_ds_stall_flag,
-                            cmd_buffer->state.pc_reasons[0],
-                            cmd_buffer->state.pc_reasons[1],
-                            cmd_buffer->state.pc_reasons[2],
-                            cmd_buffer->state.pc_reasons[3]);
-      cmd_buffer->state.pc_reasons[0] = NULL;
-      cmd_buffer->state.pc_reasons[1] = NULL;
-      cmd_buffer->state.pc_reasons[2] = NULL;
-      cmd_buffer->state.pc_reasons[3] = NULL;
-      cmd_buffer->state.pc_reasons_count = 0;
-   }
 }
 
 static inline struct anv_state
@@ -2455,6 +2432,20 @@ genX(batch_emit_pipe_control_write)(struct anv_batch *batch,
        (batch->engine_class == INTEL_ENGINE_CLASS_VIDEO))
       unreachable("Trying to emit unsupported PIPE_CONTROL command.");
 
+   const bool trace_flush =
+      (bits & (ANV_PIPE_FLUSH_BITS |
+               ANV_PIPE_STALL_BITS |
+               ANV_PIPE_INVALIDATE_BITS |
+               ANV_PIPE_END_OF_PIPE_SYNC_BIT)) != 0;
+   if (trace_flush && batch->trace != NULL) {
+      // Store pipe control reasons if there is enough space
+      if (batch->pc_reasons_count < ARRAY_SIZE(batch->pc_reasons)) {
+         batch->pc_reasons[batch->pc_reasons_count++] = reason;
+      }
+      trace_intel_begin_stall(batch->trace);
+   }
+
+
    /* XXX - insert all workarounds and GFX specific things below. */
 
    /* Wa_14014966230: For COMPUTE Workload - Any PIPE_CONTROL command with
@@ -2590,6 +2581,20 @@ genX(batch_emit_pipe_control_write)(struct anv_batch *batch,
       pipe.ImmediateData = imm_data;
 
       anv_debug_dump_pc(pipe, reason);
+   }
+
+   if (trace_flush && batch->trace != NULL) {
+         trace_intel_end_stall(batch->trace, bits,
+                               anv_pipe_flush_bit_to_ds_stall_flag,
+                               batch->pc_reasons[0],
+                               batch->pc_reasons[1],
+                               batch->pc_reasons[2],
+                               batch->pc_reasons[3]);
+         batch->pc_reasons[0] = NULL;
+         batch->pc_reasons[1] = NULL;
+         batch->pc_reasons[2] = NULL;
+         batch->pc_reasons[3] = NULL;
+         batch->pc_reasons_count = 0;
    }
 }
 
@@ -2803,6 +2808,352 @@ genX(cmd_buffer_begin_companion)(struct anv_cmd_buffer *cmd_buffer,
       anv_add_pending_pipe_bits(cmd_buffer,
                                 ANV_PIPE_AUX_TABLE_INVALIDATE_BIT,
                                 "new cmd buffer with aux-tt");
+   }
+}
+
+static bool
+aux_op_resolves(enum isl_aux_op aux_op)
+{
+   return aux_op == ISL_AUX_OP_FULL_RESOLVE ||
+          aux_op == ISL_AUX_OP_PARTIAL_RESOLVE;
+}
+
+static bool
+aux_op_clears(enum isl_aux_op aux_op)
+{
+   return aux_op == ISL_AUX_OP_FAST_CLEAR ||
+          aux_op == ISL_AUX_OP_AMBIGUATE;
+}
+
+static bool
+aux_op_renders(enum isl_aux_op aux_op)
+{
+   return aux_op == ISL_AUX_OP_NONE;
+}
+
+static void
+add_pending_pipe_bits_for_color_aux_op(struct anv_cmd_buffer *cmd_buffer,
+                                       enum isl_aux_op next_aux_op,
+                                       enum anv_pipe_bits pipe_bits)
+{
+   const enum isl_aux_op last_aux_op = cmd_buffer->state.color_aux_op;
+   assert(next_aux_op != last_aux_op);
+
+   char flush_reason[64] = {};
+   if (INTEL_DEBUG(DEBUG_PIPE_CONTROL) ||
+       u_trace_enabled(&cmd_buffer->device->ds.trace_context)) {
+      int ret = snprintf(flush_reason, sizeof(flush_reason),
+                         "color aux-op: %s -> %s",
+                         isl_aux_op_to_name(last_aux_op),
+                         isl_aux_op_to_name(next_aux_op));
+      assert(ret < sizeof(flush_reason));
+   }
+
+   anv_add_pending_pipe_bits(cmd_buffer, pipe_bits, flush_reason);
+}
+
+void
+genX(cmd_buffer_update_color_aux_op)(struct anv_cmd_buffer *cmd_buffer,
+                                     enum isl_aux_op next_aux_op)
+{
+   const enum isl_aux_op last_aux_op = cmd_buffer->state.color_aux_op;
+
+   if (!aux_op_clears(last_aux_op) && aux_op_clears(next_aux_op)) {
+#if GFX_VER >= 20
+      /* From the Xe2 Bspec 57340 (r59562),
+       * "MCS/CCS Buffers, Fast Clear for Render Target(s)":
+       *
+       *    Synchronization:
+       *    Due to interaction of scaled clearing rectangle with pixel
+       *    scoreboard, we require one of the following commands to be
+       *    issued. [...]
+       *
+       *    PIPE_CONTROL
+       *    PSS Stall Sync Enable            [...] 1b (Enable)
+       *       Machine-wide Stall at Pixel Stage, wait for all Prior Pixel
+       *       Work to Reach End of Pipe
+       *    Render Target Cache Flush Enable [...] 1b (Enable)
+       *       Post-Sync Op Flushes Render Cache before Unblocking Stall
+       *
+       *    This synchronization step is required before and after the fast
+       *    clear pass, to ensure correct ordering between pixels.
+       */
+      add_pending_pipe_bits_for_color_aux_op(
+            cmd_buffer, next_aux_op,
+            ANV_PIPE_PSS_STALL_SYNC_BIT |
+            ANV_PIPE_RENDER_TARGET_CACHE_FLUSH_BIT);
+
+#elif GFX_VERx10 == 125
+      /* From the ACM Bspec 47704 (r52663), "Render Target Fast Clear":
+       *
+       *    Preamble pre fast clear synchronization
+       *
+       *    PIPE_CONTROL:
+       *    PS sync stall = 1
+       *    Tile Cache Flush = 1
+       *    RT Write Flush = 1
+       *    HDC Flush = 1
+       *    DC Flush = 1
+       *    Texture Invalidate = 1
+       *
+       *    [...]
+       *
+       *    Objective of the preamble flushes is to ensure all data is
+       *    evicted from L1 caches prior to fast clear.
+       *
+       * From the ACM PRM Vol. 9, "MCS/CCS Buffers for Render Target(s)":
+       *
+       *    Any transition from any value in {Clear, Render, Resolve} to a
+       *    different value in {Clear, Render, Resolve} requires end of pipe
+       *    synchronization.
+       */
+      add_pending_pipe_bits_for_color_aux_op(
+            cmd_buffer, next_aux_op,
+            ANV_PIPE_PSS_STALL_SYNC_BIT |
+            ANV_PIPE_TILE_CACHE_FLUSH_BIT |
+            ANV_PIPE_RENDER_TARGET_CACHE_FLUSH_BIT |
+            ANV_PIPE_HDC_PIPELINE_FLUSH_BIT |
+            ANV_PIPE_DATA_CACHE_FLUSH_BIT |
+            ANV_PIPE_TEXTURE_CACHE_INVALIDATE_BIT |
+            ANV_PIPE_END_OF_PIPE_SYNC_BIT);
+
+#elif GFX_VERx10 == 120
+      /* From the TGL Bspec 47704 (r52663), "Render Target Fast Clear":
+       *
+       *    Preamble pre fast clear synchronization
+       *
+       *    PIPE_CONTROL:
+       *    Depth Stall = 1
+       *    Tile Cache Flush = 1
+       *    RT Write Flush = 1
+       *    Texture Invalidate = 1
+       *
+       *    [...]
+       *
+       *    Objective of the preamble flushes is to ensure all data is
+       *    evicted from L1 caches prior to fast clear.
+       *
+       * From the TGL PRM Vol. 9, "MCS/CCS Buffers for Render Target(s)":
+       *
+       *    Any transition from any value in {Clear, Render, Resolve} to a
+       *    different value in {Clear, Render, Resolve} requires end of pipe
+       *    synchronization.
+       */
+      add_pending_pipe_bits_for_color_aux_op(
+            cmd_buffer, next_aux_op,
+            ANV_PIPE_DEPTH_STALL_BIT  |
+            ANV_PIPE_TILE_CACHE_FLUSH_BIT |
+            ANV_PIPE_RENDER_TARGET_CACHE_FLUSH_BIT |
+            ANV_PIPE_TEXTURE_CACHE_INVALIDATE_BIT |
+            ANV_PIPE_END_OF_PIPE_SYNC_BIT);
+
+#else
+      /* From the Sky Lake PRM Vol. 7, "MCS Buffer for Render Target(s)":
+       *
+       *    Any transition from any value in {Clear, Render, Resolve} to a
+       *    different value in {Clear, Render, Resolve} requires end of pipe
+       *    synchronization.
+       *
+       * From the Sky Lake PRM Vol. 7, "Render Target Fast Clear":
+       *
+       *    After Render target fast clear, pipe-control with color cache
+       *    write-flush must be issued before sending any DRAW commands on
+       *    that render target.
+       *
+       * The last comment is a bit cryptic and doesn't really tell you what's
+       * going or what's really needed.  It appears that fast clear ops are
+       * not properly synchronized with other drawing.  This means that we
+       * cannot have a fast clear operation in the pipe at the same time as
+       * other regular drawing operations.  We need to use a PIPE_CONTROL
+       * to ensure that the contents of the previous draw hit the render
+       * target before we resolve and then use a second PIPE_CONTROL after
+       * the resolve to ensure that it is completed before any additional
+       * drawing occurs.
+       */
+      add_pending_pipe_bits_for_color_aux_op(
+            cmd_buffer, next_aux_op,
+            ANV_PIPE_RENDER_TARGET_CACHE_FLUSH_BIT |
+            ANV_PIPE_END_OF_PIPE_SYNC_BIT);
+#endif
+
+   } else if (aux_op_clears(last_aux_op) && !aux_op_clears(next_aux_op)) {
+#if GFX_VER >= 20
+      /* From the Xe2 Bspec 57340 (r59562),
+       * "MCS/CCS Buffers, Fast Clear for Render Target(s)":
+       *
+       *    Synchronization:
+       *    Due to interaction of scaled clearing rectangle with pixel
+       *    scoreboard, we require one of the following commands to be
+       *    issued. [...]
+       *
+       *    PIPE_CONTROL
+       *    PSS Stall Sync Enable            [...] 1b (Enable)
+       *       Machine-wide Stall at Pixel Stage, wait for all Prior Pixel
+       *       Work to Reach End of Pipe
+       *    Render Target Cache Flush Enable [...] 1b (Enable)
+       *       Post-Sync Op Flushes Render Cache before Unblocking Stall
+       *
+       *    This synchronization step is required before and after the fast
+       *    clear pass, to ensure correct ordering between pixels.
+       */
+      add_pending_pipe_bits_for_color_aux_op(
+            cmd_buffer, next_aux_op,
+            ANV_PIPE_PSS_STALL_SYNC_BIT |
+            ANV_PIPE_RENDER_TARGET_CACHE_FLUSH_BIT);
+
+#elif GFX_VERx10 == 125
+      /* From the ACM PRM Vol. 9, "Color Fast Clear Synchronization":
+       *
+       *    Postamble post fast clear synchronization
+       *
+       *    PIPE_CONTROL:
+       *    PS sync stall = 1
+       *    RT flush = 1
+       *
+       * From the ACM PRM Vol. 9, "MCS/CCS Buffers for Render Target(s)":
+       *
+       *    Any transition from any value in {Clear, Render, Resolve} to a
+       *    different value in {Clear, Render, Resolve} requires end of pipe
+       *    synchronization.
+       */
+      add_pending_pipe_bits_for_color_aux_op(
+            cmd_buffer, next_aux_op,
+            ANV_PIPE_PSS_STALL_SYNC_BIT |
+            ANV_PIPE_RENDER_TARGET_CACHE_FLUSH_BIT |
+            ANV_PIPE_END_OF_PIPE_SYNC_BIT);
+
+#elif GFX_VERx10 == 120
+      /* From the TGL PRM Vol. 9, "Color Fast Clear Synchronization":
+       *
+       *    Postamble post fast clear synchronization
+       *
+       *    PIPE_CONTROL:
+       *    Depth Stall = 1
+       *    Tile Cache Flush = 1
+       *    RT Write Flush = 1
+       *
+       * From the TGL PRM Vol. 9, "MCS/CCS Buffers for Render Target(s)":
+       *
+       *    Any transition from any value in {Clear, Render, Resolve} to a
+       *    different value in {Clear, Render, Resolve} requires end of pipe
+       *    synchronization.
+       *
+       */
+      add_pending_pipe_bits_for_color_aux_op(
+            cmd_buffer, next_aux_op,
+            ANV_PIPE_DEPTH_STALL_BIT |
+            ANV_PIPE_TILE_CACHE_FLUSH_BIT |
+            ANV_PIPE_RENDER_TARGET_CACHE_FLUSH_BIT |
+            ANV_PIPE_END_OF_PIPE_SYNC_BIT);
+
+#else
+      /* From the Sky Lake PRM Vol. 7, "Render Target Fast Clear":
+       *
+       *    After Render target fast clear, pipe-control with color cache
+       *    write-flush must be issued before sending any DRAW commands on
+       *    that render target.
+       *
+       * From the Sky Lake PRM Vol. 7, "MCS Buffer for Render Target(s)":
+       *
+       *    Any transition from any value in {Clear, Render, Resolve} to a
+       *    different value in {Clear, Render, Resolve} requires end of pipe
+       *    synchronization.
+       */
+      add_pending_pipe_bits_for_color_aux_op(
+            cmd_buffer, next_aux_op,
+            ANV_PIPE_RENDER_TARGET_CACHE_FLUSH_BIT |
+            ANV_PIPE_END_OF_PIPE_SYNC_BIT);
+#endif
+
+   } else if (aux_op_renders(last_aux_op) != aux_op_renders(next_aux_op)) {
+      assert(aux_op_resolves(last_aux_op) != aux_op_resolves(next_aux_op));
+      /* From the Sky Lake PRM Vol. 7, "MCS Buffer for Render Target(s)":
+       *
+       *    Any transition from any value in {Clear, Render, Resolve} to a
+       *    different value in {Clear, Render, Resolve} requires end of pipe
+       *    synchronization.
+       *
+       * We perform a flush of the write cache before and after the clear and
+       * resolve operations to meet this requirement.
+       *
+       * Unlike other drawing, fast clear operations are not properly
+       * synchronized. The first PIPE_CONTROL here likely ensures that the
+       * contents of the previous render or clear hit the render target before
+       * we resolve and the second likely ensures that the resolve is complete
+       * before we do any more rendering or clearing.
+       */
+      add_pending_pipe_bits_for_color_aux_op(
+            cmd_buffer, next_aux_op,
+            ANV_PIPE_RENDER_TARGET_CACHE_FLUSH_BIT |
+            ANV_PIPE_END_OF_PIPE_SYNC_BIT);
+   }
+
+   if (next_aux_op == ISL_AUX_OP_FAST_CLEAR &&
+       cmd_buffer->device->isl_dev.ss.clear_color_state_size > 0) {
+      /* From the ICL PRM Vol. 9, "Render Target Fast Clear":
+       *
+       *    HwManaged FastClear allows SW to store FastClearValue in separate
+       *    graphics allocation, instead of keeping them in
+       *    RENDER_SURFACE_STATE. This behavior can be enabled by setting
+       *    ClearValueAddressEnable in RENDER_SURFACE_STATE.
+       *
+       *    Proper sequence of commands is as follows:
+       *
+       *       1. Storing clear color to allocation
+       *       2. Ensuring that step 1. is finished and visible for
+       *          TextureCache
+       *       3. Performing FastClear
+       *
+       *    Step 2. is required on products with ClearColorConversion feature.
+       *    This feature is enabled by setting ClearColorConversionEnable.
+       *    This causes HW to read stored color from ClearColorAllocation and
+       *    write back with the native format or RenderTarget - and clear
+       *    color needs to be present and visible. Reading is done from
+       *    TextureCache, writing is done to RenderCache.
+       *
+       * Invalidate the texture cache so that the clear color conversion
+       * feature works properly.
+       */
+      anv_add_pending_pipe_bits(cmd_buffer,
+                                ANV_PIPE_TEXTURE_CACHE_INVALIDATE_BIT,
+                                "Invalidate for clear color conversion");
+
+      /* From the ICL PRM Vol. 9, "State Caching":
+       *
+       *    Any values referenced by pointers within the RENDER_SURFACE_STATE
+       *    or SAMPLER_STATE (e.g. Clear Color Pointer, Border Color or
+       *    Indirect State Pointer) are considered to be part of that state
+       *    and any changes to these referenced values requires an
+       *    invalidation of the L1 state cache to ensure the new values are
+       *    being used as part of the state. In the case of surface data
+       *    pointed to by the Surface Base Address in RENDER SURFACE STATE,
+       *    the Texture Cache must be invalidated if the surface data changes.
+       *
+       * We could alternatively perform this invalidation when we stop
+       * fast-clearing. A benefit to doing it now, when transitioning to a
+       * fast clear, is that we save a pipe control by combining the state
+       * cache invalidation with the texture cache invalidation.
+       */
+      if (last_aux_op != ISL_AUX_OP_FAST_CLEAR) {
+         anv_add_pending_pipe_bits(cmd_buffer,
+                                   ANV_PIPE_STATE_CACHE_INVALIDATE_BIT,
+                                   "Invalidate for new clear color");
+      }
+   }
+
+   /* Update the auxiliary surface operation, but with one exception. */
+   if (last_aux_op == ISL_AUX_OP_FAST_CLEAR &&
+       next_aux_op == ISL_AUX_OP_AMBIGUATE) {
+      assert(aux_op_clears(last_aux_op) && aux_op_clears(next_aux_op));
+      /* Fast clears and ambiguates are in the same class of operation, but
+       * fast clears have more stringent synchronization requirements. For
+       * better performance, don't replace the current fast clear operation
+       * state with ambiguate. This allows us to perform one state cache
+       * invalidation when leaving a sequence which alternates between
+       * ambiguates and clears, instead of multiple such invalidations.
+       */
+   } else {
+      cmd_buffer->state.color_aux_op = next_aux_op;
    }
 }
 
@@ -3103,6 +3454,9 @@ end_command_buffer(struct anv_cmd_buffer *cmd_buffer)
                                 "query clear flush prior command buffer end");
    }
 
+   /* Flush any in-progress CCS/MCS operations in preparation for chaining. */
+   genX(cmd_buffer_update_color_aux_op(cmd_buffer, ISL_AUX_OP_NONE));
+
    genX(cmd_buffer_flush_generated_draws)(cmd_buffer);
 
    /* Turn on object level preemption if it is disabled to have it in known
@@ -3199,6 +3553,11 @@ genX(CmdExecuteCommands)(
                                 ANV_PIPE_QUERY_BITS(container->state.queries.clear_bits),
                                 "query clear flush prior to secondary buffer");
    }
+
+   /* Ensure we're in a regular drawing cache mode (assumption for all
+    * secondary).
+    */
+   genX(cmd_buffer_update_color_aux_op(container, ISL_AUX_OP_NONE));
 
    /* The secondary command buffer doesn't know which textures etc. have been
     * flushed prior to their execution.  Apply those flushes now.
@@ -4723,40 +5082,28 @@ cmd_buffer_emit_depth_stencil(struct anv_cmd_buffer *cmd_buffer)
 
    isl_emit_depth_stencil_hiz_s(&device->isl_dev, dw, &info);
 
-   /* Wa_14016712196:
-    * Emit depth flush after state that sends implicit depth flush.
-    */
-   if (intel_needs_workaround(cmd_buffer->device->info, 14016712196)) {
-      genx_batch_emit_pipe_control(&cmd_buffer->batch,
-                                   cmd_buffer->device->info,
-                                   cmd_buffer->state.current_pipeline,
-                                   ANV_PIPE_DEPTH_CACHE_FLUSH_BIT);
+   if (intel_needs_workaround(cmd_buffer->device->info, 1408224581) ||
+       intel_needs_workaround(cmd_buffer->device->info, 14014097488) ||
+       intel_needs_workaround(cmd_buffer->device->info, 14016712196)) {
+      /* Wa_1408224581
+       *
+       * Workaround: Gfx12LP Astep only An additional pipe control with
+       * post-sync = store dword operation would be required.( w/a is to have
+       * an additional pipe control after the stencil state whenever the
+       * surface state bits of this state is changing).
+       *
+       * This also seems sufficient to handle Wa_14014097488 and
+       * Wa_14016712196.
+       */
+      genx_batch_emit_pipe_control_write(&cmd_buffer->batch, device->info,
+                                         cmd_buffer->state.current_pipeline,
+                                         WriteImmediateData,
+                                         device->workaround_address, 0, 0);
    }
 
    if (info.depth_surf)
       genX(cmd_buffer_emit_gfx12_depth_wa)(cmd_buffer, info.depth_surf);
 
-   if (GFX_VER >= 11) {
-      cmd_buffer->state.pending_pipe_bits |= ANV_PIPE_POST_SYNC_BIT;
-      genX(cmd_buffer_apply_pipe_flushes)(cmd_buffer);
-
-      if (intel_needs_workaround(cmd_buffer->device->info, 1408224581) ||
-          intel_needs_workaround(cmd_buffer->device->info, 14014097488)) {
-         /* Wa_1408224581
-          *
-          * Workaround: Gfx12LP Astep only An additional pipe control with
-          * post-sync = store dword operation would be required.( w/a is to
-          * have an additional pipe control after the stencil state whenever
-          * the surface state bits of this state is changing).
-          *
-          * This also seems sufficient to handle Wa_14014097488.
-          */
-         genx_batch_emit_pipe_control_write
-            (&cmd_buffer->batch, cmd_buffer->device->info,
-             cmd_buffer->state.current_pipeline, WriteImmediateData,
-             cmd_buffer->device->workaround_address, 0, 0);
-      }
-   }
    cmd_buffer->state.hiz_enabled = isl_aux_usage_has_hiz(info.hiz_usage);
 }
 
@@ -4796,14 +5143,15 @@ cmd_buffer_emit_cps_control_buffer(struct anv_cmd_buffer *cmd_buffer,
    isl_emit_cpb_control_s(&device->isl_dev, dw, &info);
 
    /* Wa_14016712196:
-    * Emit depth flush after state that sends implicit depth flush.
+    * Emit dummy pipe control after state that sends implicit depth flush.
     */
-   if (intel_needs_workaround(cmd_buffer->device->info, 14016712196)) {
-      genx_batch_emit_pipe_control(&cmd_buffer->batch,
-                                   cmd_buffer->device->info,
-                                   cmd_buffer->state.current_pipeline,
-                                   ANV_PIPE_DEPTH_CACHE_FLUSH_BIT);
+   if (intel_needs_workaround(device->info, 14016712196)) {
+      genx_batch_emit_pipe_control_write(&cmd_buffer->batch, device->info,
+                                         cmd_buffer->state.current_pipeline,
+                                         WriteImmediateData,
+                                         device->workaround_address, 0, 0);
    }
+
 #endif /* GFX_VERx10 >= 125 */
 }
 

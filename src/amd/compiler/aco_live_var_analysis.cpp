@@ -10,7 +10,7 @@
 namespace aco {
 
 RegisterDemand
-get_live_changes(aco_ptr<Instruction>& instr)
+get_live_changes(Instruction* instr)
 {
    RegisterDemand changes;
    for (const Definition& def : instr->definitions) {
@@ -40,7 +40,7 @@ get_additional_operand_demand(Instruction* instr)
 }
 
 RegisterDemand
-get_temp_registers(aco_ptr<Instruction>& instr)
+get_temp_registers(Instruction* instr)
 {
    RegisterDemand demand_before;
    RegisterDemand demand_after;
@@ -60,7 +60,7 @@ get_temp_registers(aco_ptr<Instruction>& instr)
       }
    }
 
-   demand_before += get_additional_operand_demand(instr.get());
+   demand_before += get_additional_operand_demand(instr);
    demand_after.update(demand_before);
    return demand_after;
 }
@@ -179,8 +179,13 @@ process_live_temps_per_block(live_ctx& ctx, Block* block)
       ctx.program->needs_vcc |= instr_needs_vcc(insn);
       insn->register_demand = RegisterDemand(new_demand.vgpr, new_demand.sgpr);
 
+      bool has_vgpr_def = false;
+
       /* KILL */
       for (Definition& definition : insn->definitions) {
+         has_vgpr_def |= definition.regClass().type() == RegType::vgpr &&
+                         !definition.regClass().is_linear_vgpr();
+
          if (!definition.isTemp()) {
             continue;
          }
@@ -199,11 +204,52 @@ process_live_temps_per_block(live_ctx& ctx, Block* block)
          }
       }
 
+      if (ctx.program->gfx_level >= GFX10 && insn->isVALU() &&
+          insn->definitions.back().regClass() == s2) {
+         /* RDNA2 ISA doc, 6.2.4. Wave64 Destination Restrictions:
+          * The first pass of a wave64 VALU instruction may not overwrite a scalar value used by
+          * the second half.
+          */
+         bool carry_in = insn->opcode == aco_opcode::v_addc_co_u32 ||
+                         insn->opcode == aco_opcode::v_subb_co_u32 ||
+                         insn->opcode == aco_opcode::v_subbrev_co_u32;
+         for (unsigned op_idx = 0; op_idx < (carry_in ? 2 : insn->operands.size()); op_idx++) {
+            if (insn->operands[op_idx].isOfType(RegType::sgpr))
+               insn->operands[op_idx].setLateKill(true);
+         }
+      } else if (insn->opcode == aco_opcode::p_bpermute_readlane ||
+                 insn->opcode == aco_opcode::p_bpermute_permlane ||
+                 insn->opcode == aco_opcode::p_bpermute_shared_vgpr ||
+                 insn->opcode == aco_opcode::p_dual_src_export_gfx11 ||
+                 insn->opcode == aco_opcode::v_mqsad_u32_u8) {
+         for (Operand& op : insn->operands)
+            op.setLateKill(true);
+      } else if (insn->opcode == aco_opcode::p_interp_gfx11) {
+         insn->operands.back().setLateKill(true); /* we don't want the bld.lm def to use m0 */
+         if (insn->operands.size() == 7)
+            insn->operands[5].setLateKill(true); /* we re-use the destination reg in the middle */
+      } else if (insn->opcode == aco_opcode::v_interp_p1_f32 && ctx.program->dev.has_16bank_lds) {
+         insn->operands[0].setLateKill(true);
+      } else if (insn->opcode == aco_opcode::p_init_scratch) {
+         insn->operands.back().setLateKill(true);
+      } else if (instr_info.classes[(int)insn->opcode] == instr_class::wmma) {
+         insn->operands[0].setLateKill(true);
+         insn->operands[1].setLateKill(true);
+      }
+
       /* we need to do this in a separate loop because the next one can
        * setKill() for several operands at once and we don't want to
        * overwrite that in a later iteration */
-      for (Operand& op : insn->operands)
+      for (Operand& op : insn->operands) {
          op.setKill(false);
+         /* Linear vgprs must be late kill: this is to ensure linear VGPR operands and
+          * normal VGPR definitions don't try to use the same register, which is problematic
+          * because of assignment restrictions.
+          */
+         if (op.hasRegClass() && op.regClass().is_linear_vgpr() && !op.isUndefined() &&
+             has_vgpr_def)
+            op.setLateKill(true);
+      }
 
       /* GEN */
       for (unsigned i = 0; i < insn->operands.size(); ++i) {
@@ -282,10 +328,8 @@ process_live_temps_per_block(live_ctx& ctx, Block* block)
                 block->logical_preds.back() <= block->linear_preds.back());
          ctx.worklist = std::max<int>(ctx.worklist, block->linear_preds.back());
       } else {
-         for (unsigned t : live) {
-            aco_err(ctx.program, "Temporary never defined or are defined after use: %%%d in BB%d",
-                    t, block->index);
-         }
+         ASSERTED bool is_valid = validate_ir(ctx.program);
+         assert(!is_valid);
       }
    }
 

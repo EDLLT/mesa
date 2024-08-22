@@ -679,12 +679,6 @@ r600_lower_to_scalar_instr_filter(const nir_instr *instr, const void *)
    case nir_op_fdot2:
    case nir_op_fdot3:
    case nir_op_fdot4:
-   case nir_op_fddx:
-   case nir_op_fddx_coarse:
-   case nir_op_fddx_fine:
-   case nir_op_fddy:
-   case nir_op_fddy_coarse:
-   case nir_op_fddy_fine:
       return nir_src_bit_size(alu->src[0].src) == 64;
    default:
       return true;
@@ -847,6 +841,7 @@ r600_lower_and_optimize_nir(nir_shader *sh,
               nir_lower_vars_to_scratch,
               nir_var_function_temp,
               40,
+              r600_get_natural_size_align_bytes,
               r600_get_natural_size_align_bytes);
 
    while (optimize_once(sh))

@@ -7,6 +7,7 @@
 #include "hk_cmd_buffer.h"
 
 #include "agx_bo.h"
+#include "agx_device.h"
 #include "agx_linker.h"
 #include "agx_tilebuffer.h"
 #include "agx_usc.h"
@@ -26,7 +27,6 @@
 #include "vk_pipeline_layout.h"
 #include "vk_synchronization.h"
 
-#include "nouveau/nouveau.h"
 #include "util/list.h"
 #include "util/macros.h"
 #include "util/u_dynarray.h"
@@ -48,6 +48,7 @@ static void
 hk_free_resettable_cmd_buffer(struct hk_cmd_buffer *cmd)
 {
    struct hk_cmd_pool *pool = hk_cmd_buffer_pool(cmd);
+   struct hk_device *dev = hk_cmd_pool_device(pool);
 
    hk_descriptor_state_fini(cmd, &cmd->state.gfx.descriptors);
    hk_descriptor_state_fini(cmd, &cmd->state.cs.descriptors);
@@ -61,7 +62,7 @@ hk_free_resettable_cmd_buffer(struct hk_cmd_buffer *cmd)
    }
 
    util_dynarray_foreach(&cmd->large_bos, struct agx_bo *, bo) {
-      agx_bo_unreference(*bo);
+      agx_bo_unreference(&dev->dev, *bo);
    }
 
    util_dynarray_clear(&cmd->large_bos);
@@ -179,10 +180,13 @@ hk_pool_alloc_internal(struct hk_cmd_buffer *cmd, uint32_t size,
    if (size > HK_CMD_BO_SIZE) {
       uint32_t flags = usc ? AGX_BO_LOW_VA : 0;
       struct agx_bo *bo =
-         agx_bo_create(&dev->dev, size, flags, "Large pool allocation");
+         agx_bo_create(&dev->dev, size, flags, 0, "Large pool allocation");
 
       util_dynarray_append(&cmd->large_bos, struct agx_bo *, bo);
-      return bo->ptr;
+      return (struct agx_ptr){
+         .gpu = bo->va->addr,
+         .cpu = bo->map,
+      };
    }
 
    assert(size <= HK_CMD_BO_SIZE);
@@ -214,13 +218,13 @@ hk_pool_alloc_internal(struct hk_cmd_buffer *cmd, uint32_t size,
     * BO.
     */
    if (uploader->map == NULL || size < uploader->offset) {
-      uploader->map = bo->bo->ptr.cpu;
-      uploader->base = bo->bo->ptr.gpu;
+      uploader->map = bo->bo->map;
+      uploader->base = bo->bo->va->addr;
       uploader->offset = size;
    }
 
    return (struct agx_ptr){
-      .gpu = bo->bo->ptr.gpu,
+      .gpu = bo->bo->va->addr,
       .cpu = bo->map,
    };
 }
@@ -525,7 +529,7 @@ hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
    struct hk_root_descriptor_table *root = &desc->root;
 
    struct agx_ptr root_ptr = hk_pool_alloc(cmd, sizeof(*root), 8);
-   if (!root_ptr.cpu)
+   if (!root_ptr.gpu)
       return 0;
 
    root->root_desc_addr = root_ptr.gpu;
@@ -604,6 +608,8 @@ uint32_t
 hk_upload_usc_words(struct hk_cmd_buffer *cmd, struct hk_shader *s,
                     struct hk_linked_shader *linked)
 {
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+
    enum pipe_shader_type sw_stage = s->info.stage;
    enum pipe_shader_type hw_stage = s->b.info.stage;
 
@@ -674,7 +680,7 @@ hk_upload_usc_words(struct hk_cmd_buffer *cmd, struct hk_shader *s,
    }
 
    agx_usc_push_blob(&b, linked->usc.data, linked->usc.size);
-   return t.gpu;
+   return agx_usc_addr(&dev->dev, t.gpu);
 }
 
 /* Specialized variant of hk_upload_usc_words for internal dispatches that do
@@ -684,6 +690,8 @@ uint32_t
 hk_upload_usc_words_kernel(struct hk_cmd_buffer *cmd, struct hk_shader *s,
                            void *data, size_t data_size)
 {
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+
    assert(s->info.stage == MESA_SHADER_COMPUTE);
    assert(s->b.info.scratch_size == 0 && "you shouldn't be spilling!");
    assert(s->b.info.preamble_scratch_size == 0 && "you shouldn't be spilling!");
@@ -703,7 +711,7 @@ hk_upload_usc_words_kernel(struct hk_cmd_buffer *cmd, struct hk_shader *s,
                    hk_pool_upload(cmd, data, data_size, 4));
 
    agx_usc_push_blob(&b, s->only_linked->usc.data, s->only_linked->usc.size);
-   return t.gpu;
+   return agx_usc_addr(&dev->dev, t.gpu);
 }
 
 void

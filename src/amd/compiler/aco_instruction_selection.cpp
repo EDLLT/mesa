@@ -180,13 +180,8 @@ emit_bpermute(isel_context* ctx, Builder& bld, Temp index, Temp data)
 
    if (ctx->options->gfx_level <= GFX7 || avoid_shared_vgprs) {
       /* GFX6-7: there is no bpermute instruction */
-      Operand index_op(index);
-      Operand input_data(data);
-      index_op.setLateKill(true);
-      input_data.setLateKill(true);
-
       return bld.pseudo(aco_opcode::p_bpermute_readlane, bld.def(v1), bld.def(bld.lm),
-                        bld.def(bld.lm, vcc), index_op, input_data);
+                        bld.def(bld.lm, vcc), index, data);
    } else if (ctx->options->gfx_level >= GFX10 && ctx->program->wave_size == 64) {
 
       /* GFX10 wave64 mode: emulate full-wave bpermute */
@@ -199,11 +194,6 @@ emit_bpermute(isel_context* ctx, Builder& bld, Temp index, Temp data)
       Operand same_half = bld.pseudo(aco_opcode::p_create_vector, bld.def(s2),
                                      index_is_lo_split.def(0).getTemp(), index_is_lo_n1);
       Operand index_x4 = bld.vop2(aco_opcode::v_lshlrev_b32, bld.def(v1), Operand::c32(2u), index);
-      Operand input_data(data);
-
-      index_x4.setLateKill(true);
-      input_data.setLateKill(true);
-      same_half.setLateKill(true);
 
       if (ctx->options->gfx_level <= GFX10_3) {
          /* We need one pair of shared VGPRs:
@@ -212,11 +202,10 @@ emit_bpermute(isel_context* ctx, Builder& bld, Temp index, Temp data)
          ctx->program->config->num_shared_vgprs = 2 * ctx->program->dev.vgpr_alloc_granule;
 
          return bld.pseudo(aco_opcode::p_bpermute_shared_vgpr, bld.def(v1), bld.def(s2),
-                           bld.def(s1, scc), index_x4, input_data, same_half);
+                           bld.def(s1, scc), index_x4, data, same_half);
       } else {
          return bld.pseudo(aco_opcode::p_bpermute_permlane, bld.def(v1), bld.def(s2),
-                           bld.def(s1, scc), Operand(v1.as_linear()), index_x4, input_data,
-                           same_half);
+                           bld.def(s1, scc), Operand(v1.as_linear()), index_x4, data, same_half);
       }
    } else {
       /* GFX8-9 or GFX10 wave32: bpermute works normally */
@@ -1775,7 +1764,7 @@ visit_alu_instr(isel_context* ctx, nir_alu_instr* instr)
          bld.pseudo(aco_opcode::p_split_vector, Definition(lo), Definition(hi), src);
          lo = bld.vop1(aco_opcode::v_ffbl_b32, bld.def(v1), lo);
          hi = bld.vop1(aco_opcode::v_ffbl_b32, bld.def(v1), hi);
-         hi = uadd32_sat(bld, bld.def(v1), bld.copy(bld.def(s1), Operand::c32(32u)), hi);
+         hi = bld.vop2(aco_opcode::v_or_b32, bld.def(v1), Operand::c32(32u), hi);
          bld.vop2(aco_opcode::v_min_u32, Definition(dst), lo, hi);
       } else {
          isel_err(&instr->instr, "Unimplemented NIR instr bit size");
@@ -1816,12 +1805,10 @@ visit_alu_instr(isel_context* ctx, nir_alu_instr* instr)
          Temp lo = bld.tmp(v1), hi = bld.tmp(v1);
          bld.pseudo(aco_opcode::p_split_vector, Definition(lo), Definition(hi), src);
 
-         lo = uadd32_sat(bld, bld.def(v1), bld.copy(bld.def(s1), Operand::c32(32u)),
-                         bld.vop1(op, bld.def(v1), lo));
+         lo = bld.vop1(op, bld.def(v1), lo);
+         lo = bld.vop2(aco_opcode::v_or_b32, bld.def(v1), Operand::c32(32), lo);
          hi = bld.vop1(op, bld.def(v1), hi);
-         Temp found_hi = bld.vopc(aco_opcode::v_cmp_lg_u32, bld.def(bld.lm), Operand::c32(-1), hi);
-
-         Temp msb_rev = bld.vop2(aco_opcode::v_cndmask_b32, bld.def(v1), lo, hi, found_hi);
+         Temp msb_rev = bld.vop2(aco_opcode::v_min_u32, bld.def(v1), lo, hi);
 
          Temp msb = bld.tmp(v1);
          Temp carry =
@@ -3612,11 +3599,8 @@ visit_alu_instr(isel_context* ctx, nir_alu_instr* instr)
       Temp ref = get_alu_src(ctx, instr->src[0]);
       Temp src = get_alu_src(ctx, instr->src[1], 2);
       Temp accum = get_alu_src(ctx, instr->src[2], 4);
-      Builder::Result res = bld.vop3(aco_opcode::v_mqsad_u32_u8, Definition(dst), as_vgpr(ctx, src),
-                                     as_vgpr(ctx, ref), as_vgpr(ctx, accum));
-      res.instr->operands[0].setLateKill(true);
-      res.instr->operands[1].setLateKill(true);
-      res.instr->operands[2].setLateKill(true);
+      bld.vop3(aco_opcode::v_mqsad_u32_u8, Definition(dst), as_vgpr(ctx, src), as_vgpr(ctx, ref),
+               as_vgpr(ctx, accum));
       emit_split_vector(ctx, dst, 4);
       break;
    }
@@ -4166,84 +4150,6 @@ visit_alu_instr(isel_context* ctx, nir_alu_instr* instr)
          isel_err(&instr->instr, "Unimplemented NIR instr bit size");
       }
       bld.vopc(op, Definition(dst), Operand::c32(0), res);
-      break;
-   }
-   case nir_op_fddx:
-   case nir_op_fddy:
-   case nir_op_fddx_fine:
-   case nir_op_fddy_fine:
-   case nir_op_fddx_coarse:
-   case nir_op_fddy_coarse: {
-      uint16_t dpp_ctrl1, dpp_ctrl2;
-      if (instr->op == nir_op_fddx_fine) {
-         dpp_ctrl1 = dpp_quad_perm(0, 0, 2, 2);
-         dpp_ctrl2 = dpp_quad_perm(1, 1, 3, 3);
-      } else if (instr->op == nir_op_fddy_fine) {
-         dpp_ctrl1 = dpp_quad_perm(0, 1, 0, 1);
-         dpp_ctrl2 = dpp_quad_perm(2, 3, 2, 3);
-      } else {
-         dpp_ctrl1 = dpp_quad_perm(0, 0, 0, 0);
-         if (instr->op == nir_op_fddx || instr->op == nir_op_fddx_coarse)
-            dpp_ctrl2 = dpp_quad_perm(1, 1, 1, 1);
-         else
-            dpp_ctrl2 = dpp_quad_perm(2, 2, 2, 2);
-      }
-
-      if (dst.regClass() == v1 && instr->def.bit_size == 16) {
-         assert(instr->def.num_components == 2);
-
-         Temp src = as_vgpr(ctx, get_alu_src_vop3p(ctx, instr->src[0]));
-
-         /* swizzle to opsel: all swizzles are either 0 (x) or 1 (y) */
-         unsigned opsel_lo = instr->src[0].swizzle[0] & 1;
-         unsigned opsel_hi = instr->src[0].swizzle[1] & 1;
-         opsel_lo |= opsel_lo << 1;
-         opsel_hi |= opsel_hi << 1;
-
-         Temp tl = src;
-         if (nir_src_is_divergent(instr->src[0].src))
-            tl = bld.vop1_dpp(aco_opcode::v_mov_b32, bld.def(v1), src, dpp_ctrl1);
-
-         Builder::Result sub =
-            bld.vop3p(aco_opcode::v_pk_add_f16, bld.def(v1), src, tl, opsel_lo, opsel_hi);
-         sub->valu().neg_lo[1] = true;
-         sub->valu().neg_hi[1] = true;
-
-         if (nir_src_is_divergent(instr->src[0].src))
-            bld.vop1_dpp(aco_opcode::v_mov_b32, Definition(dst), sub, dpp_ctrl2);
-         else
-            bld.copy(Definition(dst), sub);
-         emit_split_vector(ctx, dst, 2);
-      } else {
-         Temp src = as_vgpr(ctx, get_alu_src(ctx, instr->src[0]));
-
-         aco_opcode subrev =
-            instr->def.bit_size == 16 ? aco_opcode::v_subrev_f16 : aco_opcode::v_subrev_f32;
-         bool use_interp = dpp_ctrl1 == dpp_quad_perm(0, 0, 0, 0) && instr->def.bit_size == 32 &&
-                           ctx->program->gfx_level >= GFX11_5;
-         if (!nir_src_is_divergent(instr->src[0].src)) {
-            bld.vop2(subrev, Definition(dst), src, src);
-         } else if (use_interp && dpp_ctrl2 == dpp_quad_perm(1, 1, 1, 1)) {
-            bld.vinterp_inreg(aco_opcode::v_interp_p10_f32_inreg, Definition(dst), src,
-                              Operand::c32(0x3f800000), src)
-               ->valu()
-               .neg[2] = true;
-         } else if (use_interp && dpp_ctrl2 == dpp_quad_perm(2, 2, 2, 2)) {
-            Builder::Result tmp = bld.vinterp_inreg(aco_opcode::v_interp_p10_f32_inreg, bld.def(v1),
-                                                    Operand::c32(0), Operand::c32(0), src);
-            tmp->valu().neg = 0x6;
-            bld.vinterp_inreg(aco_opcode::v_interp_p2_f32_inreg, Definition(dst), src,
-                              Operand::c32(0x3f800000), tmp);
-         } else if (ctx->program->gfx_level >= GFX8) {
-            Temp tmp = bld.vop2_dpp(subrev, bld.def(v1), src, src, dpp_ctrl1);
-            bld.vop1_dpp(aco_opcode::v_mov_b32, Definition(dst), tmp, dpp_ctrl2);
-         } else {
-            Temp tl = bld.ds(aco_opcode::ds_swizzle_b32, bld.def(v1), src, (1 << 15) | dpp_ctrl1);
-            Temp tr = bld.ds(aco_opcode::ds_swizzle_b32, bld.def(v1), src, (1 << 15) | dpp_ctrl2);
-            bld.vop2(subrev, Definition(dst), tl, tr);
-         }
-      }
-      set_wqm(ctx, true);
       break;
    }
    default: isel_err(&instr->instr, "Unknown NIR ALU instr");
@@ -5693,13 +5599,9 @@ emit_interp_instr_gfx11(isel_context* ctx, unsigned idx, unsigned component, Tem
    Builder bld(ctx->program, ctx->block);
 
    if (in_exec_divergent_or_in_loop(ctx)) {
-      Operand prim_mask_op = bld.m0(prim_mask);
-      prim_mask_op.setLateKill(true); /* we don't want the bld.lm definition to use m0 */
-      Operand coord2_op(coord2);
-      coord2_op.setLateKill(true); /* we re-use the destination reg in the middle */
       bld.pseudo(aco_opcode::p_interp_gfx11, Definition(dst), Operand(v1.as_linear()),
                  Operand::c32(idx), Operand::c32(component), Operand::c32(high_16bits), coord1,
-                 coord2_op, prim_mask_op);
+                 coord2, bld.m0(prim_mask));
       return;
    }
 
@@ -5756,11 +5658,8 @@ emit_interp_instr(isel_context* ctx, unsigned idx, unsigned component, Temp src,
       }
    } else {
       assert(!high_16bits);
-      Builder::Result interp_p1 = bld.vintrp(aco_opcode::v_interp_p1_f32, bld.def(v1), coord1,
-                                             bld.m0(prim_mask), idx, component);
-
-      if (ctx->program->dev.has_16bank_lds)
-         interp_p1->operands[0].setLateKill(true);
+      Temp interp_p1 = bld.vintrp(aco_opcode::v_interp_p1_f32, bld.def(v1), coord1,
+                                  bld.m0(prim_mask), idx, component);
 
       bld.vintrp(aco_opcode::v_interp_p2_f32, Definition(dst), coord2, bld.m0(prim_mask), interp_p1,
                  idx, component);
@@ -5776,11 +5675,9 @@ emit_interp_mov_instr(isel_context* ctx, unsigned idx, unsigned component, unsig
    if (ctx->options->gfx_level >= GFX11) {
       uint16_t dpp_ctrl = dpp_quad_perm(vertex_id, vertex_id, vertex_id, vertex_id);
       if (in_exec_divergent_or_in_loop(ctx)) {
-         Operand prim_mask_op = bld.m0(prim_mask);
-         prim_mask_op.setLateKill(true); /* we don't want the bld.lm definition to use m0 */
          bld.pseudo(aco_opcode::p_interp_gfx11, Definition(tmp), Operand(v1.as_linear()),
                     Operand::c32(idx), Operand::c32(component), Operand::c32(dpp_ctrl),
-                    prim_mask_op);
+                    bld.m0(prim_mask));
       } else {
          Temp p =
             bld.ldsdir(aco_opcode::lds_param_load, bld.def(v1), bld.m0(prim_mask), idx, component);
@@ -6269,11 +6166,8 @@ emit_mimg(Builder& bld, aco_opcode op, Temp dst, Temp rsrc, Operand samp, std::v
    mimg->operands[0] = Operand(rsrc);
    mimg->operands[1] = samp;
    mimg->operands[2] = vdata;
-   for (unsigned i = 0; i < coords.size(); i++) {
+   for (unsigned i = 0; i < coords.size(); i++)
       mimg->operands[3 + i] = Operand(coords[i]);
-      if (coords[i].regClass().is_linear_vgpr())
-         mimg->operands[3 + i].setLateKill(true);
-   }
    mimg->mimg().strict_wqm = strict_wqm;
 
    return &bld.insert(std::move(mimg))->mimg();
@@ -8299,9 +8193,7 @@ create_fs_dual_src_export_gfx11(isel_context* ctx, const struct aco_export_mrt* 
       create_instruction(aco_opcode::p_dual_src_export_gfx11, Format::PSEUDO, 8, 6)};
    for (unsigned i = 0; i < 4; i++) {
       exp->operands[i] = mrt0 ? mrt0->out[i] : Operand(v1);
-      exp->operands[i].setLateKill(true);
       exp->operands[i + 4] = mrt1 ? mrt1->out[i] : Operand(v1);
-      exp->operands[i + 4].setLateKill(true);
    }
 
    RegClass type = RegClass(RegType::vgpr, util_bitcount(mrt0->enabled_channels));
@@ -8346,9 +8238,6 @@ visit_cmat_muladd(isel_context* ctx, nir_intrinsic_instr* instr)
    Operand A(as_vgpr(ctx, get_ssa_temp(ctx, instr->src[0].ssa)));
    Operand B(as_vgpr(ctx, get_ssa_temp(ctx, instr->src[1].ssa)));
    Operand C(as_vgpr(ctx, get_ssa_temp(ctx, instr->src[2].ssa)));
-
-   A.setLateKill(true);
-   B.setLateKill(true);
 
    VALU_instruction& vop3p = bld.vop3p(opcode, Definition(dst), A, B, C, 0, 0)->valu();
    vop3p.neg_lo[0] = (signed_mask & 0x1) != 0;
@@ -8575,6 +8464,106 @@ visit_intrinsic(isel_context* ctx, nir_intrinsic_instr* instr)
       }
       break;
    }
+   case nir_intrinsic_ddx:
+   case nir_intrinsic_ddy:
+   case nir_intrinsic_ddx_fine:
+   case nir_intrinsic_ddy_fine:
+   case nir_intrinsic_ddx_coarse:
+   case nir_intrinsic_ddy_coarse: {
+      Temp src = as_vgpr(ctx, get_ssa_temp(ctx, instr->src[0].ssa));
+      Temp dst = get_ssa_temp(ctx, &instr->def);
+
+      bool only_used_by_abs = true;
+      nir_foreach_use (use, &instr->def) {
+         nir_instr* use_instr = nir_src_parent_instr(use);
+
+         if (use_instr->type != nir_instr_type_alu ||
+             nir_instr_as_alu(use_instr)->op != nir_op_fabs)
+            only_used_by_abs = false;
+      }
+
+      uint16_t dpp_ctrl1, dpp_ctrl2;
+      if (instr->intrinsic == nir_intrinsic_ddx_fine) {
+         if (only_used_by_abs) {
+            dpp_ctrl1 = dpp_quad_perm(1, 0, 3, 2);
+            dpp_ctrl2 = dpp_quad_perm(0, 1, 2, 3);
+         } else {
+            dpp_ctrl1 = dpp_quad_perm(0, 0, 2, 2);
+            dpp_ctrl2 = dpp_quad_perm(1, 1, 3, 3);
+         }
+      } else if (instr->intrinsic == nir_intrinsic_ddy_fine) {
+         if (only_used_by_abs) {
+            dpp_ctrl1 = dpp_quad_perm(2, 3, 0, 1);
+            dpp_ctrl2 = dpp_quad_perm(0, 1, 2, 3);
+         } else {
+            dpp_ctrl1 = dpp_quad_perm(0, 1, 0, 1);
+            dpp_ctrl2 = dpp_quad_perm(2, 3, 2, 3);
+         }
+      } else {
+         dpp_ctrl1 = dpp_quad_perm(0, 0, 0, 0);
+         if (instr->intrinsic == nir_intrinsic_ddx ||
+             instr->intrinsic == nir_intrinsic_ddx_coarse)
+            dpp_ctrl2 = dpp_quad_perm(1, 1, 1, 1);
+         else
+            dpp_ctrl2 = dpp_quad_perm(2, 2, 2, 2);
+      }
+
+      if (dst.regClass() == v1 && instr->def.bit_size == 16) {
+         assert(instr->def.num_components == 2);
+
+         /* identify swizzle to opsel */
+         unsigned opsel_lo = 0b00;
+         unsigned opsel_hi = 0b11;
+
+         Temp tl = src;
+         if (nir_src_is_divergent(instr->src[0]))
+            tl = bld.vop1_dpp(aco_opcode::v_mov_b32, bld.def(v1), src, dpp_ctrl1);
+
+         Builder::Result sub =
+            bld.vop3p(aco_opcode::v_pk_add_f16, bld.def(v1), src, tl, opsel_lo, opsel_hi);
+         sub->valu().neg_lo[1] = true;
+         sub->valu().neg_hi[1] = true;
+
+         if (nir_src_is_divergent(instr->src[0]) && dpp_ctrl2 != dpp_quad_perm(0, 1, 2, 3))
+            bld.vop1_dpp(aco_opcode::v_mov_b32, Definition(dst), sub, dpp_ctrl2);
+         else
+            bld.copy(Definition(dst), sub);
+         emit_split_vector(ctx, dst, 2);
+      } else {
+         aco_opcode subrev =
+            instr->def.bit_size == 16 ? aco_opcode::v_subrev_f16 : aco_opcode::v_subrev_f32;
+         bool use_interp = dpp_ctrl1 == dpp_quad_perm(0, 0, 0, 0) && instr->def.bit_size == 32 &&
+                           ctx->program->gfx_level >= GFX11_5;
+         if (!nir_src_is_divergent(instr->src[0])) {
+            bld.vop2(subrev, Definition(dst), src, src);
+         } else if (use_interp && dpp_ctrl2 == dpp_quad_perm(1, 1, 1, 1)) {
+            bld.vinterp_inreg(aco_opcode::v_interp_p10_f32_inreg, Definition(dst), src,
+                              Operand::c32(0x3f800000), src)
+               ->valu()
+               .neg[2] = true;
+         } else if (use_interp && dpp_ctrl2 == dpp_quad_perm(2, 2, 2, 2)) {
+            Builder::Result tmp = bld.vinterp_inreg(aco_opcode::v_interp_p10_f32_inreg, bld.def(v1),
+                                                    Operand::c32(0), Operand::c32(0), src);
+            tmp->valu().neg = 0x6;
+            bld.vinterp_inreg(aco_opcode::v_interp_p2_f32_inreg, Definition(dst), src,
+                              Operand::c32(0x3f800000), tmp);
+         } else if (ctx->program->gfx_level >= GFX8 && dpp_ctrl2 == dpp_quad_perm(0, 1, 2, 3)) {
+            bld.vop2_dpp(subrev, Definition(dst), src, src, dpp_ctrl1);
+         } else if (ctx->program->gfx_level >= GFX8) {
+            Temp tmp = bld.vop2_dpp(subrev, bld.def(v1), src, src, dpp_ctrl1);
+            bld.vop1_dpp(aco_opcode::v_mov_b32, Definition(dst), tmp, dpp_ctrl2);
+         } else {
+            Temp tl = bld.ds(aco_opcode::ds_swizzle_b32, bld.def(v1), src, (1 << 15) | dpp_ctrl1);
+            Temp tr = src;
+            if (dpp_ctrl2 != dpp_quad_perm(0, 1, 2, 3))
+               tr = bld.ds(aco_opcode::ds_swizzle_b32, bld.def(v1), src, (1 << 15) | dpp_ctrl2);
+            bld.vop2(subrev, Definition(dst), tl, tr);
+         }
+      }
+      set_wqm(ctx, true);
+      break;
+   }
+
    case nir_intrinsic_load_subgroup_invocation: {
       emit_mbcnt(ctx, get_ssa_temp(ctx, &instr->def));
       break;
@@ -10481,9 +10470,7 @@ visit_block(isel_context* ctx, nir_block* block)
    if (ctx->block->kind & block_kind_top_level) {
       Builder bld(ctx->program, ctx->block);
       for (Temp tmp : ctx->unended_linear_vgprs) {
-         Operand op(tmp);
-         op.setLateKill(true);
-         bld.pseudo(aco_opcode::p_end_linear_vgpr, op);
+         bld.pseudo(aco_opcode::p_end_linear_vgpr, tmp);
       }
       ctx->unended_linear_vgprs.clear();
    }
@@ -10628,9 +10615,12 @@ begin_divergent_if_then(isel_context* ctx, if_context* ic, Temp cond,
    branch.reset(create_instruction(aco_opcode::p_cbranch_z, Format::PSEUDO_BRANCH, 1, 1));
    branch->definitions[0] = Definition(ctx->program->allocateTmp(s2));
    branch->operands[0] = Operand(cond);
-   branch->branch().selection_control_remove =
-      sel_ctrl == nir_selection_control_flatten ||
-      sel_ctrl == nir_selection_control_divergent_always_taken;
+   bool never_taken =
+      sel_ctrl == nir_selection_control_divergent_always_taken &&
+      !(ctx->cf_info.exec.potentially_empty_discard || ctx->cf_info.exec.potentially_empty_break ||
+        ctx->cf_info.exec.potentially_empty_continue);
+   branch->branch().rarely_taken = sel_ctrl == nir_selection_control_flatten || never_taken;
+   branch->branch().never_taken = never_taken;
    ctx->block->instructions.push_back(std::move(branch));
 
    ic->BB_if_idx = ctx->block->index;
@@ -10693,9 +10683,12 @@ begin_divergent_if_else(isel_context* ctx, if_context* ic,
    /* branch to linear else block (skip else) */
    branch.reset(create_instruction(aco_opcode::p_branch, Format::PSEUDO_BRANCH, 0, 1));
    branch->definitions[0] = Definition(ctx->program->allocateTmp(s2));
-   branch->branch().selection_control_remove =
-      sel_ctrl == nir_selection_control_flatten ||
-      sel_ctrl == nir_selection_control_divergent_always_taken;
+   bool never_taken =
+      sel_ctrl == nir_selection_control_divergent_always_taken &&
+      !(ctx->cf_info.exec.potentially_empty_discard || ctx->cf_info.exec.potentially_empty_break ||
+        ctx->cf_info.exec.potentially_empty_continue);
+   branch->branch().rarely_taken = sel_ctrl == nir_selection_control_flatten || never_taken;
+   branch->branch().never_taken = never_taken;
    ctx->block->instructions.push_back(std::move(branch));
 
    ic->exec_old.combine(ctx->cf_info.exec);
@@ -11442,16 +11435,13 @@ add_startpgm(struct isel_context* ctx)
       } else if (ctx->program->gfx_level <= GFX10_3 && ctx->program->stage != raytracing_cs) {
          /* Manually initialize scratch. For RT stages scratch initialization is done in the prolog.
           */
-         Operand scratch_offset = Operand(get_arg(ctx, ctx->args->scratch_offset));
-         scratch_offset.setLateKill(true);
-
          Operand scratch_addr = ctx->args->ring_offsets.used
                                    ? Operand(get_arg(ctx, ctx->args->ring_offsets))
                                    : Operand(s2);
 
          Builder bld(ctx->program, ctx->block);
          bld.pseudo(aco_opcode::p_init_scratch, bld.def(s2), bld.def(s1, scc), scratch_addr,
-                    scratch_offset);
+                    get_arg(ctx, ctx->args->scratch_offset));
       }
    }
 
@@ -12608,6 +12598,11 @@ select_rt_prolog(Program* program, ac_shader_config* config,
    assert(in_stack_base == out_launch_size_z);
    assert(in_local_ids[0] == out_launch_ids[0]);
 
+   /* <gfx9 reads in_scratch_offset at the end of the prolog to write out the scratch_offset
+    * arg. Make sure no other outputs have overwritten it by then.
+    */
+   assert(options->gfx_level >= GFX9 || in_scratch_offset.reg() >= out_args->num_sgprs_used);
+
    /* load raygen sbt */
    bld.smem(aco_opcode::s_load_dwordx2, Definition(tmp_raygen_sbt, s2), Operand(in_sbt_desc, s2),
             Operand::c32(0u));
@@ -12659,15 +12654,6 @@ select_rt_prolog(Program* program, ac_shader_config* config,
    bld.vop3(aco_opcode::v_mad_u32_u24, Definition(out_launch_ids[0], v1), Operand(in_wg_id_x, s1),
             Operand::c32(8), Operand(in_local_ids[0], v1));
 
-   if (options->gfx_level < GFX9) {
-      /* write scratch/ring offsets to outputs, if needed */
-      bld.sop1(aco_opcode::s_mov_b32,
-               Definition(get_arg_reg(out_args, out_args->scratch_offset), s1),
-               Operand(in_scratch_offset, s1));
-      bld.sop1(aco_opcode::s_mov_b64, Definition(get_arg_reg(out_args, out_args->ring_offsets), s2),
-               Operand(tmp_ring_offsets, s2));
-   }
-
    /* calculate shader record ptr: SBT + RADV_RT_HANDLE_SIZE */
    if (options->gfx_level < GFX9) {
       bld.vop2_e64(aco_opcode::v_add_co_u32, Definition(out_record_ptr, v1), Definition(vcc, s2),
@@ -12708,6 +12694,15 @@ select_rt_prolog(Program* program, ac_shader_config* config,
             Operand(tmp_invocation_idx, v1), Operand(out_launch_ids[0], v1), Operand(vcc, bld.lm));
    bld.vop2(aco_opcode::v_cndmask_b32, Definition(out_launch_ids[1], v1), Operand::zero(),
             Operand(out_launch_ids[1], v1), Operand(vcc, bld.lm));
+
+   if (options->gfx_level < GFX9) {
+      /* write scratch/ring offsets to outputs, if needed */
+      bld.sop1(aco_opcode::s_mov_b32,
+               Definition(get_arg_reg(out_args, out_args->scratch_offset), s1),
+               Operand(in_scratch_offset, s1));
+      bld.sop1(aco_opcode::s_mov_b64, Definition(get_arg_reg(out_args, out_args->ring_offsets), s2),
+               Operand(tmp_ring_offsets, s2));
+   }
 
    /* jump to raygen */
    bld.sop1(aco_opcode::s_setpc_b64, Operand(out_uniform_shader_addr, s2));

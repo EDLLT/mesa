@@ -462,6 +462,9 @@ radv_shader_spirv_to_nir(struct radv_device *device, const struct radv_shader_st
       NIR_PASS(_, nir, ac_nir_lower_sin_cos);
    }
 
+   if (options && options->lower_view_index_to_device_index)
+      NIR_PASS(_, nir, nir_lower_view_index_to_device_index);
+
    NIR_PASS(_, nir, nir_lower_system_values);
    nir_lower_compute_system_values_options csv_options = {
       /* Mesh shaders run as NGG which can implement local_invocation_index from
@@ -2780,7 +2783,8 @@ radv_fill_nir_compiler_options(struct radv_nir_compiler_options *options, struct
    const struct radv_instance *instance = radv_physical_device_instance(pdev);
 
    /* robust_buffer_access_llvm here used by LLVM only, pipeline robustness is not exposed there. */
-   options->robust_buffer_access_llvm = device->buffer_robustness >= RADV_BUFFER_ROBUSTNESS_1;
+   options->robust_buffer_access_llvm =
+      (device->vk.enabled_features.robustBufferAccess2 || device->vk.enabled_features.robustBufferAccess);
    options->wgp_mode = should_use_wgp;
    options->info = &pdev->info;
    options->dump_shader = can_dump_shader;
@@ -2789,6 +2793,20 @@ radv_fill_nir_compiler_options(struct radv_nir_compiler_options *options, struct
    options->record_stats = keep_statistic_info;
    options->check_ir = instance->debug_flags & RADV_DEBUG_CHECKIR;
    options->enable_mrt_output_nan_fixup = gfx_state ? gfx_state->ps.epilog.enable_mrt_output_nan_fixup : false;
+}
+
+void
+radv_set_stage_key_robustness(const struct vk_pipeline_robustness_state *rs, gl_shader_stage stage,
+                              struct radv_shader_stage_key *key)
+{
+   if (rs->storage_buffers == VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2_EXT)
+      key->storage_robustness2 = 1;
+   if (rs->uniform_buffers == VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2_EXT)
+      key->uniform_robustness2 = 1;
+   if (stage == MESA_SHADER_VERTEX &&
+       (rs->vertex_inputs == VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_EXT ||
+        rs->vertex_inputs == VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2_EXT))
+      key->vertex_robustness1 = 1u;
 }
 
 static void

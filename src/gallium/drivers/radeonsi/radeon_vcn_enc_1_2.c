@@ -660,9 +660,6 @@ static void radeon_enc_nalu_sei(struct radeon_encoder *enc)
 
 static void radeon_enc_nalu_sei_hevc(struct radeon_encoder *enc)
 {
-   if (!enc->enc_pic.enc_sei.flags.value)
-      return;
-
    struct radeon_enc_pic *pic = &enc->enc_pic;
    RADEON_ENC_BEGIN(enc->cmd.nalu);
    RADEON_ENC_CS(RENCODE_DIRECT_OUTPUT_NALU_TYPE_SEI);
@@ -1372,12 +1369,14 @@ static void radeon_enc_encode_statistics(struct radeon_encoder *enc)
 
 static void radeon_enc_qp_map(struct radeon_encoder *enc)
 {
-   if (enc->enc_pic.enc_qp_map.qp_map_type == RENCODE_QP_MAP_TYPE_NONE)
-      return;
-
    RADEON_ENC_BEGIN(enc->cmd.enc_qp_map);
    RADEON_ENC_CS(enc->enc_pic.enc_qp_map.qp_map_type);
-   RADEON_ENC_READWRITE(enc->roi->res->buf, enc->roi->res->domains, 0);
+   if (enc->enc_pic.enc_qp_map.qp_map_type != RENCODE_QP_MAP_TYPE_NONE)
+      RADEON_ENC_READWRITE(enc->roi->res->buf, enc->roi->res->domains, 0);
+   else {
+      RADEON_ENC_CS(0); /* use null for roi buffer */
+      RADEON_ENC_CS(0); /* use null for roi buffer */
+   }
    RADEON_ENC_CS(0); /* qp_map pitch set to 0 for the ib */
    RADEON_ENC_END();
 }
@@ -1469,15 +1468,17 @@ static void begin(struct radeon_encoder *enc)
 
 static void radeon_enc_headers_h264(struct radeon_encoder *enc)
 {
-   enc->nalu_aud(enc);
-   if (enc->enc_pic.layer_ctrl.num_temporal_layers > 1)
+   if (enc->enc_pic.header_flags.aud)
+      enc->nalu_aud(enc);
+   if (enc->enc_pic.layer_ctrl.num_temporal_layers > 1) {
       enc->nalu_prefix(enc);
-   if (enc->enc_pic.is_idr || enc->enc_pic.need_sequence_header) {
-      if (enc->enc_pic.layer_ctrl.num_temporal_layers > 1)
+      if (enc->enc_pic.is_idr)
          enc->nalu_sei(enc);
-      enc->nalu_sps(enc);
-      enc->nalu_pps(enc);
    }
+   if (enc->enc_pic.header_flags.sps)
+      enc->nalu_sps(enc);
+   if (enc->enc_pic.header_flags.pps)
+      enc->nalu_pps(enc);
    enc->slice_header(enc);
    enc->encode_params(enc);
    enc->encode_params_codec_spec(enc);
@@ -1485,13 +1486,16 @@ static void radeon_enc_headers_h264(struct radeon_encoder *enc)
 
 static void radeon_enc_headers_hevc(struct radeon_encoder *enc)
 {
-   enc->nalu_aud(enc);
-   if (enc->enc_pic.is_idr || enc->enc_pic.need_sequence_header) {
+   if (enc->enc_pic.header_flags.aud)
+      enc->nalu_aud(enc);
+   if (enc->enc_pic.header_flags.vps)
       enc->nalu_vps(enc);
-      enc->nalu_pps(enc);
+   if (enc->enc_pic.header_flags.sps)
       enc->nalu_sps(enc);
+   if (enc->enc_pic.header_flags.pps)
+      enc->nalu_pps(enc);
+   if (enc->enc_pic.enc_sei.flags.value)
       enc->nalu_sei(enc);
-   }
    enc->slice_header(enc);
    enc->encode_params(enc);
    enc->encode_params_codec_spec(enc);

@@ -85,9 +85,15 @@
 #define VBAQ_DISABLE (0)
 #define VBAQ_AUTO    (1)
 
-#define ENC_PACKED_HEADERS_H264 (VA_ENC_PACKED_HEADER_SEQUENCE)
+#define ENC_PACKED_HEADERS_H264 (VA_ENC_PACKED_HEADER_SEQUENCE | \
+                                 VA_ENC_PACKED_HEADER_PICTURE | \
+                                 VA_ENC_PACKED_HEADER_SLICE | \
+                                 VA_ENC_PACKED_HEADER_RAW_DATA)
 #define ENC_PACKED_HEADERS_HEVC (VA_ENC_PACKED_HEADER_SEQUENCE | \
-                                 VA_ENC_PACKED_HEADER_MISC)
+                                 VA_ENC_PACKED_HEADER_PICTURE | \
+                                 VA_ENC_PACKED_HEADER_SLICE | \
+                                 VA_ENC_PACKED_HEADER_MISC | \
+                                 VA_ENC_PACKED_HEADER_RAW_DATA)
 #define ENC_PACKED_HEADERS_AV1  (VA_ENC_PACKED_HEADER_SEQUENCE | \
                                  VA_ENC_PACKED_HEADER_PICTURE  | \
                                  VA_ENC_PACKED_HEADER_MISC)
@@ -425,6 +431,7 @@ typedef struct {
    enum pipe_video_entrypoint entrypoint;
    enum pipe_h2645_enc_rate_control_method rc;
    unsigned int rt_format;
+   unsigned int packed_headers;
 } vlVaConfig;
 
 typedef struct vlVaSurface {
@@ -605,6 +612,7 @@ VAStatus vlVaHandleVAEncPackedHeaderDataBufferTypeHEVC(vlVaContext *context, vlV
 VAStatus vlVaHandleVAEncMiscParameterTypeQualityLevelHEVC(vlVaContext *context, VAEncMiscParameterBuffer *buf);
 VAStatus vlVaHandleVAEncMiscParameterTypeMaxFrameSizeHEVC(vlVaContext *context, VAEncMiscParameterBuffer *buf);
 VAStatus vlVaHandleVAEncMiscParameterTypeHRDHEVC(vlVaContext *context, VAEncMiscParameterBuffer *buf);
+VAStatus vlVaHandleVAEncMiscParameterTypeTemporalLayerHEVC(vlVaContext *context, VAEncMiscParameterBuffer *buf);
 
 #if VA_CHECK_VERSION(1, 16, 0)
 VAStatus vlVaHandleVAEncSequenceParameterBufferTypeAV1(vlVaDriver *drv, vlVaContext *context, vlVaBuffer *buf);

@@ -1558,9 +1558,7 @@ agx_compile_nir(struct agx_device *dev, nir_shader *nir,
       BITSET_COPY(compiled->attrib_components_read, attrib_components_read);
 
    struct agx_shader_key key = {
-      .needs_g13x_coherency = (dev->params.gpu_generation == 13 &&
-                               dev->params.num_clusters_total > 1) ||
-                              dev->params.num_dies > 1,
+      .dev = agx_gather_device_key(dev),
       .libagx = dev->libagx,
       .has_scratch = !secondary,
       .promote_constants = true,
@@ -1592,11 +1590,10 @@ agx_compile_nir(struct agx_device *dev, nir_shader *nir,
    agx_compile_shader_nir(nir, &key, debug, &compiled->b);
 
    if (compiled->b.binary_size && !secondary) {
-      compiled->bo = agx_bo_create(dev, compiled->b.binary_size,
+      compiled->bo = agx_bo_create(dev, compiled->b.binary_size, 0,
                                    AGX_BO_EXEC | AGX_BO_LOW_VA, "Executable");
 
-      memcpy(compiled->bo->ptr.cpu, compiled->b.binary,
-             compiled->b.binary_size);
+      memcpy(compiled->bo->map, compiled->b.binary, compiled->b.binary_size);
    }
 
    return compiled;
@@ -2215,17 +2212,14 @@ agx_update_vs(struct agx_context *ctx, unsigned index_size_B)
    agx_update_shader(ctx, &ctx->vs, PIPE_SHADER_VERTEX,
                      (union asahi_shader_key *)&key);
 
+   struct agx_device *dev = agx_device(ctx->base.screen);
    struct agx_fast_link_key link_key = {
       .prolog.vs.hw = key.hw,
       .prolog.vs.sw_index_size_B = key.hw ? 0 : index_size_B,
 
       /* TODO: We could optimize this */
-      .prolog.vs.robustness =
-         {
-            .level = AGX_ROBUSTNESS_GL,
-            .soft_fault = false,
-         },
-
+      .prolog.vs.robustness.level = AGX_ROBUSTNESS_GL,
+      .prolog.vs.robustness.soft_fault = agx_has_soft_fault(dev),
       .main = ctx->vs,
    };
 
@@ -2468,34 +2462,35 @@ agx_bind_cs_state(struct pipe_context *pctx, void *cso)
 }
 
 /* Forward declare because of the recursion hit with geometry shaders */
-static void agx_delete_uncompiled_shader(struct agx_uncompiled_shader *so);
+static void agx_delete_uncompiled_shader(struct agx_device *dev,
+                                         struct agx_uncompiled_shader *so);
 
 static void
-agx_delete_compiled_shader_internal(struct agx_compiled_shader *so)
+agx_delete_compiled_shader(struct agx_device *dev,
+                           struct agx_compiled_shader *so)
 {
    if (so->gs_count)
-      agx_delete_compiled_shader_internal(so->gs_count);
+      agx_delete_compiled_shader(dev, so->gs_count);
 
    if (so->pre_gs)
-      agx_delete_compiled_shader_internal(so->pre_gs);
+      agx_delete_compiled_shader(dev, so->pre_gs);
 
    if (so->gs_copy)
-      agx_delete_compiled_shader_internal(so->gs_copy);
+      agx_delete_compiled_shader(dev, so->gs_copy);
 
-   agx_bo_unreference(so->bo);
+   agx_bo_unreference(dev, so->bo);
    FREE(so);
 }
 
 static void
-agx_delete_compiled_shader(struct hash_entry *ent)
+agx_delete_uncompiled_shader(struct agx_device *dev,
+                             struct agx_uncompiled_shader *so)
 {
-   agx_delete_compiled_shader_internal(ent->data);
-}
+   hash_table_foreach(so->variants, ent) {
+      agx_delete_compiled_shader(dev, ent->data);
+   }
 
-static void
-agx_delete_uncompiled_shader(struct agx_uncompiled_shader *so)
-{
-   _mesa_hash_table_destroy(so->variants, agx_delete_compiled_shader);
+   _mesa_hash_table_destroy(so->variants, NULL);
    blob_finish(&so->serialized_nir);
    blob_finish(&so->early_serialized_nir);
 
@@ -2503,14 +2498,15 @@ agx_delete_uncompiled_shader(struct agx_uncompiled_shader *so)
       for (unsigned j = 0; j < 3; ++j) {
          for (unsigned k = 0; k < 2; ++k) {
             if (so->passthrough_progs[i][j][k])
-               agx_delete_uncompiled_shader(so->passthrough_progs[i][j][k]);
+               agx_delete_uncompiled_shader(dev,
+                                            so->passthrough_progs[i][j][k]);
          }
       }
    }
 
    for (unsigned i = 0; i < ARRAY_SIZE(so->passthrough_tcs); ++i) {
       if (so->passthrough_tcs[i])
-         agx_delete_uncompiled_shader(so->passthrough_tcs[i]);
+         agx_delete_uncompiled_shader(dev, so->passthrough_tcs[i]);
    }
 
    ralloc_free(so);
@@ -2519,7 +2515,8 @@ agx_delete_uncompiled_shader(struct agx_uncompiled_shader *so)
 static void
 agx_delete_shader_state(struct pipe_context *ctx, void *cso)
 {
-   agx_delete_uncompiled_shader(cso);
+   struct agx_device *dev = agx_device(ctx->screen);
+   agx_delete_uncompiled_shader(dev, cso);
 }
 
 struct agx_generic_meta_key {
@@ -2557,7 +2554,12 @@ agx_init_meta_shaders(struct agx_context *ctx)
 void
 agx_destroy_meta_shaders(struct agx_context *ctx)
 {
-   _mesa_hash_table_destroy(ctx->generic_meta, agx_delete_compiled_shader);
+   struct agx_device *dev = agx_device(ctx->base.screen);
+   hash_table_foreach(ctx->generic_meta, ent) {
+      agx_delete_compiled_shader(dev, ent->data);
+   }
+
+   _mesa_hash_table_destroy(ctx->generic_meta, NULL);
 }
 
 static struct agx_compiled_shader *
@@ -2765,9 +2767,13 @@ agx_upload_textures(struct agx_batch *batch, struct agx_compiled_shader *cs,
       struct pipe_sampler_view sampler_view = util_image_to_sampler_view(view);
 
       /* For the texture descriptor, lower cubes to 2D arrays. This matches the
-       * transform done in the compiler.
+       * transform done in the compiler. Also, force 2D arrays for internal
+       * blitter images, this helps reduce shader variants.
        */
-      if (target_is_cube(sampler_view.target))
+      bool internal = (view->access & PIPE_IMAGE_ACCESS_DRIVER_INTERNAL);
+
+      if (target_is_cube(sampler_view.target) ||
+          (sampler_view.target == PIPE_TEXTURE_3D && internal))
          sampler_view.target = PIPE_TEXTURE_2D_ARRAY;
 
       agx_pack_texture(texture, agx_resource(view->resource), view->format,
@@ -2796,7 +2802,7 @@ agx_sampler_heap_add(struct agx_device *dev, struct agx_sampler_heap *heap,
    /* Allocate (maximally sized) BO if we haven't already */
    if (!heap->bo) {
       heap->bo = agx_bo_create(dev, AGX_SAMPLER_HEAP_SIZE * AGX_SAMPLER_LENGTH,
-                               AGX_BO_WRITEBACK, "Sampler heap");
+                               0, AGX_BO_WRITEBACK, "Sampler heap");
 
       assert(heap->count == 0);
    }
@@ -2805,7 +2811,7 @@ agx_sampler_heap_add(struct agx_device *dev, struct agx_sampler_heap *heap,
 
    /* Precondition: there is room in the heap */
    assert(heap->count < AGX_SAMPLER_HEAP_SIZE);
-   struct agx_sampler_packed *samplers = heap->bo->ptr.cpu;
+   struct agx_sampler_packed *samplers = heap->bo->map;
    memcpy(samplers + heap->count, sampler, sizeof(*sampler));
 
    return heap->count++;
@@ -2929,6 +2935,7 @@ agx_build_pipeline(struct agx_batch *batch, struct agx_compiled_shader *cs,
                    unsigned variable_shared_mem, size_t max_subgroups)
 {
    struct agx_context *ctx = batch->ctx;
+   struct agx_device *dev = agx_device(ctx->base.screen);
    unsigned constant_push_ranges =
       DIV_ROUND_UP(cs->b.info.immediate_size_16, 64);
 
@@ -3007,6 +3014,18 @@ agx_build_pipeline(struct agx_batch *batch, struct agx_compiled_shader *cs,
 
    if (stage == PIPE_SHADER_FRAGMENT) {
       agx_usc_push_packed(&b, SHARED, &batch->tilebuffer_layout.usc);
+   } else if (stage == PIPE_SHADER_COMPUTE && cs->b.info.imageblock_stride) {
+      assert(cs->b.info.local_size == 0 && "we don't handle this interaction");
+      assert(variable_shared_mem == 0 && "we don't handle this interaction");
+
+      agx_usc_pack(&b, SHARED, cfg) {
+         cfg.layout = AGX_SHARED_LAYOUT_32X32;
+         cfg.uses_shared_memory = true;
+         cfg.sample_count = 1;
+         cfg.sample_stride_in_8_bytes =
+            DIV_ROUND_UP(cs->b.info.imageblock_stride, 8);
+         cfg.bytes_per_threadgroup = cfg.sample_stride_in_8_bytes * 8 * 32 * 32;
+      }
    } else if (stage == PIPE_SHADER_COMPUTE || stage == PIPE_SHADER_TESS_CTRL) {
       unsigned size = cs->b.info.local_size + variable_shared_mem;
 
@@ -3027,7 +3046,8 @@ agx_build_pipeline(struct agx_batch *batch, struct agx_compiled_shader *cs,
          agx_usc_push_packed(&b, FRAGMENT_PROPERTIES, linked->fragment_props);
    } else {
       agx_usc_pack(&b, SHADER, cfg) {
-         cfg.code = (cs->bo->ptr.gpu + cs->b.info.main_offset);
+         cfg.code =
+            agx_usc_addr(dev, cs->bo->va->addr + cs->b.info.main_offset);
          cfg.unk_2 = 3;
       }
 
@@ -3041,20 +3061,22 @@ agx_build_pipeline(struct agx_batch *batch, struct agx_compiled_shader *cs,
 
    if (cs->b.info.has_preamble) {
       agx_usc_pack(&b, PRESHADER, cfg) {
-         cfg.code = cs->bo->ptr.gpu + cs->b.info.preamble_offset;
+         cfg.code =
+            agx_usc_addr(dev, cs->bo->va->addr + cs->b.info.preamble_offset);
       }
    } else {
       agx_usc_pack(&b, NO_PRESHADER, cfg)
          ;
    }
 
-   return t.gpu;
+   return agx_usc_addr(dev, t.gpu);
 }
 
 static uint32_t
 agx_build_internal_usc(struct agx_batch *batch, struct agx_compiled_shader *cs,
                        uint64_t data)
 {
+   struct agx_device *dev = agx_device(batch->ctx->base.screen);
    size_t usc_size = agx_usc_size(12);
 
    struct agx_ptr t =
@@ -3077,7 +3099,7 @@ agx_build_internal_usc(struct agx_batch *batch, struct agx_compiled_shader *cs,
    }
 
    agx_usc_pack(&b, SHADER, cfg) {
-      cfg.code = (cs->bo->ptr.gpu + cs->b.info.main_offset);
+      cfg.code = agx_usc_addr(dev, cs->bo->va->addr + cs->b.info.main_offset);
       cfg.unk_2 = 3;
    }
 
@@ -3088,14 +3110,15 @@ agx_build_internal_usc(struct agx_batch *batch, struct agx_compiled_shader *cs,
 
    if (cs->b.info.has_preamble) {
       agx_usc_pack(&b, PRESHADER, cfg) {
-         cfg.code = cs->bo->ptr.gpu + cs->b.info.preamble_offset;
+         cfg.code =
+            agx_usc_addr(dev, cs->bo->va->addr + cs->b.info.preamble_offset);
       }
    } else {
       agx_usc_pack(&b, NO_PRESHADER, cfg)
          ;
    }
 
-   return t.gpu;
+   return agx_usc_addr(dev, t.gpu);
 }
 
 static void
@@ -3277,11 +3300,12 @@ agx_build_bg_eot(struct agx_batch *batch, bool store, bool partial_render)
 
    /* Get the shader */
    key.reserved_preamble = uniforms;
+   struct agx_device *dev = agx_device(ctx->base.screen);
    struct agx_bg_eot_shader *shader = agx_get_bg_eot_shader(&ctx->bg_eot, &key);
    agx_batch_add_bo(batch, shader->bo);
 
    agx_usc_pack(&b, SHADER, cfg) {
-      cfg.code = shader->ptr;
+      cfg.code = agx_usc_addr(dev, shader->ptr);
       cfg.unk_2 = 0;
    }
 
@@ -3290,7 +3314,8 @@ agx_build_bg_eot(struct agx_batch *batch, bool store, bool partial_render)
 
    if (shader->info.has_preamble) {
       agx_usc_pack(&b, PRESHADER, cfg) {
-         cfg.code = shader->ptr + shader->info.preamble_offset;
+         cfg.code =
+            agx_usc_addr(dev, shader->ptr + shader->info.preamble_offset);
       }
    } else {
       agx_usc_pack(&b, NO_PRESHADER, cfg)
@@ -3484,6 +3509,7 @@ static uint8_t *
 agx_encode_state(struct agx_batch *batch, uint8_t *out)
 {
    struct agx_context *ctx = batch->ctx;
+   struct agx_device *dev = agx_device(ctx->base.screen);
 
    /* If nothing is dirty, encode nothing */
    if (!ctx->dirty)
@@ -3517,7 +3543,7 @@ agx_encode_state(struct agx_batch *batch, uint8_t *out)
                                     : 0,
                                  &batch->generate_primitive_id);
 
-         batch->varyings = t.gpu;
+         batch->varyings = agx_usc_addr(dev, t.gpu);
       } else {
          batch->varyings = 0;
       }
@@ -3794,7 +3820,7 @@ agx_index_buffer_rsrc_ptr(struct agx_batch *batch,
    agx_batch_reads(batch, rsrc);
 
    *extent = ALIGN_POT(rsrc->layout.size_B, 4);
-   return rsrc->bo->ptr.gpu;
+   return rsrc->bo->va->addr;
 }
 
 static uint64_t
@@ -3928,7 +3954,7 @@ agx_batch_geometry_state(struct agx_batch *batch)
       }
 
       struct agx_geometry_state state = {
-         .heap = agx_resource(ctx->heap)->bo->ptr.gpu,
+         .heap = agx_resource(ctx->heap)->bo->va->addr,
          .heap_size = size,
       };
 
@@ -3975,7 +4001,7 @@ agx_batch_geometry_params(struct agx_batch *batch, uint64_t input_index_buffer,
       params.xfb_size[i] = size;
 
       if (rsrc) {
-         params.xfb_offs_ptrs[i] = rsrc->bo->ptr.gpu;
+         params.xfb_offs_ptrs[i] = rsrc->bo->va->addr;
          agx_batch_writes(batch, rsrc, 0);
          batch->incoherent_writes = true;
       } else {
@@ -4055,7 +4081,7 @@ agx_indirect_buffer_ptr(struct agx_batch *batch,
 
    struct agx_resource *rsrc = agx_resource(indirect->buffer);
    agx_batch_reads(batch, rsrc);
-   return rsrc->bo->ptr.gpu + indirect->offset;
+   return rsrc->bo->va->addr + indirect->offset;
 }
 
 static void
@@ -4226,7 +4252,7 @@ agx_draw_without_restart(struct agx_batch *batch,
       .restart_index = info->restart_index,
       .index_buffer_size_el = ib_extent / info->index_size,
       .flatshade_first = batch->ctx->rast->base.flatshade_first,
-      .draws = indirect_rsrc->bo->ptr.gpu + indirect->offset,
+      .draws = indirect_rsrc->bo->va->addr + indirect->offset,
    };
 
    /* Unroll the index buffer for each draw */
@@ -4248,7 +4274,7 @@ agx_draw_without_restart(struct agx_batch *batch,
 
    struct pipe_draw_indirect_info new_indirect = *indirect;
    new_indirect.buffer = &out_draws_rsrc.base;
-   new_indirect.offset = out_draws.gpu - out_draws_rsrc.bo->ptr.gpu;
+   new_indirect.offset = out_draws.gpu - out_draws_rsrc.bo->va->addr;
    new_indirect.stride = 5 * sizeof(uint32_t);
 
    ctx->active_draw_without_restart = true;
@@ -4445,7 +4471,7 @@ agx_upload_draw_params(struct agx_batch *batch,
 {
    if (indirect) {
       struct agx_resource *indirect_rsrc = agx_resource(indirect->buffer);
-      uint64_t address = indirect_rsrc->bo->ptr.gpu + indirect->offset;
+      uint64_t address = indirect_rsrc->bo->va->addr + indirect->offset;
       agx_batch_reads(batch, indirect_rsrc);
 
       /* To implement draw parameters, we use the last 2 words of the
@@ -4591,7 +4617,7 @@ agx_draw_patches(struct agx_context *ctx, const struct pipe_draw_info *info,
       .output_patch_size = tcs->tess.output_patch_size,
       .tcs_patch_constants = tcs->tess.nr_patch_outputs,
       .tcs_per_vertex_outputs = tcs->tess.per_vertex_outputs,
-      .patch_coord_buffer = agx_resource(ctx->heap)->bo->ptr.gpu,
+      .patch_coord_buffer = agx_resource(ctx->heap)->bo->va->addr,
    };
 
    memcpy(&args.tess_level_outer_default, ctx->default_outer_level,
@@ -4781,7 +4807,7 @@ agx_draw_patches(struct agx_context *ctx, const struct pipe_draw_info *info,
 
    struct pipe_draw_indirect_info copy_indirect = {
       .buffer = &indirect_rsrc.base,
-      .offset = args.out_draws - draw_bo->ptr.gpu,
+      .offset = args.out_draws - draw_bo->va->addr,
       .stride = draw_stride,
       .draw_count = 1,
    };
@@ -5113,7 +5139,7 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
       indirect_gs = (struct pipe_draw_indirect_info){
          .draw_count = 1,
          .buffer = &indirect_rsrc.base,
-         .offset = batch->geom_indirect - indirect_rsrc.bo->ptr.gpu,
+         .offset = batch->geom_indirect - indirect_rsrc.bo->va->addr,
       };
 
       info = &info_gs;
@@ -5124,7 +5150,7 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
       ctx->dirty |= AGX_DIRTY_PRIM;
 
       if (info_gs.index_size) {
-         ib = agx_resource(ctx->heap)->bo->ptr.gpu;
+         ib = agx_resource(ctx->heap)->bo->va->addr;
          ib_extent = agx_resource(ctx->heap)->bo->size;
       } else {
          ib = 0;
@@ -5172,7 +5198,7 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
 
    if (ctx->in_generated_vdm) {
       struct agx_resource *indirect_rsrc = agx_resource(indirect->buffer);
-      uint64_t address = indirect_rsrc->bo->ptr.gpu + indirect->offset;
+      uint64_t address = indirect_rsrc->bo->va->addr + indirect->offset;
 
       agx_push(out, VDM_STREAM_LINK, cfg) {
          cfg.target_lo = address & BITFIELD_MASK(32);
@@ -5217,7 +5243,7 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
 
       if (indirect) {
          struct agx_resource *indirect_rsrc = agx_resource(indirect->buffer);
-         uint64_t address = indirect_rsrc->bo->ptr.gpu + indirect->offset;
+         uint64_t address = indirect_rsrc->bo->va->addr + indirect->offset;
 
          agx_push(out, INDEX_LIST_INDIRECT_BUFFER, cfg) {
             cfg.address_hi = address >> 32;
@@ -5450,7 +5476,7 @@ agx_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
    if (info->indirect) {
       struct agx_resource *rsrc = agx_resource(info->indirect);
       agx_batch_reads(batch, rsrc);
-      indirect = rsrc->bo->ptr.gpu + info->indirect_offset;
+      indirect = rsrc->bo->va->addr + info->indirect_offset;
    }
 
    /* Increment the pipeline stats query.
@@ -5501,7 +5527,7 @@ agx_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
       agx_batch_reads(batch, indirect);
 
       grid.mode = AGX_CDM_MODE_INDIRECT_GLOBAL;
-      grid.indirect = indirect->bo->ptr.gpu + info->indirect_offset;
+      grid.indirect = indirect->bo->va->addr + info->indirect_offset;
    } else {
       grid.mode = AGX_CDM_MODE_DIRECT;
 
@@ -5566,7 +5592,7 @@ agx_set_global_binding(struct pipe_context *pipe, unsigned first,
          struct agx_resource *rsrc = agx_resource(resources[i]);
 
          memcpy(&addr, handles[i], sizeof(addr));
-         addr += rsrc->bo->ptr.gpu;
+         addr += rsrc->bo->va->addr;
          memcpy(handles[i], &addr, sizeof(addr));
       } else {
          pipe_resource_reference(res, NULL);

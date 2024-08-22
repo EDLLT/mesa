@@ -714,7 +714,7 @@ struct anv_fixed_size_state_pool {
 };
 
 #define ANV_MIN_STATE_SIZE_LOG2 6
-#define ANV_MAX_STATE_SIZE_LOG2 22
+#define ANV_MAX_STATE_SIZE_LOG2 24
 
 #define ANV_STATE_BUCKETS (ANV_MAX_STATE_SIZE_LOG2 - ANV_MIN_STATE_SIZE_LOG2 + 1)
 
@@ -2346,6 +2346,11 @@ struct anv_batch {
     * Number of 3DPRIMITIVE's emitted for WA 16014538804
     */
    uint8_t num_3d_primitives_emitted;
+
+   struct u_trace * trace;
+   const char * pc_reasons[4];
+   uint32_t pc_reasons_count;
+
 };
 
 void *anv_batch_emit_dwords(struct anv_batch *batch, int num_dwords);
@@ -2442,6 +2447,9 @@ _anv_combine_address(struct anv_batch *batch, void *location,
            assert((pipeline)->state.len == __anv_cmd_length(cmd));      \
            __anv_cmd_pack(cmd)(batch, _partial, &name);                 \
            for (uint32_t i = 0; i < __anv_cmd_length(cmd); i++) {       \
+              assert((_partial[i] &                                     \
+                      (pipeline)->batch_data[                           \
+                         (pipeline)->state.offset + i]) == 0);          \
               ((uint32_t *)_dst)[i] = _partial[i] |                     \
                  (pipeline)->batch_data[(pipeline)->state.offset + i];  \
            }                                                            \
@@ -2461,6 +2469,9 @@ _anv_combine_address(struct anv_batch *batch, void *location,
            assert(_cmd_state->len == __anv_cmd_length(cmd));            \
            __anv_cmd_pack(cmd)(batch, _partial, &name);                 \
            for (uint32_t i = 0; i < __anv_cmd_length(cmd); i++) {       \
+              assert((_partial[i] &                                     \
+                      (pipeline)->batch_data[                           \
+                         (pipeline)->state.offset + i]) == 0);          \
               ((uint32_t *)_dst)[i] = _partial[i] |                     \
                  (pipeline)->batch_data[_cmd_state->offset + i];        \
            }                                                            \
@@ -3315,6 +3326,7 @@ enum anv_cmd_dirty_bits {
    ANV_CMD_DIRTY_RESTART_INDEX                       = 1 << 5,
    ANV_CMD_DIRTY_OCCLUSION_QUERY_ACTIVE              = 1 << 6,
    ANV_CMD_DIRTY_FS_MSAA_FLAGS                       = 1 << 7,
+   ANV_CMD_DIRTY_COARSE_PIXEL_ACTIVE                 = 1 << 8,
 };
 typedef enum anv_cmd_dirty_bits anv_cmd_dirty_mask_t;
 
@@ -3787,6 +3799,12 @@ struct anv_cmd_pipeline_state {
    struct anv_pipeline      *pipeline;
 };
 
+enum anv_coarse_pixel_state {
+   ANV_COARSE_PIXEL_STATE_UNKNOWN,
+   ANV_COARSE_PIXEL_STATE_DISABLED,
+   ANV_COARSE_PIXEL_STATE_ENABLED,
+};
+
 /** State tracking for graphics pipeline
  *
  * This has anv_cmd_pipeline_state as a base struct to track things which get
@@ -3849,6 +3867,11 @@ struct anv_cmd_graphics_state {
     * State tracking for Wa_18020335297.
     */
    bool                                         viewport_set;
+
+   /**
+    * State tracking for Wa_18038825448.
+    */
+   enum anv_coarse_pixel_state coarse_pixel_active;
 
    struct intel_urb_config urb_cfg;
 
@@ -3914,8 +3937,6 @@ struct anv_cmd_state {
    struct anv_cmd_ray_tracing_state             rt;
 
    enum anv_pipe_bits                           pending_pipe_bits;
-   const char *                                 pc_reasons[4];
-   uint32_t                                     pc_reasons_count;
 
    /**
     * Whether the last programmed STATE_BASE_ADDRESS references
@@ -3992,6 +4013,11 @@ struct anv_cmd_state {
     * last command buffer to the primary (if known).
     */
    enum anv_depth_reg_mode                      depth_reg_mode;
+
+   /* The last auxiliary surface operation (or equivalent operation) provided
+    * to genX(cmd_buffer_update_color_aux_op).
+    */
+   enum isl_aux_op                              color_aux_op;
 
    /**
     * Whether RHWO optimization is enabled (Wa_1508744258).
@@ -4684,6 +4710,11 @@ struct anv_graphics_lib_pipeline {
 
       enum gl_subgroup_size                     subgroup_size_type;
 
+      /* Hold on the value of VK_PIPELINE_CREATE_VIEW_INDEX_FROM_DEVICE_INDEX_BIT
+       * from library that introduces the stage, so it remains consistent.
+       */
+      bool                                      view_index_from_device_index;
+
       /* NIR captured in anv_pipeline_stage_get_nir(), includes specialization
        * constants.
        */
@@ -4806,20 +4837,6 @@ struct anv_graphics_pipeline {
       struct anv_gfx_state_ptr                  vfg;
    } partial;
 };
-
-#define anv_batch_merge_pipeline_state(batch, dwords0, pipeline, state) \
-   do {                                                                 \
-      uint32_t *dw;                                                     \
-                                                                        \
-      assert(ARRAY_SIZE(dwords0) == (pipeline)->state.len);             \
-      dw = anv_batch_emit_dwords((batch), ARRAY_SIZE(dwords0));         \
-      if (!dw)                                                          \
-         break;                                                         \
-      for (uint32_t i = 0; i < ARRAY_SIZE(dwords0); i++)                \
-         dw[i] = (dwords0)[i] |                                         \
-            (pipeline)->batch_data[(pipeline)->state.offset + i];       \
-      VG(VALGRIND_CHECK_MEM_IS_DEFINED(dw, ARRAY_SIZE(dwords0) * 4));   \
-   } while (0)
 
 #define anv_batch_emit_pipeline_state(batch, pipeline, state)           \
    do {                                                                 \
@@ -6131,11 +6148,8 @@ anv_add_pending_pipe_bits(struct anv_cmd_buffer* cmd_buffer,
       anv_dump_pipe_bits(bits, stdout);
       fprintf(stdout, "reason: %s\n", reason);
    }
-   /* store reason, if space available*/
-   if (cmd_buffer->state.pc_reasons_count <
-       ARRAY_SIZE(cmd_buffer->state.pc_reasons)) {
-      cmd_buffer->state.pc_reasons[
-         cmd_buffer->state.pc_reasons_count++] = reason;
+   if (cmd_buffer->batch.pc_reasons_count < ARRAY_SIZE(cmd_buffer->batch.pc_reasons)) {
+      cmd_buffer->batch.pc_reasons[cmd_buffer->batch.pc_reasons_count++] = reason;
    }
 }
 
@@ -6206,9 +6220,6 @@ struct anv_utrace_submit {
    /* Stream for temporary allocations */
    struct anv_state_stream dynamic_state_stream;
    struct anv_state_stream general_state_stream;
-
-   /* Buffer of 64bits timestamps (only used for timestamp copies) */
-   struct anv_bo *trace_bo;
 
    /* Last fully read 64bit timestamp (used to rebuild the upper bits of 32bit
     * timestamps)

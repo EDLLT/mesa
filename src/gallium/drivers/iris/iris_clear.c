@@ -498,10 +498,20 @@ can_fast_clear_depth(struct iris_context *ice,
    if (!iris_resource_level_has_hiz(devinfo, res, level))
       return false;
 
-   if (!blorp_can_hiz_clear_depth(devinfo, &res->surf, res->aux.usage,
-                                  level, box->z, box->x, box->y,
-                                  box->x + box->width,
-                                  box->y + box->height)) {
+   /* From the TGL PRM, Vol 9, "Compressed Depth Buffers" (under the
+    * "Texture performant" and "ZCS" columns):
+    *
+    *    Update with clear at either 16x8 or 8x4 granularity, based on
+    *    fs_clr or otherwise.
+    *
+    * When fast-clearing, hardware behaves in unexpected ways if the clear
+    * rectangle, aligned to 16x8, could cover neighboring LODs. Fortunately,
+    * ISL guarantees that LOD0 will be 8-row aligned and LOD0's height seems
+    * to not matter. Also, few applications ever clear LOD1+. Only allow
+    * fast-clearing upper LODs if no overlap can occur.
+    */
+   if (res->aux.usage == ISL_AUX_USAGE_HIZ_CCS_WT && level >= 1 &&
+       (p_res->width0 % 32 != 0 || res->surf.image_alignment_el.h % 8 != 0)) {
       return false;
    }
 
@@ -516,8 +526,28 @@ fast_clear_depth(struct iris_context *ice,
                  float depth)
 {
    struct iris_batch *batch = &ice->batches[IRIS_BATCH_RENDER];
+   const struct intel_device_info *devinfo = batch->screen->devinfo;
 
-   bool update_clear_depth = false;
+   if (res->aux.usage == ISL_AUX_USAGE_HIZ_CCS_WT) {
+      /* From Bspec 47010 (Depth Buffer Clear):
+       *
+       *    Since the fast clear cycles to CCS are not cached in TileCache,
+       *    any previous depth buffer writes to overlapping pixels must be
+       *    flushed out of TileCache before a succeeding Depth Buffer Clear.
+       *    This restriction only applies to Depth Buffer with write-thru
+       *    enabled, since fast clears to CCS only occur for write-thru mode.
+       *
+       * There may have been a write to this depth buffer. Flush it from the
+       * tile cache just in case.
+       *
+       * Set CS stall bit to guarantee that the fast clear starts the execution
+       * after the tile cache flush completed.
+       */
+      iris_emit_pipe_control_flush(batch, "hiz_ccs_wt: before fast clear",
+                                   PIPE_CONTROL_DEPTH_CACHE_FLUSH |
+                                   PIPE_CONTROL_CS_STALL |
+                                   PIPE_CONTROL_TILE_CACHE_FLUSH);
+   }
 
    /* If we're clearing to a new clear value, then we need to resolve any clear
     * flags out of the HiZ buffer into the real depth buffer.
@@ -550,48 +580,50 @@ fast_clear_depth(struct iris_context *ice,
              * value so this shouldn't happen often.
              */
             iris_hiz_exec(ice, batch, res, res_level, layer, 1,
-                          ISL_AUX_OP_FULL_RESOLVE, false);
+                          ISL_AUX_OP_FULL_RESOLVE);
             iris_resource_set_aux_state(ice, res, res_level, layer, 1,
                                         ISL_AUX_STATE_RESOLVED);
          }
       }
       const union isl_color_value clear_value = { .f32 = {depth, } };
       iris_resource_set_clear_color(ice, res, clear_value);
-      update_clear_depth = true;
-   }
 
-   if (res->aux.usage == ISL_AUX_USAGE_HIZ_CCS_WT) {
-      /* From Bspec 47010 (Depth Buffer Clear):
-       *
-       *    Since the fast clear cycles to CCS are not cached in TileCache,
-       *    any previous depth buffer writes to overlapping pixels must be
-       *    flushed out of TileCache before a succeeding Depth Buffer Clear.
-       *    This restriction only applies to Depth Buffer with write-thru
-       *    enabled, since fast clears to CCS only occur for write-thru mode.
-       *
-       * There may have been a write to this depth buffer. Flush it from the
-       * tile cache just in case.
-       *
-       * Set CS stall bit to guarantee that the fast clear starts the execution
-       * after the tile cache flush completed.
-       */
-      iris_emit_pipe_control_flush(batch, "hiz_ccs_wt: before fast clear",
-                                   PIPE_CONTROL_DEPTH_CACHE_FLUSH |
-                                   PIPE_CONTROL_CS_STALL |
-                                   PIPE_CONTROL_TILE_CACHE_FLUSH);
+      /* Also set the indirect clear color if it exists. */
+      if (res->aux.clear_color_bo) {
+         uint32_t packed_depth;
+         isl_color_value_pack(&clear_value, res->surf.format, &packed_depth);
+
+         const uint64_t clear_pixel_offset = res->aux.clear_color_offset +
+            isl_get_sampler_clear_field_offset(devinfo, res->surf.format);
+
+         iris_emit_pipe_control_write(batch, "update fast clear value (Z)",
+                                      PIPE_CONTROL_WRITE_IMMEDIATE,
+                                      res->aux.clear_color_bo,
+                                      clear_pixel_offset, packed_depth);
+
+         /* From the TGL PRMs, Volume 9: Render Engine, State Caching :
+          *
+          *    "Any values referenced by pointers within the
+          *    RENDER_SURFACE_STATE or SAMPLER_STATE (e.g. Clear Color
+          *    Pointer, Border Color or Indirect State Pointer) are considered
+          *    to be part of that state and any changes to these referenced
+          *    values requires an invalidation of the L1 state cache to ensure
+          *    the new values are being used as part of the state."
+          *
+          * Invalidate the state cache as suggested.
+          */
+         iris_emit_pipe_control_flush(batch, "flush fast clear values (z)",
+                                      PIPE_CONTROL_FLUSH_ENABLE |
+                                      PIPE_CONTROL_STATE_CACHE_INVALIDATE);
+      }
    }
 
    for (unsigned l = 0; l < box->depth; l++) {
       enum isl_aux_state aux_state =
          iris_resource_get_aux_state(res, level, box->z + l);
-      if (update_clear_depth || aux_state != ISL_AUX_STATE_CLEAR) {
-         if (aux_state == ISL_AUX_STATE_CLEAR) {
-            perf_debug(&ice->dbg, "Performing HiZ clear just to update the "
-                                  "depth clear value\n");
-         }
+      if (aux_state != ISL_AUX_STATE_CLEAR) {
          iris_hiz_exec(ice, batch, res, level,
-                       box->z + l, 1, ISL_AUX_OP_FAST_CLEAR,
-                       update_clear_depth);
+                       box->z + l, 1, ISL_AUX_OP_FAST_CLEAR);
       }
    }
 

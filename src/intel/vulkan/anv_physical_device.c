@@ -150,6 +150,7 @@ get_device_extensions(const struct anv_physical_device *device,
       .KHR_shader_maximal_reconvergence      = true,
       .KHR_shader_non_semantic_info          = true,
       .KHR_shader_quad_control               = true,
+      .KHR_shader_relaxed_extended_instruction = true,
       .KHR_shader_subgroup_extended_types    = true,
       .KHR_shader_subgroup_rotate            = true,
       .KHR_shader_subgroup_uniform_control_flow = true,
@@ -2020,6 +2021,7 @@ anv_physical_device_free_disk_cache(struct anv_physical_device *device)
  *  * "g" is for graphics queues with no compute support
  *  * "c" is for compute queues with no graphics support
  *  * "v" is for video queues with no graphics support
+ *  * "b" is for copy (blitter) queues with no graphics support
  *
  * For example, ANV_QUEUE_OVERRIDE=gc=2,c=1 would override the number of
  * advertised queues to be 2 queues with graphics+compute support, and 1 queue
@@ -2034,12 +2036,13 @@ anv_physical_device_free_disk_cache(struct anv_physical_device *device)
  * number of graphics+compute queues to be 0.
  */
 static void
-anv_override_engine_counts(int *gc_count, int *g_count, int *c_count, int *v_count)
+anv_override_engine_counts(int *gc_count, int *g_count, int *c_count, int *v_count, int *blit_count)
 {
    int gc_override = -1;
    int g_override = -1;
    int c_override = -1;
    int v_override = -1;
+   int blit_override = -1;
    const char *env_ = os_get_option("ANV_QUEUE_OVERRIDE");
 
    if (env_ == NULL)
@@ -2057,6 +2060,8 @@ anv_override_engine_counts(int *gc_count, int *g_count, int *c_count, int *v_cou
          c_override = strtol(next + 2, NULL, 0);
       } else if (strncmp(next, "v=", 2) == 0) {
          v_override = strtol(next + 2, NULL, 0);
+      } else if (strncmp(next, "b=", 2) == 0) {
+         blit_override = strtol(next + 2, NULL, 0);
       } else {
          mesa_logw("Ignoring unsupported ANV_QUEUE_OVERRIDE token: %s", next);
       }
@@ -2074,6 +2079,8 @@ anv_override_engine_counts(int *gc_count, int *g_count, int *c_count, int *v_cou
       *c_count = c_override;
    if (v_override >= 0)
       *v_count = v_override;
+   if (blit_override >= 0)
+      *blit_count = blit_override;
 }
 
 static void
@@ -2093,12 +2100,20 @@ anv_physical_device_init_queue_families(struct anv_physical_device *pdevice)
          intel_engines_count(pdevice->engine_info, INTEL_ENGINE_CLASS_VIDEO);
       int g_count = 0;
       int c_count = 0;
+      /* Not only the Kernel needs to have vm_control, but it also needs to
+       * have a new enough GuC and the interface to tell us so. This is
+       * implemented in the common layer by is_guc_semaphore_functional() and
+       * results in devinfo->engine_class_supported_count being adjusted,
+       * which we read below.
+       */
       const bool kernel_supports_non_render_engines = pdevice->has_vm_control;
-      const bool sparse_supports_non_render_engines =
-         pdevice->sparse_type != ANV_SPARSE_TYPE_TRTT;
+      /* For now we're choosing to not expose non-render engines on i915.ko
+       * even when the Kernel allows it. We have data suggesting it's not an
+       * obvious win in terms of performance.
+       */
       const bool can_use_non_render_engines =
          kernel_supports_non_render_engines &&
-         sparse_supports_non_render_engines;
+         pdevice->info.kmd_type == INTEL_KMD_TYPE_XE;
 
       if (can_use_non_render_engines) {
          c_count = pdevice->info.engine_class_supported_count[INTEL_ENGINE_CLASS_COMPUTE];
@@ -2111,7 +2126,7 @@ anv_physical_device_init_queue_families(struct anv_physical_device *pdevice)
          blit_count = pdevice->info.engine_class_supported_count[INTEL_ENGINE_CLASS_COPY];
       }
 
-      anv_override_engine_counts(&gc_count, &g_count, &c_count, &v_count);
+      anv_override_engine_counts(&gc_count, &g_count, &c_count, &v_count, &blit_count);
 
       if (gc_count > 0) {
          pdevice->queue.families[family_count++] = (struct anv_queue_family) {
@@ -2397,21 +2412,20 @@ anv_physical_device_try_create(struct vk_instance *vk_instance,
    device->uses_relocs = device->info.kmd_type != INTEL_KMD_TYPE_XE;
 
    /* While xe.ko can use both vm_bind and TR-TT, i915.ko only has TR-TT. */
-   if (device->info.kmd_type == INTEL_KMD_TYPE_XE) {
-      if (debug_get_bool_option("ANV_SPARSE_USE_TRTT", false))
-         device->sparse_type = ANV_SPARSE_TYPE_TRTT;
-      else
-         device->sparse_type = ANV_SPARSE_TYPE_VM_BIND;
-   } else {
-      if (device->info.ver >= 12 &&
-          device->has_exec_timeline &&
-          debug_get_bool_option("ANV_SPARSE", true)) {
-         device->sparse_type = ANV_SPARSE_TYPE_TRTT;
-      } else if (instance->has_fake_sparse) {
-         device->sparse_type = ANV_SPARSE_TYPE_FAKE;
+   if (debug_get_bool_option("ANV_SPARSE", true)) {
+      if (device->info.kmd_type == INTEL_KMD_TYPE_XE) {
+         if (debug_get_bool_option("ANV_SPARSE_USE_TRTT", false))
+            device->sparse_type = ANV_SPARSE_TYPE_TRTT;
+         else
+            device->sparse_type = ANV_SPARSE_TYPE_VM_BIND;
       } else {
-         device->sparse_type = ANV_SPARSE_TYPE_NOT_SUPPORTED;
+         if (device->info.ver >= 12 && device->has_exec_timeline)
+            device->sparse_type = ANV_SPARSE_TYPE_TRTT;
       }
+   }
+   if (device->sparse_type == ANV_SPARSE_TYPE_NOT_SUPPORTED) {
+      if (instance->has_fake_sparse)
+         device->sparse_type = ANV_SPARSE_TYPE_FAKE;
    }
 
    device->always_flush_cache = INTEL_DEBUG(DEBUG_STALL) ||

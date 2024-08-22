@@ -1281,20 +1281,20 @@ radv_link_vs(const struct radv_device *device, struct radv_shader_stage *vs_stag
    }
 
    if (next_stage && next_stage->nir->info.stage == MESA_SHADER_TESS_CTRL) {
-      nir_linked_io_var_info vs2tcs = nir_assign_linked_io_var_locations(vs_stage->nir, next_stage->nir);
+      const unsigned num_reserved_slots = util_bitcount64(next_stage->nir->info.inputs_read);
 
-      vs_stage->info.vs.num_linked_outputs = vs2tcs.num_linked_io_vars;
+      vs_stage->info.vs.num_linked_outputs = num_reserved_slots;
       vs_stage->info.outputs_linked = true;
 
-      next_stage->info.tcs.num_linked_inputs = vs2tcs.num_linked_io_vars;
+      next_stage->info.tcs.num_linked_inputs = num_reserved_slots;
       next_stage->info.inputs_linked = true;
    } else if (next_stage && next_stage->nir->info.stage == MESA_SHADER_GEOMETRY) {
-      nir_linked_io_var_info vs2gs = nir_assign_linked_io_var_locations(vs_stage->nir, next_stage->nir);
+      const unsigned num_reserved_slots = util_bitcount64(next_stage->nir->info.inputs_read);
 
-      vs_stage->info.vs.num_linked_outputs = vs2gs.num_linked_io_vars;
+      vs_stage->info.vs.num_linked_outputs = num_reserved_slots;
       vs_stage->info.outputs_linked = true;
 
-      next_stage->info.gs.num_linked_inputs = vs2gs.num_linked_io_vars;
+      next_stage->info.gs.num_linked_inputs = num_reserved_slots;
       next_stage->info.inputs_linked = true;
    }
 }
@@ -1354,12 +1354,12 @@ radv_link_tes(const struct radv_device *device, struct radv_shader_stage *tes_st
    }
 
    if (next_stage && next_stage->nir->info.stage == MESA_SHADER_GEOMETRY) {
-      nir_linked_io_var_info tes2gs = nir_assign_linked_io_var_locations(tes_stage->nir, next_stage->nir);
+      const unsigned num_reserved_slots = util_bitcount64(next_stage->nir->info.inputs_read);
 
-      tes_stage->info.tes.num_linked_outputs = tes2gs.num_linked_io_vars;
+      tes_stage->info.tes.num_linked_outputs = num_reserved_slots;
       tes_stage->info.outputs_linked = true;
 
-      next_stage->info.gs.num_linked_inputs = tes2gs.num_linked_io_vars;
+      next_stage->info.gs.num_linked_inputs = num_reserved_slots;
       next_stage->info.inputs_linked = true;
    }
 }
@@ -2059,6 +2059,8 @@ radv_create_gs_copy_shader(struct radv_device *device, struct vk_pipeline_cache 
                            struct radv_shader_binary **gs_copy_binary)
 {
    const struct radv_physical_device *pdev = radv_device_physical(device);
+   struct radv_instance *instance = radv_physical_device_instance(pdev);
+
    const struct radv_shader_info *gs_info = &gs_stage->info;
    ac_nir_gs_output_info output_info = {
       .streams = gs_info->gs.output_streams,
@@ -2101,6 +2103,9 @@ radv_create_gs_copy_shader(struct radv_device *device, struct vk_pipeline_cache 
    struct radv_graphics_pipeline_key key = {0};
    bool dump_shader = radv_can_dump_shader(device, nir, true);
 
+   if (dump_shader)
+      simple_mtx_lock(&instance->shader_dump_mtx);
+
    *gs_copy_binary = radv_shader_nir_to_asm(device, &gs_copy_stage, &nir, 1, &key.gfx_state, keep_executable_info,
                                             keep_statistic_info);
    struct radv_shader *copy_shader =
@@ -2108,6 +2113,10 @@ radv_create_gs_copy_shader(struct radv_device *device, struct vk_pipeline_cache 
    if (copy_shader)
       radv_shader_generate_debug_info(device, dump_shader, keep_executable_info, *gs_copy_binary, copy_shader, &nir, 1,
                                       &gs_copy_stage.info);
+
+   if (dump_shader)
+      simple_mtx_unlock(&instance->shader_dump_mtx);
+
    return copy_shader;
 }
 
@@ -2120,6 +2129,7 @@ radv_graphics_shaders_nir_to_asm(struct radv_device *device, struct vk_pipeline_
                                  struct radv_shader_binary **gs_copy_binary)
 {
    const struct radv_physical_device *pdev = radv_device_physical(device);
+   struct radv_instance *instance = radv_physical_device_instance(pdev);
 
    for (int s = MESA_VULKAN_SHADER_STAGES - 1; s >= 0; s--) {
       if (!(active_nir_stages & (1 << s)))
@@ -2150,11 +2160,20 @@ radv_graphics_shaders_nir_to_asm(struct radv_device *device, struct vk_pipeline_
 
       bool dump_shader = radv_can_dump_shader(device, nir_shaders[0], false);
 
+      if (dump_shader) {
+         simple_mtx_lock(&instance->shader_dump_mtx);
+         for (uint32_t i = 0; i < shader_count; i++)
+            nir_print_shader(nir_shaders[i], stderr);
+      }
+
       binaries[s] = radv_shader_nir_to_asm(device, &stages[s], nir_shaders, shader_count, gfx_state,
                                            keep_executable_info, keep_statistic_info);
       shaders[s] = radv_shader_create(device, cache, binaries[s], keep_executable_info || dump_shader);
       radv_shader_generate_debug_info(device, dump_shader, keep_executable_info, binaries[s], shaders[s], nir_shaders,
                                       shader_count, &stages[s].info);
+
+      if (dump_shader)
+         simple_mtx_unlock(&instance->shader_dump_mtx);
 
       if (s == MESA_SHADER_GEOMETRY && !stages[s].info.is_ngg) {
          *gs_copy_shader = radv_create_gs_copy_shader(device, cache, &stages[MESA_SHADER_GEOMETRY], gfx_state,
@@ -2380,6 +2399,7 @@ radv_graphics_shaders_compile(struct radv_device *device, struct vk_pipeline_cac
             .lower_view_index_to_zero = !gfx_state->has_multiview_view_index,
             .fix_dual_src_mrt1_export =
                gfx_state->ps.epilog.mrt0_is_dual_src && instance->drirc.dual_color_blend_by_location,
+            .lower_view_index_to_device_index = stages[s].key.view_index_from_device_index,
          };
          blake3_hash key;
 
@@ -2504,9 +2524,6 @@ radv_graphics_shaders_compile(struct radv_device *device, struct vk_pipeline_cac
       radv_postprocess_nir(device, gfx_state, &stages[i]);
 
       stages[i].feedback.duration += os_time_get_nano() - stage_start;
-
-      if (radv_can_dump_shader(device, stages[i].nir, false))
-         nir_print_shader(stages[i].nir, stderr);
    }
 
    /* Compile NIR shaders to AMD assembly. */

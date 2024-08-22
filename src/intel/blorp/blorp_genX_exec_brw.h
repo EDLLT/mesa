@@ -593,7 +593,10 @@ blorp_emit_cc_viewport(struct blorp_batch *batch)
 {
    uint32_t cc_vp_offset;
 
-   if (batch->blorp->config.use_cached_dynamic_states) {
+   /* Somehow reusing CC_VIEWPORT on Gfx9 is causing issues :
+    *    https://gitlab.freedesktop.org/mesa/mesa/-/issues/11647
+    */
+   if (GFX_VER != 9 && batch->blorp->config.use_cached_dynamic_states) {
       cc_vp_offset = blorp_get_dynamic_state(batch, BLORP_DYNAMIC_STATE_CC_VIEWPORT);
    } else {
       blorp_emit_dynamic(batch, GENX(CC_VIEWPORT), vp, 32, &cc_vp_offset) {
@@ -874,6 +877,12 @@ blorp_emit_ps_config(struct blorp_batch *batch,
          psx.PixelShaderComputedDepthMode = prog_data->computed_depth_mode;
          psx.PixelShaderComputesStencil = prog_data->computed_stencil;
          psx.PixelShaderIsPerSample = prog_data->persample_dispatch;
+
+#if INTEL_WA_18038825448_GFX_VER
+         psx.EnablePSDependencyOnCPsizeChange =
+            batch->flags & BLORP_BATCH_FORCE_CPS_DEPENDENCY;
+#endif
+
 #if GFX_VER < 20
          psx.AttributeEnable = prog_data->num_varying_inputs > 0;
 #else
@@ -1307,6 +1316,8 @@ blorp_emit_depth_stencil_config(struct blorp_batch *batch,
                                 const struct blorp_params *params)
 {
    const struct isl_device *isl_dev = batch->blorp->isl_dev;
+   const struct intel_device_info *devinfo =
+      batch->blorp->compiler->brw->devinfo;
 
    uint32_t *dw = blorp_emit_dwords(batch, isl_dev->ds.size / 4);
    if (dw == NULL)
@@ -1358,21 +1369,24 @@ blorp_emit_depth_stencil_config(struct blorp_batch *batch,
 
    isl_emit_depth_stencil_hiz_s(isl_dev, dw, &info);
 
-#if GFX_VER >= 11
-   /* Wa_1408224581
-    *
-    * Workaround: Gfx12LP Astep only An additional pipe control with
-    * post-sync = store dword operation would be required.( w/a is to
-    * have an additional pipe control after the stencil state whenever
-    * the surface state bits of this state is changing).
-    *
-    * This also seems sufficient to handle Wa_14014097488.
-    */
-   blorp_emit(batch, GENX(PIPE_CONTROL), pc) {
-      pc.PostSyncOperation = WriteImmediateData;
-      pc.Address = blorp_get_workaround_address(batch);
+   if (intel_needs_workaround(devinfo, 1408224581) ||
+       intel_needs_workaround(devinfo, 14014097488) ||
+       intel_needs_workaround(devinfo, 14016712196)) {
+      /* Wa_1408224581
+       *
+       * Workaround: Gfx12LP Astep only An additional pipe control with
+       * post-sync = store dword operation would be required.( w/a is to
+       * have an additional pipe control after the stencil state whenever
+       * the surface state bits of this state is changing).
+       *
+       * This also seems sufficient to handle Wa_14014097488 and
+       * Wa_14016712196.
+       */
+      blorp_emit(batch, GENX(PIPE_CONTROL), pc) {
+         pc.PostSyncOperation = WriteImmediateData;
+         pc.Address = blorp_get_workaround_address(batch);
+      }
    }
-#endif
 }
 
 /* Emits the Optimized HiZ sequence specified in the BDW+ PRMs. The
@@ -1532,50 +1546,17 @@ blorp_update_clear_color(UNUSED struct blorp_batch *batch,
 
 #else
 
-   /* According to Wa_2201730850, in the Clear Color Programming Note under
-    * the Red channel, "Software shall write the converted Depth Clear to this
-    * dword." The only depth formats listed under the red channel are IEEE_FP
-    * and UNORM24_X8. These two requirements are incompatible with the UNORM16
-    * depth format, so just ignore that case and simply perform the conversion
-    * for all depth formats.
-    */
-   union isl_color_value fixed_color = info->clear_color;
-   if (GFX_VER == 12 && isl_surf_usage_is_depth(info->surf.usage)) {
-      isl_color_value_pack(&info->clear_color, info->surf.format,
-                           fixed_color.u32);
-   }
-
    for (int i = 0; i < 4; i++) {
       blorp_emit(batch, GENX(MI_STORE_DATA_IMM), sdi) {
          sdi.Address = info->clear_color_addr;
          sdi.Address.offset += i * 4;
-         sdi.ImmediateData = fixed_color.u32[i];
+         sdi.ImmediateData = info->clear_color.u32[i];
 #if GFX_VER >= 12
          if (i == 3)
             sdi.ForceWriteCompletionCheck = true;
 #endif
       }
    }
-
-   /* The RENDER_SURFACE_STATE::ClearColor field states that software should
-    * write the converted depth value 16B after the clear address:
-    *
-    *    3D Sampler will always fetch clear depth from the location 16-bytes
-    *    above this address, where the clear depth, converted to native
-    *    surface format by software, will be stored.
-    *
-    */
-#if GFX_VER >= 12
-   if (isl_surf_usage_is_depth(info->surf.usage)) {
-      blorp_emit(batch, GENX(MI_STORE_DATA_IMM), sdi) {
-         sdi.Address = info->clear_color_addr;
-         sdi.Address.offset += 4 * 4;
-         sdi.ImmediateData = fixed_color.u32[0];
-         sdi.ForceWriteCompletionCheck = true;
-      }
-   }
-#endif
-
 #endif
 }
 
@@ -1592,16 +1573,10 @@ blorp_uses_bti_rt_writes(const struct blorp_batch *batch, const struct blorp_par
 static void
 blorp_exec_3d(struct blorp_batch *batch, const struct blorp_params *params)
 {
-   if (!(batch->flags & BLORP_BATCH_NO_UPDATE_CLEAR_COLOR)) {
-      if (params->fast_clear_op == ISL_AUX_OP_FAST_CLEAR &&
-          params->dst.clear_color_addr.buffer != NULL) {
-         blorp_update_clear_color(batch, &params->dst);
-      }
-
-      if (params->hiz_op == ISL_AUX_OP_FAST_CLEAR &&
-          params->depth.clear_color_addr.buffer != NULL) {
-         blorp_update_clear_color(batch, &params->depth);
-      }
+   if (!(batch->flags & BLORP_BATCH_NO_UPDATE_CLEAR_COLOR) &&
+       params->fast_clear_op == ISL_AUX_OP_FAST_CLEAR &&
+       params->dst.clear_color_addr.buffer != NULL) {
+      blorp_update_clear_color(batch, &params->dst);
    }
 
    if (params->hiz_op != ISL_AUX_OP_NONE) {

@@ -110,8 +110,8 @@
     <value name="ASTC 2D HDR" value="23"/>
     <value name="AFBC" value="24"/>
     <value name="AFRC" value="25"/>
-    <value name="ASTC 2D NARROW" value="62"/>
-    <value name="ASTC 3D NARROW" value="63"/>
+    <value name="ASTC 2D NARROW" value="30"/>
+    <value name="ASTC 3D NARROW" value="31"/>
 
     <!-- Actual enum values follow -->
     <value name="YUV8" value="32"/>
@@ -1743,7 +1743,7 @@
     <field name="Allow merging workgroups" start="31" size="1" type="bool"/>
   </struct>
 
-  <struct name="Resource" size="4" align="16">
+  <struct name="Resource" size="4" align="64">
     <field name="Address" start="0:0" size="56" type="address"/>
     <field name="Contains descriptors" start="1:24" size="1" type="bool" default="true"/>
     <field name="Size" start="2:0" size="64" type="uint"/> <!-- bytes -->

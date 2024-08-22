@@ -51,6 +51,7 @@ anv_cmd_state_init(struct anv_cmd_buffer *cmd_buffer)
    state->current_pipeline = UINT32_MAX;
    state->gfx.restart_index = UINT32_MAX;
    state->gfx.object_preemption = true;
+   state->gfx.coarse_pixel_active = ANV_COARSE_PIXEL_STATE_UNKNOWN;
    state->gfx.dirty = 0;
 
    memcpy(state->gfx.dyn_state.dirty,
@@ -1198,8 +1199,10 @@ anv_cmd_buffer_merge_dynamic(struct anv_cmd_buffer *cmd_buffer,
    state = anv_cmd_buffer_alloc_dynamic_state(cmd_buffer,
                                               dwords * 4, alignment);
    p = state.map;
-   for (uint32_t i = 0; i < dwords; i++)
+   for (uint32_t i = 0; i < dwords; i++) {
+      assert((a[i] & b[i]) == 0);
       p[i] = a[i] | b[i];
+   }
 
    VG(VALGRIND_CHECK_MEM_IS_DEFINED(p, dwords * 4));
 

@@ -226,7 +226,6 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_scalar_arg_amd:
    case nir_intrinsic_load_smem_amd:
    case nir_intrinsic_load_resume_shader_address_amd:
-   case nir_intrinsic_load_global_const_block_intel:
    case nir_intrinsic_load_reloc_const_intel:
    case nir_intrinsic_load_btd_global_arg_addr_intel:
    case nir_intrinsic_load_btd_local_arg_addr_intel:
@@ -270,6 +269,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_printf_base_identifier:
    case nir_intrinsic_load_core_id_agx:
    case nir_intrinsic_load_samples_log2_agx:
+   case nir_intrinsic_load_active_subgroup_count_agx:
       is_divergent = false;
       break;
 
@@ -528,6 +528,12 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
 
    /* Intrinsics with divergence depending on sources */
    case nir_intrinsic_convert_alu_types:
+   case nir_intrinsic_ddx:
+   case nir_intrinsic_ddx_fine:
+   case nir_intrinsic_ddx_coarse:
+   case nir_intrinsic_ddy:
+   case nir_intrinsic_ddy_fine:
+   case nir_intrinsic_ddy_coarse:
    case nir_intrinsic_ballot_bitfield_extract:
    case nir_intrinsic_ballot_find_lsb:
    case nir_intrinsic_ballot_find_msb:
@@ -586,6 +592,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_reg:
    case nir_intrinsic_load_constant_agx:
    case nir_intrinsic_load_reg_indirect:
+   case nir_intrinsic_load_const_ir3:
    case nir_intrinsic_load_frag_size_ir3:
    case nir_intrinsic_load_frag_offset_ir3:
    case nir_intrinsic_bindless_resource_ir3: {

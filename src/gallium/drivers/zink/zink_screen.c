@@ -570,7 +570,7 @@ zink_get_param(struct pipe_screen *pscreen, enum pipe_cap param)
    }
    case PIPE_CAP_SUPPORTED_PRIM_MODES: {
       uint32_t modes = BITFIELD_MASK(MESA_PRIM_COUNT);
-      if (!screen->have_triangle_fans)
+      if (!screen->have_triangle_fans || !screen->info.feats.features.geometryShader)
         modes &= ~BITFIELD_BIT(MESA_PRIM_QUADS);
       modes &= ~BITFIELD_BIT(MESA_PRIM_QUAD_STRIP);
       modes &= ~BITFIELD_BIT(MESA_PRIM_POLYGON);
@@ -1545,10 +1545,25 @@ zink_set_damage_region(struct pipe_screen *pscreen, struct pipe_resource *pres, 
 
    for (unsigned i = 0; i < nrects; i++) {
       int y = pres->height0 - rects[i].y - rects[i].height;
-      res->damage.extent.width = MAX2(res->damage.extent.width, rects[i].x + rects[i].width);
-      res->damage.extent.height = MAX2(res->damage.extent.height, y + rects[i].height);
-      res->damage.offset.x = MIN2(res->damage.offset.x, rects[i].x);
-      res->damage.offset.y = MIN2(res->damage.offset.y, y);
+      /* convert back to coord-based rects to use coordinate calcs */
+      struct u_rect currect = {
+         .x0 = res->damage.offset.x,
+         .y0 = res->damage.offset.y,
+         .x1 = res->damage.offset.x + res->damage.extent.width,
+         .y1 = res->damage.offset.y + res->damage.extent.height,
+      };
+      struct u_rect newrect = {
+         .x0 = rects[i].x,
+         .y0 = y,
+         .x1 = rects[i].x + rects[i].width,
+         .y1 = y + rects[i].height,
+      };
+      struct u_rect u;
+      u_rect_union(&u, &currect, &newrect);
+      res->damage.extent.width = u.y1 - u.y0;
+      res->damage.extent.height = u.x1 - u.x0;
+      res->damage.offset.x = u.x0;
+      res->damage.offset.y = u.y0;
    }
 
    res->use_damage = nrects > 0;
@@ -1702,7 +1717,8 @@ choose_pdev(struct zink_screen *screen, int64_t dev_major, int64_t dev_minor)
          return;
       }
 
-      assert(pdev_count > 0);
+      if (!pdev_count)
+         return;
 
       pdevs = malloc(sizeof(*pdevs) * pdev_count);
       if (!pdevs) {
@@ -1738,6 +1754,8 @@ choose_pdev(struct zink_screen *screen, int64_t dev_major, int64_t dev_minor)
             mesa_loge("ZINK: vkEnumeratePhysicalDevices failed (%s)", vk_Result_to_str(result));
          return;
       }
+      if (!pdev_count)
+         return;
       screen->pdev = pdev;
    }
    VKSCR(GetPhysicalDeviceProperties)(screen->pdev, &screen->info.props);
@@ -3313,7 +3331,7 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
       screen->driconf.zink_shader_object_enable = driQueryOptionb(config->options, "zink_shader_object_enable");
    }
 
-   if (!zink_create_instance(screen, dev_major > 0 && dev_major < 255))
+   if (!zink_create_instance(screen))
       goto fail;
 
    if (zink_debug & ZINK_DEBUG_VALIDATION) {

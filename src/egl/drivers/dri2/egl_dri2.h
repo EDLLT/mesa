@@ -270,10 +270,10 @@ struct dri2_egl_display {
    char *driver_name;
 
    const __DRIextension **loader_extensions;
-   const __DRIextension **driver_extensions;
 
    bool has_dmabuf_import;
-   bool has_modifiers;
+   bool has_dmabuf_export;
+   bool explicit_modifiers;
    bool multibuffers_available;
 #ifdef HAVE_X11_PLATFORM
    xcb_connection_t *conn;
@@ -308,6 +308,7 @@ struct dri2_egl_display {
    /* gralloc vendor usage bit for front rendering */
    uint32_t front_rendering_usage;
    bool has_native_fence_fd;
+   bool pure_swrast;
 #endif
 };
 

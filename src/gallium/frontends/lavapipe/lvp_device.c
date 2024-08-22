@@ -50,6 +50,10 @@
 #include <sys/resource.h>
 #endif
 
+#if DETECT_OS_ANDROID
+#include "vk_android.h"
+#endif
+
 #if defined(VK_USE_PLATFORM_WAYLAND_KHR) || \
     defined(VK_USE_PLATFORM_WIN32_KHR) || \
     defined(VK_USE_PLATFORM_XCB_KHR) || \
@@ -249,6 +253,9 @@ static const struct vk_device_extension_table lvp_device_extensions_supported = 
    .EXT_line_rasterization                = true,
    .EXT_robustness2                       = true,
    .AMDX_shader_enqueue                   = true,
+#if DETECT_OS_ANDROID
+   .ANDROID_native_buffer                 = true,
+#endif
    .GOOGLE_decorate_string                = true,
    .GOOGLE_hlsl_functionality1            = true,
    .NV_device_generated_commands          = true,
@@ -1263,6 +1270,8 @@ lvp_physical_device_init(struct lvp_physical_device *device,
       device->vk.supported_extensions.KHR_external_semaphore_fd = true;
       device->vk.supported_extensions.KHR_external_fence_fd = true;
    }
+   if (supported_dmabuf_bits & DRM_PRIME_CAP_IMPORT)
+      device->vk.supported_extensions.ANDROID_external_memory_android_hardware_buffer = true;
 #endif
 
    /* SNORM blending on llvmpipe fails CTS - disable by default */
@@ -1271,12 +1280,14 @@ lvp_physical_device_init(struct lvp_physical_device *device,
    lvp_get_features(device, &device->vk.supported_features);
    lvp_get_properties(device, &device->vk.properties);
 
+#ifdef LVP_USE_WSI_PLATFORM
    result = lvp_init_wsi(device);
    if (result != VK_SUCCESS) {
       vk_physical_device_finish(&device->vk);
       vk_error(instance, result);
       goto fail;
    }
+#endif
 
    return VK_SUCCESS;
  fail:
@@ -1286,7 +1297,9 @@ lvp_physical_device_init(struct lvp_physical_device *device,
 static void VKAPI_CALL
 lvp_physical_device_finish(struct lvp_physical_device *device)
 {
+#ifdef LVP_USE_WSI_PLATFORM
    lvp_finish_wsi(device);
+#endif
    device->pscreen->destroy(device->pscreen);
    vk_physical_device_finish(&device->vk);
 }
@@ -1342,6 +1355,10 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_CreateInstance(
 
    //   VG(VALGRIND_CREATE_MEMPOOL(instance, 0, false));
 
+#if DETECT_OS_ANDROID
+   vk_android_init_ugralloc();
+#endif
+
    *pInstance = lvp_instance_to_handle(instance);
 
    return VK_SUCCESS;
@@ -1355,6 +1372,10 @@ VKAPI_ATTR void VKAPI_CALL lvp_DestroyInstance(
 
    if (!instance)
       return;
+
+#if DETECT_OS_ANDROID
+   vk_android_destroy_ugralloc();
+#endif
 
    pipe_loader_release(&instance->devs, instance->num_devices);
 
@@ -1841,6 +1862,9 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_AllocateMemory(
    struct lvp_device_memory *mem;
    ASSERTED const VkExportMemoryAllocateInfo *export_info = NULL;
    ASSERTED const VkImportMemoryFdInfoKHR *import_info = NULL;
+#if DETECT_OS_ANDROID
+   ASSERTED const VkImportAndroidHardwareBufferInfoANDROID *ahb_import_info = NULL;
+#endif
    const VkImportMemoryHostPointerInfoEXT *host_ptr_info = NULL;
    VkResult error = VK_ERROR_OUT_OF_DEVICE_MEMORY;
    assert(pAllocateInfo->sType == VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO);
@@ -1871,6 +1895,12 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_AllocateMemory(
          priority = get_mem_priority(prio->priority);
          break;
       }
+#if DETECT_OS_ANDROID
+      case VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID: {
+         ahb_import_info = (VkImportAndroidHardwareBufferInfoANDROID*)ext;
+         break;
+      }
+#endif
       default:
          break;
       }
@@ -1893,6 +1923,11 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_AllocateMemory(
    mem->memory_type = LVP_DEVICE_MEMORY_TYPE_DEFAULT;
    mem->backed_fd = -1;
    mem->size = pAllocateInfo->allocationSize;
+
+#if DETECT_OS_ANDROID
+   mem->android_hardware_buffer = NULL;
+#endif
+
    if (host_ptr_info) {
       mem->mem_alloc = (struct llvmpipe_memory_allocation) {
          .cpu_addr = host_ptr_info->pHostPointer,
@@ -1901,6 +1936,18 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_AllocateMemory(
       mem->map = host_ptr_info->pHostPointer;
       mem->memory_type = LVP_DEVICE_MEMORY_TYPE_USER_PTR;
    }
+#if DETECT_OS_ANDROID
+   else if(ahb_import_info) {
+      error = lvp_import_ahb_memory(device, mem, ahb_import_info);
+      if (error != VK_SUCCESS)
+         goto fail;
+   } else if(export_info &&
+             (export_info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID)) {
+      error = lvp_create_ahb_memory(device, mem, pAllocateInfo);
+      if (error != VK_SUCCESS)
+         goto fail;
+   }
+#endif
 #ifdef PIPE_MEMORY_FD
    else if(import_info && import_info->handleType) {
       bool dmabuf = import_info->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
@@ -2231,6 +2278,11 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_BindImageMemory2(VkDevice _device,
       VkBindMemoryStatusKHR *status = (void*)vk_find_struct_const(&pBindInfos[i], BIND_MEMORY_STATUS_KHR);
       bool did_bind = false;
 
+      if (!mem) {
+         continue;
+      }
+
+#ifdef LVP_USE_WSI_PLATFORM
       vk_foreach_struct_const(s, bind_info->pNext) {
          switch (s->sType) {
          case VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_SWAPCHAIN_INFO_KHR: {
@@ -2256,6 +2308,7 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_BindImageMemory2(VkDevice _device,
             break;
          }
       }
+#endif
 
       if (!did_bind) {
          uint64_t offset_B = 0;

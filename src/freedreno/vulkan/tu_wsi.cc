@@ -25,7 +25,7 @@ static bool
 tu_wsi_can_present_on_device(VkPhysicalDevice physicalDevice, int fd)
 {
    VK_FROM_HANDLE(tu_physical_device, pdevice, physicalDevice);
-   #ifdef HAVE_LIBDRM	 
+   #ifdef HAVE_LIBDRM
    return wsi_common_drm_devices_equal(fd, pdevice->local_fd);
    #else
    return true;

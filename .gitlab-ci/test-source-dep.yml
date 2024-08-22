@@ -61,7 +61,6 @@
         - src/*
         - src/compiler/**/*
         - src/drm-shim/**/*
-        - src/gbm/**/*
         - src/gtest/**/*
         # Some src/util and src/compiler files use headers from mesa/ (e.g.
         # mtypes.h).  We should clean that up.
@@ -161,6 +160,7 @@
     - !reference [.core-rules, rules]
     - changes: &mesa_core_file_list
         - src/egl/**/*
+        - src/gbm/**/*
         - src/glx/**/*
         - src/loader/**/*
         - src/mapi/**/*
@@ -224,7 +224,6 @@
     - !reference [.never-post-merge-rules, rules]
     - !reference [.no_scheduled_pipelines-rules, rules]
     - !reference [.zink-common-rules, rules]
-    - !reference [.softpipe-rules, rules]
     - !reference [.llvmpipe-rules, rules]
     - !reference [.lavapipe-rules, rules]
 

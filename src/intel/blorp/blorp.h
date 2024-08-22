@@ -135,6 +135,9 @@ enum blorp_batch_flags {
 
    /** Use the hardware blitter to perform any operations in this batch */
    BLORP_BATCH_USE_BLITTER           = BITFIELD_BIT(4),
+
+   /** Wa_18038825448 */
+   BLORP_BATCH_FORCE_CPS_DEPENDENCY  = BITFIELD_BIT(5),
 };
 
 struct blorp_batch {
@@ -311,12 +314,7 @@ blorp_clear_depth_stencil(struct blorp_batch *batch,
                           uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1,
                           bool clear_depth, float depth_value,
                           uint8_t stencil_mask, uint8_t stencil_value);
-bool
-blorp_can_hiz_clear_depth(const struct intel_device_info *devinfo,
-                          const struct isl_surf *surf,
-                          enum isl_aux_usage aux_usage,
-                          uint32_t level, uint32_t layer,
-                          uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1);
+
 void
 blorp_hiz_clear_depth_stencil(struct blorp_batch *batch,
                               const struct blorp_surf *depth,

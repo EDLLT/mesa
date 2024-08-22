@@ -272,7 +272,6 @@ alpine-build-testing:
       -D egl=enabled
       -D glvnd=disabled
       -D platforms=wayland
-    LLVM_VERSION: "16"
     GALLIUM_DRIVERS: "crocus,etnaviv,freedreno,iris,lima,nouveau,panfrost,r300,r600,radeonsi,svga,llvmpipe,softpipe,tegra,v3d,vc4,virgl,zink"
     GALLIUM_ST: >
       -D dri3=enabled
@@ -286,10 +285,11 @@ alpine-build-testing:
       -D gles1=disabled
       -D gles2=enabled
       -D llvm=enabled
+      -D llvm-orcjit=true
       -D microsoft-clc=disabled
       -D shared-llvm=enabled
     UNWIND: "disabled"
-    VULKAN_DRIVERS: "amd,broadcom,freedreno,intel,imagination-experimental"
+    VULKAN_DRIVERS: "amd,asahi,broadcom,freedreno,intel,imagination-experimental"
 
 fedora-release:
   extends:
@@ -338,7 +338,7 @@ fedora-release:
       -D shared-llvm=enabled
     LLVM_VERSION: ""
     UNWIND: "disabled"
-    VULKAN_DRIVERS: "amd,broadcom,freedreno,imagination-experimental,intel,intel_hasvk"
+    VULKAN_DRIVERS: "amd,asahi,broadcom,freedreno,imagination-experimental,intel,intel_hasvk"
 
 debian-android:
   extends:
@@ -432,7 +432,7 @@ debian-android:
   needs:
     - debian/arm64_build
   variables:
-    VULKAN_DRIVERS: freedreno,broadcom
+    VULKAN_DRIVERS: asahi,freedreno,broadcom
     GALLIUM_DRIVERS: "etnaviv,freedreno,lima,nouveau,panfrost,llvmpipe,softpipe,tegra,v3d,vc4,zink"
     BUILDTYPE: "debugoptimized"
   tags:
@@ -446,7 +446,8 @@ debian-arm32:
     CROSS: armhf
     DRI_LOADERS:
       -D glvnd=disabled
-    # remove llvmpipe from the .meson-arm list because here we have llvm=disabled
+    # remove asahi & llvmpipe from the .meson-arm list because here we have llvm=disabled
+    VULKAN_DRIVERS: freedreno,broadcom
     GALLIUM_DRIVERS: "etnaviv,freedreno,lima,nouveau,panfrost,softpipe,tegra,v3d,vc4,zink"
     EXTRA_OPTION: >
       -D llvm=disabled
@@ -482,7 +483,7 @@ debian-arm64:
     C_ARGS: >
       -Wno-error=array-bounds
       -Wno-error=stringop-truncation
-    VULKAN_DRIVERS: "freedreno,broadcom,panfrost,imagination-experimental"
+    VULKAN_DRIVERS: "asahi,freedreno,broadcom,panfrost,imagination-experimental"
     DRI_LOADERS:
       -D glvnd=disabled
     EXTRA_OPTION: >
@@ -517,7 +518,7 @@ debian-arm64-build-test:
     - .meson-arm
     - .ci-deqp-artifacts
   variables:
-    VULKAN_DRIVERS: "amd"
+    VULKAN_DRIVERS: "amd,nouveau"
     DRI_LOADERS:
       -D glvnd=disabled
     EXTRA_OPTION: >
@@ -655,7 +656,7 @@ debian-vulkan:
       -D c_args=-fno-sanitize-recover=all
       -D cpp_args=-fno-sanitize-recover=all
     UBSAN_OPTIONS: "print_stacktrace=1"
-    VULKAN_DRIVERS: amd,broadcom,freedreno,intel,intel_hasvk,panfrost,virtio,imagination-experimental,microsoft-experimental,nouveau
+    VULKAN_DRIVERS: amd,asahi,broadcom,freedreno,intel,intel_hasvk,panfrost,virtio,imagination-experimental,microsoft-experimental,nouveau
     EXTRA_OPTION: >
       -D vulkan-layers=device-select,overlay
       -D build-aco-tests=true
@@ -689,6 +690,9 @@ debian-x86_32:
       -D intel-clc=enabled
       -D install-intel-clc=true
 
+# While s390 is dead, s390x is very much alive, and one of the last major
+# big-endian platforms, so it provides useful coverage.
+# In case of issues with this job, contact @ajax
 debian-s390x:
   extends:
     - debian-ppc64el
@@ -698,7 +702,7 @@ debian-s390x:
     - kvm
   variables:
     CROSS: s390x
-    GALLIUM_DRIVERS: "llvmpipe,softpipe,zink"
+    GALLIUM_DRIVERS: "llvmpipe,zink"
     LLVM_VERSION: 15
     VULKAN_DRIVERS: "swrast"
     DRI_LOADERS:

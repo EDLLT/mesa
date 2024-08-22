@@ -7,6 +7,7 @@ use crate::sm50::ShaderModel50;
 use crate::sm70::ShaderModel70;
 use crate::sph;
 
+use compiler::bindings::*;
 use nak_bindings::*;
 
 use std::cmp::max;
@@ -162,6 +163,8 @@ fn nir_options(dev: &nv_device_info) -> nir_shader_compiler_options {
     op.discard_is_demote = true;
 
     op.max_unroll_iterations = 32;
+    op.has_ddx_intrinsics = true;
+    op.scalarize_ddx = true;
 
     op
 }

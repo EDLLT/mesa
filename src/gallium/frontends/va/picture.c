@@ -146,11 +146,16 @@ vlVaBeginPicture(VADriverContextP ctx, VAContextID context_id, VASurfaceID rende
       switch (u_reduce_video_profile(context->templat.profile)) {
          case PIPE_VIDEO_FORMAT_AV1:
             context->desc.av1enc.metadata_flags.value = 0;
+            context->desc.av1enc.roi.num = 0;
             break;
          case PIPE_VIDEO_FORMAT_HEVC:
-            context->desc.h265enc.metadata_flags.value = 0;
+            context->desc.h265enc.header_flags.value = 0;
+            context->desc.h265enc.roi.num = 0;
             break;
          case PIPE_VIDEO_FORMAT_MPEG4_AVC:
+            context->desc.h264enc.header_flags.value = 0;
+            context->desc.h264enc.roi.num = 0;
+            break;
          default:
             break;
       }
@@ -554,6 +559,7 @@ handleVAEncMiscParameterTypeTemporalLayer(vlVaContext *context, VAEncMiscParamet
       break;
 
    case PIPE_VIDEO_FORMAT_HEVC:
+      status = vlVaHandleVAEncMiscParameterTypeTemporalLayerHEVC(context, misc);
       break;
 
    default:
@@ -732,8 +738,24 @@ handleVAEncMiscParameterTypeRIR(vlVaContext *context, VAEncMiscParameterBuffer *
       if (p_intra_refresh->mode) {
          p_intra_refresh->region_size = ir->intra_insert_size;
          p_intra_refresh->offset = ir->intra_insertion_location;
-         if (p_intra_refresh->offset == 0)
+         if (p_intra_refresh->offset == 0) {
             p_intra_refresh->need_sequence_header = 1;
+            if (!(context->desc.base.packed_headers & VA_ENC_PACKED_HEADER_SEQUENCE)) {
+               switch (u_reduce_video_profile(context->templat.profile)) {
+                  case PIPE_VIDEO_FORMAT_MPEG4_AVC:
+                     context->desc.h264enc.header_flags.sps = 1;
+                     context->desc.h264enc.header_flags.pps = 1;
+                     break;
+                  case PIPE_VIDEO_FORMAT_HEVC:
+                     context->desc.h265enc.header_flags.vps = 1;
+                     context->desc.h265enc.header_flags.sps = 1;
+                     context->desc.h265enc.header_flags.pps = 1;
+                     break;
+                  default:
+                     break;
+               }
+            }
+         }
       }
    } else {
       p_intra_refresh->mode = INTRA_REFRESH_MODE_NONE;
@@ -903,33 +925,12 @@ handleVAEncSliceParameterBufferType(vlVaDriver *drv, vlVaContext *context, vlVaB
 static VAStatus
 handleVAEncPackedHeaderParameterBufferType(vlVaContext *context, vlVaBuffer *buf)
 {
-   VAStatus status = VA_STATUS_SUCCESS;
    VAEncPackedHeaderParameterBuffer *param = buf->data;
 
    context->packed_header_emulation_bytes = param->has_emulation_bytes;
+   context->packed_header_type = param->type;
 
-   switch (u_reduce_video_profile(context->templat.profile)) {
-   case PIPE_VIDEO_FORMAT_MPEG4_AVC:
-      if (param->type == VAEncPackedHeaderSequence)
-         context->packed_header_type = param->type;
-      else
-         status = VA_STATUS_ERROR_UNIMPLEMENTED;
-      break;
-   case PIPE_VIDEO_FORMAT_HEVC:
-      if (param->type == VAEncPackedHeaderSequence)
-         context->packed_header_type = param->type;
-      else
-         status = VA_STATUS_ERROR_UNIMPLEMENTED;
-      break;
-   case PIPE_VIDEO_FORMAT_AV1:
-         context->packed_header_type = param->type;
-      break;
-
-   default:
-      return VA_STATUS_ERROR_UNIMPLEMENTED;
-   }
-
-   return status;
+   return VA_STATUS_SUCCESS;
 }
 
 static VAStatus
@@ -939,16 +940,10 @@ handleVAEncPackedHeaderDataBufferType(vlVaContext *context, vlVaBuffer *buf)
 
    switch (u_reduce_video_profile(context->templat.profile)) {
    case PIPE_VIDEO_FORMAT_MPEG4_AVC:
-      if (context->packed_header_type != VAEncPackedHeaderSequence)
-         return VA_STATUS_ERROR_UNIMPLEMENTED;
-
       status = vlVaHandleVAEncPackedHeaderDataBufferTypeH264(context, buf);
       break;
 
    case PIPE_VIDEO_FORMAT_HEVC:
-      if (context->packed_header_type != VAEncPackedHeaderSequence)
-         return VA_STATUS_ERROR_UNIMPLEMENTED;
-
       status = vlVaHandleVAEncPackedHeaderDataBufferTypeHEVC(context, buf);
       break;
 

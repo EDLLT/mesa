@@ -7,7 +7,7 @@
 #include "si_pipe.h"
 #include "util/format/u_format.h"
 #include "util/format_srgb.h"
-#include "util/u_helpers.h"
+#include "util/helpers.h"
 #include "util/hash_table.h"
 #include "util/u_pack_color.h"
 #include "ac_nir_meta.h"
@@ -255,6 +255,18 @@ void si_compute_clear_buffer_rmw(struct si_context *sctx, struct pipe_resource *
                                  1, &sb, 0x1);
 }
 
+/**
+ * This implements a clear/copy_buffer compute shader allowing an arbitrary src_offset, dst_offset,
+ * and size alignment, so that it can be used as a complete replacement for the typically slower
+ * CP DMA.
+ *
+ * It stores 16B blocks per thread aligned to a 16B offset just like a 16B-aligned clear/copy,
+ * and it byte-shifts src data by the amount of both src and dst misalignment to get the behavior
+ * of a totally unaligned clear/copy.
+ *
+ * The first and last thread can store less than 16B (up to 1B store granularity) depending on how
+ * much dst is unaligned.
+ */
 bool si_compute_clear_copy_buffer(struct si_context *sctx, struct pipe_resource *dst,
                                   unsigned dst_offset, struct pipe_resource *src,
                                   unsigned src_offset, unsigned size,
@@ -262,94 +274,60 @@ bool si_compute_clear_copy_buffer(struct si_context *sctx, struct pipe_resource 
                                   unsigned flags, enum si_coherency coher,
                                   unsigned dwords_per_thread, bool fail_if_slow)
 {
-   bool is_copy = src != NULL;
-
-   if (src_offset % 4 || dst_offset % 4 || size % 4 || clear_value_size % 4)
-      return false;
-
-   if (dwords_per_thread) {
-      /* Validate dwords_per_thread. Only set by the microbenchmark. */
-      if (dwords_per_thread > 4) {
-         assert(!"dwords_per_thread must be <= 4");
-         return false; /* invalid value */
-      }
-
-      if (clear_value_size > dwords_per_thread * 4) {
-         assert(!"clear_value_size must be <= dwords_per_thread");
-         return false; /* invalid value */
-      }
-   } else {
-      /* Set default optimal settings. */
-      /* Clearing 4 dwords per thread with a 3-dword clear value is slightly faster with big sizes. */
-      if (!is_copy && clear_value_size == 12)
-         dwords_per_thread = size <= 4096 ? 3 : 4;
-      else
-         dwords_per_thread = 4;
-   }
-
-   /* This doesn't fail very often because the only possible fallback is CP DMA, which doesn't
-    * support the render condition.
-    */
-   if (fail_if_slow && !(flags & SI_OP_CS_RENDER_COND_ENABLE) && sctx->screen->info.has_cp_dma &&
-       !sctx->screen->info.cp_sdma_ge_use_system_memory_scope) {
-      if (is_copy) {
-         /* Only use compute for large VRAM copies on dGPUs. */
-         if (size <= 8192 || !sctx->screen->info.has_dedicated_vram ||
-             !(si_resource(dst)->domains & RADEON_DOMAIN_VRAM) ||
-             !(si_resource(src)->domains & RADEON_DOMAIN_VRAM))
-            return false;
-      } else {
-         /* Buffer clear.
-          *
-          * CP DMA clears are terribly slow with GTT on GFX6-8, which can be encountered with any
-          * buffer due to BO evictions, so never use CP DMA clears on GFX6-8. On GFX9+, use CP DMA
-          * clears if the size is small.
-          */
-         if (sctx->gfx_level >= GFX9 && clear_value_size <= 4 && size <= 4096)
-            return false;
-      }
-   }
-
    assert(dst->target != PIPE_BUFFER || dst_offset + size <= dst->width0);
    assert(!src || src_offset + size <= src->width0);
+   bool is_copy = src != NULL;
 
-   unsigned num_threads = DIV_ROUND_UP(size, dwords_per_thread * 4);
+   si_improve_sync_flags(sctx, dst, src, &flags);
 
-   struct pipe_grid_info info = {};
-   set_work_size(&info, 64, 1, 1, num_threads, 1, 1);
+   struct ac_cs_clear_copy_buffer_options options = {
+      .nir_options = sctx->screen->nir_options,
+      .info = &sctx->screen->info,
+      .print_key = si_can_dump_shader(sctx->screen, MESA_SHADER_COMPUTE, SI_DUMP_SHADER_KEY),
+      .fail_if_slow = fail_if_slow,
+   };
+
+   struct ac_cs_clear_copy_buffer_info info = {
+      .dst_offset = dst_offset,
+      .src_offset = src_offset,
+      .size = size,
+      .clear_value_size = is_copy ? 0 : clear_value_size,
+      .dwords_per_thread = dwords_per_thread,
+      .render_condition_enabled = flags & SI_OP_CS_RENDER_COND_ENABLE,
+      .dst_is_vram = si_resource(dst)->domains & RADEON_DOMAIN_VRAM,
+      .src_is_vram = src && si_resource(src)->domains & RADEON_DOMAIN_VRAM,
+      .src_is_sparse = src && src->flags & PIPE_RESOURCE_FLAG_SPARSE,
+   };
+   memcpy(info.clear_value, clear_value, clear_value_size);
+
+   struct ac_cs_clear_copy_buffer_dispatch dispatch;
+
+   if (!ac_prepare_cs_clear_copy_buffer(&options, &info, &dispatch))
+      return false;
 
    struct pipe_shader_buffer sb[2] = {};
-   sb[is_copy].buffer = dst;
-   sb[is_copy].buffer_offset = dst_offset;
-   sb[is_copy].buffer_size = size;
+   for (unsigned i = 0; i < 2; i++) {
+      sb[i].buffer_offset = dispatch.ssbo[i].offset;
+      sb[i].buffer_size = dispatch.ssbo[i].size;
+   }
 
-   if (is_copy) {
+   if (is_copy)
       sb[0].buffer = src;
-      sb[0].buffer_offset = src_offset;
-      sb[0].buffer_size = size;
-   } else {
-      assert(clear_value_size >= 4 && clear_value_size <= 16 &&
-             (clear_value_size == 12 || util_is_power_of_two_or_zero(clear_value_size)));
+   sb[is_copy].buffer = dst;
 
-      for (unsigned i = 0; i < 4; i++)
-         sctx->cs_user_data[i] = clear_value[i % (clear_value_size / 4)];
-   }
-
-   union si_cs_clear_copy_buffer_key key;
-   key.key = 0;
-
-   key.is_clear = !is_copy;
-   assert(dwords_per_thread && dwords_per_thread <= 4);
-   key.dwords_per_thread = dwords_per_thread;
-   key.clear_value_size_is_12 = !is_copy && clear_value_size == 12;
-
-   void *shader = _mesa_hash_table_u64_search(sctx->cs_dma_shaders, key.key);
+   void *shader = _mesa_hash_table_u64_search(sctx->cs_dma_shaders, dispatch.shader_key.key);
    if (!shader) {
-      shader = si_create_dma_compute_shader(sctx, &key);
-      _mesa_hash_table_u64_insert(sctx->cs_dma_shaders, key.key, shader);
+      shader = si_create_shader_state(sctx, ac_create_clear_copy_buffer_cs(&options,
+                                                                           &dispatch.shader_key));
+      _mesa_hash_table_u64_insert(sctx->cs_dma_shaders, dispatch.shader_key.key, shader);
    }
 
-   si_launch_grid_internal_ssbos(sctx, &info, shader, flags, coher, is_copy ? 2 : 1, sb,
+   memcpy(sctx->cs_user_data, dispatch.user_data, sizeof(dispatch.user_data));
+
+   struct pipe_grid_info grid = {};
+   set_work_size(&grid, dispatch.workgroup_size, 1, 1, dispatch.num_threads, 1, 1);
+
+   si_launch_grid_internal_ssbos(sctx, &grid, shader, flags, coher, dispatch.num_ssbos, sb,
                                  is_copy ? 0x2 : 0x1);
    return true;
 }
@@ -376,12 +354,14 @@ void si_clear_buffer(struct si_context *sctx, struct pipe_resource *dst,
    if (util_lower_clearsize_to_dword(clear_value, (int*)&clear_value_size, &clamped))
       clear_value = &clamped;
 
+   if (method != SI_CP_DMA_CLEAR_METHOD &&
+       si_compute_clear_copy_buffer(sctx, dst, offset, NULL, 0, size, clear_value,
+                                    clear_value_size, flags, coher, 0,
+                                    method == SI_AUTO_SELECT_CLEAR_METHOD))
+      return;
+
    uint64_t aligned_size = size & ~3ull;
-   if (aligned_size &&
-       (method == SI_CP_DMA_CLEAR_METHOD ||
-        !si_compute_clear_copy_buffer(sctx, dst, offset, NULL, 0, aligned_size, clear_value,
-                                      clear_value_size, flags, coher, 0,
-                                      method == SI_AUTO_SELECT_CLEAR_METHOD))) {
+   if (aligned_size) {
       assert(clear_value_size == 4);
       assert(!(flags & SI_OP_CS_RENDER_COND_ENABLE));
       si_cp_dma_clear_buffer(sctx, &sctx->gfx_cs, dst, offset, aligned_size, *clear_value,

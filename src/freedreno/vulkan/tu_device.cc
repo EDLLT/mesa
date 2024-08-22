@@ -13,7 +13,6 @@
 #include "fdl/freedreno_layout.h"
 #include <fcntl.h>
 #include <poll.h>
-#include <sys/sysinfo.h>
 
 #include "git_sha1.h"
 #include "util/u_debug.h"
@@ -223,6 +222,7 @@ get_device_extensions(const struct tu_physical_device *device,
       .KHR_variable_pointers = true,
       .KHR_vertex_attribute_divisor = true,
       .KHR_vulkan_memory_model = true,
+      .KHR_workgroup_memory_explicit_layout = true,
       .KHR_zero_initialize_workgroup_memory = true,
 
       .EXT_4444_formats = true,
@@ -257,6 +257,7 @@ get_device_extensions(const struct tu_physical_device *device,
       .EXT_image_view_min_lod = true,
       .EXT_index_type_uint8 = true,
       .EXT_inline_uniform_block = true,
+      .EXT_legacy_dithering = true,
       .EXT_legacy_vertex_attributes = true,
       .EXT_line_rasterization = true,
       .EXT_load_store_op_none = true,
@@ -390,7 +391,7 @@ tu_get_features(struct tu_physical_device *pdevice,
    features->shaderBufferInt64Atomics            = false;
    features->shaderSharedInt64Atomics            = false;
    features->shaderFloat16                       = true;
-   features->shaderInt8                          = false;
+   features->shaderInt8                          = true;
 
    features->descriptorIndexing                                 = true;
    features->shaderInputAttachmentArrayDynamicIndexing          = false;
@@ -492,6 +493,12 @@ tu_get_features(struct tu_physical_device *pdevice,
    /* VK_KHR_vertex_attribute_divisor */
    features->vertexAttributeInstanceRateDivisor = true;
    features->vertexAttributeInstanceRateZeroDivisor = true;
+
+   /* VK_KHR_workgroup_memory_explicit_layout */
+   features->workgroupMemoryExplicitLayout = true;
+   features->workgroupMemoryExplicitLayoutScalarBlockLayout = true;
+   features->workgroupMemoryExplicitLayout8BitAccess = true;
+   features->workgroupMemoryExplicitLayout16BitAccess = true;
 
    /* VK_EXT_4444_formats */
    features->formatA4R4G4B4 = true;
@@ -597,6 +604,9 @@ tu_get_features(struct tu_physical_device *pdevice,
 
    /* VK_EXT_legacy_vertex_attributes */
    features->legacyVertexAttributes = true;
+
+   /* VK_EXT_legacy_dithering */
+   features->legacyDithering = true;
 
    /* VK_EXT_map_memory_placed */
    features->memoryMapPlaced = true;
@@ -1361,6 +1371,7 @@ static const driOptionDescription tu_dri_options[] = {
       DRI_CONF_DISABLE_CONSERVATIVE_LRZ(false)
       DRI_CONF_TU_DONT_RESERVE_DESCRIPTOR_SET(false)
       DRI_CONF_TU_ALLOW_OOB_INDIRECT_UBO_LOADS(false)
+      DRI_CONF_TU_DISABLE_D24S8_BORDER_COLOR_WORKAROUND(false)
    DRI_CONF_SECTION_END
 };
 
@@ -1381,6 +1392,8 @@ tu_init_dri_options(struct tu_instance *instance)
          !driQueryOptionb(&instance->dri_options, "tu_dont_reserve_descriptor_set");
    instance->allow_oob_indirect_ubo_loads =
          driQueryOptionb(&instance->dri_options, "tu_allow_oob_indirect_ubo_loads");
+   instance->disable_d24s8_border_color_workaround =
+         driQueryOptionb(&instance->dri_options, "tu_disable_d24s8_border_color_workaround");
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -1560,10 +1573,10 @@ tu_GetPhysicalDeviceQueueFamilyProperties2(
 uint64_t
 tu_get_system_heap_size(struct tu_physical_device *physical_device)
 {
-   struct sysinfo info;
-   sysinfo(&info);
-
-   uint64_t total_ram = (uint64_t) info.totalram * (uint64_t) info.mem_unit;
+   uint64_t total_ram = 0;
+   ASSERTED bool has_physical_memory =
+      os_get_total_physical_memory(&total_ram);
+   assert(has_physical_memory);
 
    /* We don't want to burn too much ram with the GPU.  If the user has 4GiB
     * or less, we use at most half.  If they have more than 4GiB, we use 3/4.
@@ -1713,6 +1726,7 @@ tu_trace_create_buffer(struct u_trace_context *utctx, uint64_t size_B)
 
    struct tu_bo *bo;
    tu_bo_init_new(device, NULL, &bo, size_B, TU_BO_ALLOC_INTERNAL_RESOURCE, "trace");
+   tu_bo_map(device, bo, NULL);
 
    return bo;
 }
@@ -1807,6 +1821,30 @@ tu_copy_buffer(struct u_trace_context *utctx, void *cmdstream,
    tu_cs_emit_qw(cs, bo_to->iova + to_offset_B);
 }
 
+static void
+tu_trace_capture_data(struct u_trace *ut,
+                        void *cs,
+                        void *dst_buffer,
+                        uint64_t dst_offset_B,
+                        void *src_buffer,
+                        uint64_t src_offset_B,
+                        uint32_t size_B)
+{
+   if (src_buffer)
+      tu_copy_buffer(ut->utctx, cs, src_buffer, src_offset_B, dst_buffer,
+                     dst_offset_B, size_B);
+}
+
+static const void *
+tu_trace_get_data(struct u_trace_context *utctx,
+                  void *buffer,
+                  uint64_t offset_B,
+                  uint32_t size_B)
+{
+   struct tu_bo *bo = (struct tu_bo *) buffer;
+   return (char *) bo->map + offset_B;
+}
+
 /* Special helpers instead of u_trace_begin_iterator()/u_trace_end_iterator()
  * that ignore tracepoints at the beginning/end that are part of a
  * suspend/resume chain.
@@ -1851,7 +1889,7 @@ tu_create_copy_timestamp_cs(struct tu_cmd_buffer *cmdbuf, struct tu_cs** cs,
    }
 
    tu_cs_init(*cs, cmdbuf->device, TU_CS_MODE_GROW,
-              list_length(&cmdbuf->trace.trace_chunks) * 6 + 3, "trace copy timestamp cs");
+              list_length(&cmdbuf->trace.trace_chunks) * 6 * 2 + 3, "trace copy timestamp cs");
 
    tu_cs_begin(*cs);
 
@@ -2125,7 +2163,7 @@ tu_init_cmdbuf_start_a725_quirk(struct tu_device *device)
    tu_cs_emit_regs(&sub_cs, A6XX_SP_CS_INSTRLEN(.sp_cs_instrlen = 1));
    tu_cs_emit_regs(&sub_cs, A6XX_SP_CS_TEX_COUNT(0));
    tu_cs_emit_regs(&sub_cs, A6XX_SP_CS_IBO_COUNT(0));
-   tu_cs_emit_regs(&sub_cs, A7XX_HLSQ_CS_CNTL_1(
+   tu_cs_emit_regs(&sub_cs, HLSQ_CS_CNTL_1(A7XX,
             .linearlocalidregid = regid(63, 0),
             .threadsize = THREAD128,
             .unk11 = true,
@@ -2513,7 +2551,8 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
 
    device->use_z24uint_s8uint =
       physical_device->info->a6xx.has_z24uint_s8uint &&
-      !border_color_without_format;
+      (!border_color_without_format ||
+       physical_device->instance->disable_d24s8_border_color_workaround);
    device->use_lrz = !TU_DEBUG(NOLRZ);
 
    tu_gpu_tracepoint_config_variable();
@@ -2521,13 +2560,13 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
    device->submit_count = 0;
    u_trace_context_init(&device->trace_context, device,
                      sizeof(uint64_t),
-                     0,
+                     12,
                      tu_trace_create_buffer,
                      tu_trace_destroy_buffer,
                      TU_CALLX(device, tu_trace_record_ts),
                      tu_trace_read_ts,
-                     NULL,
-                     NULL,
+                     tu_trace_capture_data,
+                     tu_trace_get_data,
                      tu_trace_delete_flush_data);
 
    tu_breadcrumbs_init(device);

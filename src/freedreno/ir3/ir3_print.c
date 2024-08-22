@@ -96,6 +96,8 @@ print_instr_name(struct log_stream *stream, struct ir3_instruction *instr,
          mesa_log_stream_printf(stream, "(nop%d)", instr->nop);
       if (instr->flags & IR3_INSTR_UL)
          mesa_log_stream_printf(stream, "(ul)");
+      if (instr->flags & IR3_INSTR_SAT)
+         mesa_log_stream_printf(stream, "(sat)");
    } else {
       mesa_log_stream_printf(stream, " ");
    }
@@ -455,6 +457,17 @@ print_instr(struct log_stream *stream, struct ir3_instruction *instr, int lvl)
             mesa_log_stream_printf(stream, ", ");
          mesa_log_stream_printf(stream, SYN_SSA("ssa_%u"),
                                 instr->deps[i]->serialno);
+      }
+   }
+
+   if (ir3_instr_is_rpt(instr)) {
+      mesa_log_stream_printf(stream, ", rpt: ");
+
+      if (ir3_instr_is_first_rpt(instr)) {
+         mesa_log_stream_printf(stream, "first");
+      } else {
+         mesa_log_stream_printf(stream, "%u",
+                                ir3_instr_prev_rpt(instr)->serialno);
       }
    }
 
