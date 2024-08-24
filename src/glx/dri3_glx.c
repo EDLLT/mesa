@@ -503,7 +503,11 @@ dri3_create_screen(int screen, struct glx_display * priv, bool driver_name_is_in
 
    psc->fd_display_gpu = -1;
 
+   #ifdef HAVE_FREEDRENO_KGSL
+   psc->fd_render_gpu = open("/dev/kgsl-3d0", O_RDWR, 0);
+   #else
    psc->fd_render_gpu = x11_dri3_open(c, RootWindow(priv->dpy, screen), None);
+   #endif
    if (psc->fd_render_gpu < 0) {
       int conn_error = xcb_connection_has_error(c);
 
