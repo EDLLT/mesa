@@ -71,6 +71,10 @@
 #include <util/os_file.h>
 #endif
 
+#include <bits/glibc-syscalls.h>
+#include <sys/syscall.h>
+#include <linux/memfd.h>
+
 #if MESA_DEBUG
 static struct llvmpipe_resource resource_list;
 static simple_mtx_t resource_list_mutex = SIMPLE_MTX_INITIALIZER;
@@ -1360,7 +1364,7 @@ llvmpipe_resource_alloc_udmabuf(struct llvmpipe_screen *screen,
 
       size = align(size, alignment);
 
-      int mem_fd = memfd_create("lp_dma_buf", MFD_ALLOW_SEALING);
+      int mem_fd = syscall(__NR_memfd_create, "lp_dma_buf", MFD_ALLOW_SEALING);
       if (mem_fd == -1)
          goto fail;
 

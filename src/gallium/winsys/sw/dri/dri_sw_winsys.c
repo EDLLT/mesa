@@ -106,7 +106,7 @@ dri_sw_is_displaytarget_format_supported( struct sw_winsys *ws,
    return true;
 }
 
-#ifdef HAVE_SYS_SHM_H
+#if defined HAVE_SYS_SHM_H && !defined(__TERMUX__)
 static char *
 alloc_shm(struct dri_sw_displaytarget *dri_sw_dt, unsigned size)
 {
@@ -160,7 +160,7 @@ dri_sw_displaytarget_create(struct sw_winsys *winsys,
    dri_sw_dt->shmid = -1;
    dri_sw_dt->fd = -1;
 
-#ifdef HAVE_SYS_SHM_H
+#if defined HAVE_SYS_SHM_H && !defined(__TERMUX__)
    if (ws->lf->put_image_shm)
       dri_sw_dt->data = alloc_shm(dri_sw_dt, size);
 #endif
@@ -228,7 +228,7 @@ dri_sw_displaytarget_destroy(struct sw_winsys *ws,
          ws->displaytarget_unmap(ws, dt);
       close(dri_sw_dt->fd);
    } else if (dri_sw_dt->shmid >= 0) {
-#ifdef HAVE_SYS_SHM_H
+#if defined HAVE_SYS_SHM_H && !defined(__TERMUX__)
       shmdt(dri_sw_dt->data);
       shmctl(dri_sw_dt->shmid, IPC_RMID, NULL);
 #endif

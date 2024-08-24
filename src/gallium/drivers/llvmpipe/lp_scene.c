@@ -619,8 +619,12 @@ lp_scene_begin_binning(struct lp_scene *scene,
 
    unsigned num_required_tiles = scene->tiles_x * scene->tiles_y;
    if (scene->num_alloced_tiles < num_required_tiles) {
+      #if defined(__TERMUX__)
+      scene->tiles = realloc(scene->tiles, num_required_tiles * sizeof(struct cmd_bin));
+      #else 							  
       scene->tiles = reallocarray(scene->tiles, num_required_tiles,
                                   sizeof(struct cmd_bin));
+      #endif                             
       if (!scene->tiles)
          return;
       memset(scene->tiles, 0, sizeof(struct cmd_bin) * num_required_tiles);
