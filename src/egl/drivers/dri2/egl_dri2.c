@@ -632,7 +632,7 @@ dri2_setup_screen(_EGLDisplay *disp)
       dri2_dpy->has_dmabuf_import = (caps & DRM_PRIME_CAP_IMPORT) > 0;
       dri2_dpy->has_dmabuf_export = (caps & DRM_PRIME_CAP_EXPORT) > 0;
    }
-#ifdef HAVE_ANDROID_PLATFORM
+#if defined(HAVE_ANDROID_PLATFORM) && !defined(__TERMUX__)
    dri2_dpy->has_native_fence_fd = dri_get_screen_param(dri2_dpy->dri_screen_render_gpu, PIPE_CAP_NATIVE_FENCE_FD);
 #endif
    dri2_dpy->has_compression_modifiers = pscreen->query_compression_rates && pscreen->query_compression_modifiers;
@@ -829,9 +829,11 @@ dri2_setup_device(_EGLDisplay *disp, EGLBoolean software)
    _EGLDevice *dev;
    int render_fd;
 
-   /* If we're not software, we need a DRM node FD */
+   /* If we're not software, we need a DRM node FD but this seem to not be
+   present when building for Termux*/
+   #if !defined(__TERMUX__)
    assert(software || dri2_dpy->fd_render_gpu >= 0);
-
+   #endif
    /* fd_render_gpu is what we got from WSI, so might actually be a lie and
     * not a render node... */
    if (software) {
