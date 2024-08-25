@@ -2,7 +2,7 @@
 #include "util/os_file.h"
 #include "util/os_mman.h"
 
-#include <linux/dma-heap.h>
+#include "drm-uapi/dma-heap.h"
 
 static uint64_t
 kgsl_bo_iova(struct fd_bo *bo)
