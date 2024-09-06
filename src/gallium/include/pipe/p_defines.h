@@ -464,6 +464,8 @@ enum pipe_flush_flags
 #define PIPE_BIND_COMPUTE_RESOURCE     (1 << 16) /* set_compute_resources */
 #define PIPE_BIND_COMMAND_ARGS_BUFFER  (1 << 17) /* pipe_draw_info.indirect */
 #define PIPE_BIND_QUERY_BUFFER         (1 << 18) /* get_query_result_resource */
+#define PIPE_BIND_VIDEO_DECODE_DPB     (1 << 19) /* video engine DPB decode reconstructed picture */
+#define PIPE_BIND_VIDEO_ENCODE_DPB     (1 << 20) /* video engine DPB encode reconstructed picture */
 
 /**
  * The first two flags above were previously part of the amorphous
@@ -663,6 +665,19 @@ enum pipe_conservative_raster_mode
 #define PIPE_IMAGE_ACCESS_VOLATILE           (1 << 3)
 #define PIPE_IMAGE_ACCESS_TEX2D_FROM_BUFFER  (1 << 4)
 #define PIPE_IMAGE_ACCESS_DRIVER_INTERNAL    (1 << 5)
+
+/**
+ * Shader subgroup feature flags aligned with GL_KHR_shader_subgroup.
+ */
+#define PIPE_SHADER_SUBGROUP_FEATURE_BASIC            (1 << 0)
+#define PIPE_SHADER_SUBGROUP_FEATURE_VOTE             (1 << 1)
+#define PIPE_SHADER_SUBGROUP_FEATURE_ARITHMETIC       (1 << 2)
+#define PIPE_SHADER_SUBGROUP_FEATURE_BALLOT           (1 << 3)
+#define PIPE_SHADER_SUBGROUP_FEATURE_SHUFFLE          (1 << 4)
+#define PIPE_SHADER_SUBGROUP_FEATURE_SHUFFLE_RELATIVE (1 << 5)
+#define PIPE_SHADER_SUBGROUP_FEATURE_CLUSTERED        (1 << 6)
+#define PIPE_SHADER_SUBGROUP_FEATURE_QUAD             (1 << 7)
+#define PIPE_SHADER_SUBGROUP_NUM_FEATURES             8
 
 /**
  * Implementation capabilities/limits which are queried through
@@ -954,6 +969,11 @@ enum pipe_cap
    PIPE_CAP_PERFORMANCE_MONITOR,
    PIPE_CAP_TEXTURE_SAMPLER_INDEPENDENT,
    PIPE_CAP_ASTC_DECODE_MODE,
+   /** For GL_KHR_shader_subgroup */
+   PIPE_CAP_SHADER_SUBGROUP_SIZE,
+   PIPE_CAP_SHADER_SUBGROUP_SUPPORTED_STAGES,
+   PIPE_CAP_SHADER_SUBGROUP_SUPPORTED_FEATURES,
+   PIPE_CAP_SHADER_SUBGROUP_QUAD_ALL_STAGES,
    PIPE_CAP_LAST,
    /* XXX do not add caps after PIPE_CAP_LAST! */
 };

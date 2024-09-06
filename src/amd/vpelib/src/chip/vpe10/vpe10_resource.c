@@ -31,9 +31,11 @@
 #include "vpe10_dpp.h"
 #include "vpe10_mpc.h"
 #include "vpe10_opp.h"
-#include "vpe_command.h"
+#include "vpe10_command.h"
 #include "vpe10_cm_common.h"
 #include "vpe10_background.h"
+#include "vpe10_vpe_desc_writer.h"
+#include "vpe10_plane_desc_writer.h"
 #include "vpe10/inc/asic/bringup_vpe_6_1_0_offset.h"
 #include "vpe10/inc/asic/bringup_vpe_6_1_0_sh_mask.h"
 #include "vpe10/inc/asic/bringup_vpe_6_1_0_default.h"
@@ -42,6 +44,7 @@
 #include "custom_float.h"
 #include "background.h"
 #include "vpe_visual_confirm.h"
+#include "color_bg.h"
 
 #define LUT_NUM_ENTRIES   (17 * 17 * 17)
 #define LUT_ENTRY_SIZE    (2)
@@ -161,22 +164,25 @@ static struct vpe_caps caps = {
                     .p010            = 1, /**< planar 4:2:0 10-bit */
                     .p016            = 0, /**< planar 4:2:0 16-bit */
                     .ayuv            = 0, /**< packed 4:4:4 */
-                    .yuy2            = 0  /**< packed 4:2:2 */
+                    .yuy2 = 0
                 },
-            .output_pixel_format_support = {.argb_packed_32b = 1,
-                .nv12                                        = 0,
-                .fp16                                        = 1,
-                .p010                                        = 0,
-                .p016                                        = 0,
-                .ayuv                                        = 0,
-                .yuy2                                        = 0},
-            .max_upscale_factor          = 64000,
+            .output_pixel_format_support =
+                {
+                    .argb_packed_32b = 1,
+                    .nv12            = 0,
+                    .fp16            = 1,
+                    .p010            = 0, /**< planar 4:2:0 10-bit */
+                    .p016            = 0, /**< planar 4:2:0 16-bit */
+                    .ayuv            = 0, /**< packed 4:4:4 */
+                    .yuy2 = 0
+                },
+            .max_upscale_factor = 64000,
 
             /*
              * 4:1 downscaling ratio : 1000 / 4 = 250
              * vpelib does not support more than 4:1 to preserve quality
              * due to the limitation of using maximum number of 8 taps
-            */
+             */
             .max_downscale_factor = 250,
 
             .pitch_alignment    = 256,
@@ -250,16 +256,23 @@ enum vpe_status vpe10_set_num_segments(struct vpe_priv *vpe_priv, struct stream_
     return VPE_STATUS_OK;
 }
 
-bool vpe10_get_dcc_compression_cap(const struct vpe *vpe, const struct vpe_dcc_surface_param *input,
-    struct vpe_surface_dcc_cap *output)
+bool vpe10_get_dcc_compression_output_cap(const struct vpe *vpe, const struct vpe_dcc_surface_param *params, struct vpe_surface_dcc_cap *cap)
 {
-    struct vpe_priv *vpe_priv = container_of(vpe, struct vpe_priv, pub);
-    struct vpec     *vpec     = &vpe_priv->resource.vpec;
-
-    return vpec->funcs->get_dcc_compression_cap(vpec, input, output);
+    cap->capable = false;
+    return cap->capable;
 }
 
-static struct vpe_cap_funcs cap_funcs = {.get_dcc_compression_cap = vpe10_get_dcc_compression_cap};
+bool vpe10_get_dcc_compression_input_cap(const struct vpe *vpe, const struct vpe_dcc_surface_param *params, struct vpe_surface_dcc_cap *cap)
+{
+    cap->capable = false;
+    return cap->capable;
+}
+
+static struct vpe_cap_funcs cap_funcs =
+{
+    .get_dcc_compression_output_cap = vpe10_get_dcc_compression_output_cap,
+    .get_dcc_compression_input_cap  = vpe10_get_dcc_compression_input_cap
+};
 
 struct cdc *vpe10_cdc_create(struct vpe_priv *vpe_priv, int inst)
 {
@@ -351,6 +364,9 @@ enum vpe_status vpe10_construct_resource(struct vpe_priv *vpe_priv, struct resou
         goto err;
 
     vpe10_construct_cmd_builder(vpe_priv, &res->cmd_builder);
+    vpe10_construct_vpe_desc_writer(&vpe_priv->vpe_desc_writer);
+    vpe10_construct_plane_desc_writer(&vpe_priv->plane_desc_writer);
+
     vpe_priv->num_pipe = 1;
 
     res->internal_hdr_normalization = 1;
@@ -368,6 +384,7 @@ enum vpe_status vpe10_construct_resource(struct vpe_priv *vpe_priv, struct resou
     res->program_frontend                  = vpe10_program_frontend;
     res->program_backend                   = vpe10_program_backend;
     res->get_bufs_req                      = vpe10_get_bufs_req;
+    res->check_bg_color_support            = vpe10_check_bg_color_support;
 
     return VPE_STATUS_OK;
 err:
@@ -436,6 +453,11 @@ bool vpe10_check_h_mirror_support(bool *input_mirror, bool *output_mirror)
     *input_mirror  = false;
     *output_mirror = true;
     return true;
+}
+
+enum vpe_status vpe10_check_bg_color_support(struct vpe_priv* vpe_priv, struct vpe_color* bg_color)
+{
+    return vpe_is_valid_bg_color(vpe_priv, bg_color);
 }
 
 void vpe10_calculate_dst_viewport_and_active(
@@ -518,7 +540,7 @@ enum vpe_status vpe10_calculate_segments(
     struct dpp         *dpp                  = vpe_priv->resource.dpp[0];
     const uint32_t      max_lb_size          = dpp->funcs->get_line_buffer_size();
 
-    for (stream_idx = 0; stream_idx < params->num_streams; stream_idx++) {
+    for (stream_idx = 0; stream_idx < vpe_priv->num_streams; stream_idx++) {
         stream_ctx = &vpe_priv->stream_ctx[stream_idx];
         src_rect   = &stream_ctx->stream.scaling_info.src_rect;
         dst_rect   = &stream_ctx->stream.scaling_info.dst_rect;
@@ -871,20 +893,29 @@ enum vpe_status vpe10_populate_cmd_info(struct vpe_priv *vpe_priv)
             cmd_info->cd                   = (uint8_t)(stream_ctx->num_segments - segment_idx - 1);
             memcpy(&(cmd_info->inputs[0].scaler_data),
                 &(stream_ctx->segment_ctx[segment_idx].scaler_data), sizeof(struct scaler_data));
-            cmd_info->dst_viewport = stream_ctx->segment_ctx[segment_idx].scaler_data.dst_viewport;
-            cmd_info->dst_viewport_c =
+            cmd_info->num_outputs = 1;
+            cmd_info->outputs[0].dst_viewport = stream_ctx->segment_ctx[segment_idx].scaler_data.dst_viewport;
+            cmd_info->outputs[0].dst_viewport_c =
                 stream_ctx->segment_ctx[segment_idx].scaler_data.dst_viewport_c;
             cmd_info->num_inputs = 1;
             cmd_info->ops        = VPE_CMD_OPS_COMPOSITING;
             cmd_info->tm_enabled = tm_enabled;
             vpe_priv->num_vpe_cmds++;
-            if (cmd_info->cd == (stream_ctx->num_segments - 1)) {
-                cmd_info->is_begin = true;
-            }
+            cmd_info->insert_start_csync = false;
+            cmd_info->insert_end_csync   = false;
 
-            if (cmd_info->cd == 0) {
-                cmd_info->is_end = true;
+            // The following codes are only valid if blending is supported
+            /*
+            if (cmd_info->ops == VPE_CMD_OPS_BLENDING) {
+                if (cmd_info->cd == (stream_ctx->num_segments - 1)) {
+                    cmd_info->insert_start_csync = true;
+                }
+
+                if (cmd_info->cd == 0) {
+                    cmd_info->insert_end_csync = true;
+                }
             }
+            */
         }
     }
 

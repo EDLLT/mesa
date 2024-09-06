@@ -249,6 +249,7 @@ struct gl_extensions
    GLboolean KHR_blend_equation_advanced;
    GLboolean KHR_blend_equation_advanced_coherent;
    GLboolean KHR_robustness;
+   GLboolean KHR_shader_subgroup;
    GLboolean KHR_texture_compression_astc_hdr;
    GLboolean KHR_texture_compression_astc_ldr;
    GLboolean KHR_texture_compression_astc_sliced_3d;
@@ -1017,6 +1018,12 @@ struct gl_constants
 
    /** Whether pipe_context::draw_vertex_state is supported. */
    bool HasDrawVertexState;
+
+   /** GL_KHR_shader_subgroup */
+   GLuint ShaderSubgroupSize;
+   GLuint ShaderSubgroupSupportedStages;
+   GLuint ShaderSubgroupSupportedFeatures;
+   bool ShaderSubgroupQuadAllStages;
 };
 
 #endif

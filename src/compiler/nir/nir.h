@@ -959,6 +959,7 @@ typedef enum ENUM_PACKED {
    nir_instr_type_undef,
    nir_instr_type_phi,
    nir_instr_type_parallel_copy,
+   nir_instr_type_debug_info,
 } nir_instr_type;
 
 typedef struct nir_instr {
@@ -2760,6 +2761,41 @@ typedef struct {
    struct exec_list entries;
 } nir_parallel_copy_instr;
 
+typedef enum nir_debug_info_type {
+   nir_debug_info_src_loc,
+   nir_debug_info_string,
+} nir_debug_info_type;
+
+typedef enum nir_debug_info_source {
+   nir_debug_info_spirv,
+   nir_debug_info_nir,
+} nir_debug_info_source;
+
+typedef struct nir_debug_info_instr {
+   nir_instr instr;
+
+   nir_debug_info_type type;
+
+   union {
+      struct {
+         nir_src filename;
+         /* 0 if only the spirv_offset is available. */
+         uint32_t line;
+         uint32_t column;
+
+         uint32_t spirv_offset;
+
+         nir_debug_info_source source;
+      } src_loc;
+
+      uint16_t string_length;
+   };
+
+   nir_def def;
+
+   char string[];
+} nir_debug_info_instr;
+
 NIR_DEFINE_CAST(nir_instr_as_alu, nir_instr, nir_alu_instr, instr,
                 type, nir_instr_type_alu)
 NIR_DEFINE_CAST(nir_instr_as_deref, nir_instr, nir_deref_instr, instr,
@@ -2781,6 +2817,9 @@ NIR_DEFINE_CAST(nir_instr_as_phi, nir_instr, nir_phi_instr, instr,
 NIR_DEFINE_CAST(nir_instr_as_parallel_copy, nir_instr,
                 nir_parallel_copy_instr, instr,
                 type, nir_instr_type_parallel_copy)
+NIR_DEFINE_CAST(nir_instr_as_debug_info, nir_instr,
+                nir_debug_info_instr, instr,
+                type, nir_instr_type_debug_info)
 
 #define NIR_DEFINE_SRC_AS_CONST(type, suffix)                 \
    static inline type                                         \
@@ -3764,6 +3803,18 @@ typedef enum {
    nir_io_glsl_opt_varyings = BITFIELD_BIT(17),
 } nir_io_options;
 
+typedef enum {
+   nir_lower_packing_op_pack_64_2x32,
+   nir_lower_packing_op_unpack_64_2x32,
+   nir_lower_packing_op_pack_64_4x16,
+   nir_lower_packing_op_unpack_64_4x16,
+   nir_lower_packing_op_pack_32_2x16,
+   nir_lower_packing_op_unpack_32_2x16,
+   nir_lower_packing_op_pack_32_4x8,
+   nir_lower_packing_op_unpack_32_4x8,
+   nir_lower_packing_num_ops,
+} nir_lower_packing_op;
+
 /** An instruction filtering callback
  *
  * Returns true if the instruction should be processed and false otherwise.
@@ -4291,6 +4342,12 @@ typedef struct nir_shader_compiler_options {
    /** Options determining lowering and behavior of inputs and outputs. */
    nir_io_options io_options;
 
+   /**
+    * Bit mask of nir_lower_packing_op to skip lowering some nir ops in
+    * nir_lower_packing().
+    */
+   unsigned skip_lower_packing_ops;
+
    /** Driver callback where drivers can define how to lower mediump.
     *  Used by nir_lower_io_passes.
     */
@@ -4583,6 +4640,10 @@ nir_phi_src *nir_phi_instr_add_src(nir_phi_instr *instr,
                                    nir_block *pred, nir_def *src);
 
 nir_parallel_copy_instr *nir_parallel_copy_instr_create(nir_shader *shader);
+
+nir_debug_info_instr *nir_debug_info_instr_create(nir_shader *shader,
+                                                  nir_debug_info_type type,
+                                                  uint32_t string_length);
 
 nir_undef_instr *nir_undef_instr_create(nir_shader *shader,
                                         unsigned num_components,
@@ -4893,10 +4954,14 @@ NIR_SRC_AS_(alu_instr, nir_alu_instr, nir_instr_type_alu, nir_instr_as_alu)
 NIR_SRC_AS_(intrinsic, nir_intrinsic_instr,
             nir_instr_type_intrinsic, nir_instr_as_intrinsic)
 NIR_SRC_AS_(deref, nir_deref_instr, nir_instr_type_deref, nir_instr_as_deref)
+NIR_SRC_AS_(debug_info, nir_debug_info_instr, nir_instr_type_debug_info, nir_instr_as_debug_info)
+
+const char *nir_src_as_string(nir_src src);
 
 bool nir_src_is_always_uniform(nir_src src);
 bool nir_srcs_equal(nir_src src1, nir_src src2);
 bool nir_instrs_equal(const nir_instr *instr1, const nir_instr *instr2);
+nir_block *nir_src_get_block(nir_src *src);
 
 static inline void
 nir_src_rewrite(nir_src *src, nir_def *new_ssa)
@@ -5102,6 +5167,8 @@ void nir_log_shader_annotated_tagged(enum mesa_log_level level, const char *tag,
 char *nir_shader_as_str(nir_shader *nir, void *mem_ctx);
 char *nir_shader_as_str_annotated(nir_shader *nir, struct hash_table *annotations, void *mem_ctx);
 char *nir_instr_as_str(const nir_instr *instr, void *mem_ctx);
+
+char *nir_shader_gather_debug_info(nir_shader *shader, const char *filename);
 
 /** Shallow clone of a single instruction. */
 nir_instr *nir_instr_clone(nir_shader *s, const nir_instr *orig);

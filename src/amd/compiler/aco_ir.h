@@ -1853,6 +1853,8 @@ enum vmem_type : uint8_t {
  */
 uint8_t get_vmem_type(enum amd_gfx_level gfx_level, Instruction* instr);
 
+unsigned parse_vdst_wait(Instruction* instr);
+
 enum block_kind {
    /* uniform indicates that leaving this block,
     * all actives lanes stay active */
@@ -2184,7 +2186,9 @@ void schedule_program(Program* program);
 void schedule_ilp(Program* program);
 void schedule_vopd(Program* program);
 void spill(Program* program);
-void insert_wait_states(Program* program);
+void insert_waitcnt(Program* program);
+void insert_delay_alu(Program* program);
+void combine_delay_alu(Program* program);
 bool dealloc_vgprs(Program* program);
 void insert_NOPs(Program* program);
 void form_hard_clauses(Program* program);

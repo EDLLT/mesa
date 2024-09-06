@@ -333,6 +333,14 @@ static LLVMValueRef emit_umul_high(struct ac_llvm_context *ctx, LLVMValueRef src
                                    LLVMValueRef src1)
 {
    LLVMValueRef dst64, result;
+
+#if LLVM_VERSION_MAJOR < 20
+   if (LLVMIsConstant(src0))
+      ac_build_optimization_barrier(ctx, &src1, false);
+   else
+      ac_build_optimization_barrier(ctx, &src0, false);
+#endif
+
    src0 = LLVMBuildZExt(ctx->builder, src0, ctx->i64, "");
    src1 = LLVMBuildZExt(ctx->builder, src1, ctx->i64, "");
 
@@ -1471,7 +1479,7 @@ static LLVMValueRef build_tex_intrinsic(struct ac_nir_context *ctx, const nir_te
    case nir_texop_tex:
       if (ctx->stage != MESA_SHADER_FRAGMENT &&
           (!gl_shader_stage_is_compute(ctx->stage) ||
-           ctx->info->cs.derivative_group == DERIVATIVE_GROUP_NONE)) {
+           ctx->info->derivative_group == DERIVATIVE_GROUP_NONE)) {
          assert(!args->lod);
          args->level_zero = true;
       }
@@ -1506,7 +1514,7 @@ static LLVMValueRef build_tex_intrinsic(struct ac_nir_context *ctx, const nir_te
 
    args->attributes = AC_ATTR_INVARIANT_LOAD;
    bool cs_derivs =
-      gl_shader_stage_is_compute(ctx->stage) && ctx->info->cs.derivative_group != DERIVATIVE_GROUP_NONE;
+      gl_shader_stage_is_compute(ctx->stage) && ctx->info->derivative_group != DERIVATIVE_GROUP_NONE;
    if (ctx->stage == MESA_SHADER_FRAGMENT || cs_derivs) {
       /* Prevent texture instructions with implicit derivatives from being
        * sinked into branches. */
@@ -3268,26 +3276,31 @@ static bool visit_intrinsic(struct ac_nir_context *ctx, nir_intrinsic_instr *ins
    case nir_intrinsic_quad_broadcast: {
       unsigned lane = nir_src_as_uint(instr->src[1]);
       result = ac_build_quad_swizzle(&ctx->ac, get_src(ctx, instr->src[0]), lane, lane, lane, lane);
-      result = ac_build_wqm(&ctx->ac, result);
+      if (ctx->info->stage == MESA_SHADER_FRAGMENT)
+         result = ac_build_wqm(&ctx->ac, result);
       break;
    }
    case nir_intrinsic_quad_swap_horizontal:
       result = ac_build_quad_swizzle(&ctx->ac, get_src(ctx, instr->src[0]), 1, 0, 3, 2);
-      result = ac_build_wqm(&ctx->ac, result);
+      if (ctx->info->stage == MESA_SHADER_FRAGMENT)
+         result = ac_build_wqm(&ctx->ac, result);
       break;
    case nir_intrinsic_quad_swap_vertical:
       result = ac_build_quad_swizzle(&ctx->ac, get_src(ctx, instr->src[0]), 2, 3, 0, 1);
-      result = ac_build_wqm(&ctx->ac, result);
+      if (ctx->info->stage == MESA_SHADER_FRAGMENT)
+         result = ac_build_wqm(&ctx->ac, result);
       break;
    case nir_intrinsic_quad_swap_diagonal:
       result = ac_build_quad_swizzle(&ctx->ac, get_src(ctx, instr->src[0]), 3, 2, 1, 0);
-      result = ac_build_wqm(&ctx->ac, result);
+      if (ctx->info->stage == MESA_SHADER_FRAGMENT)
+         result = ac_build_wqm(&ctx->ac, result);
       break;
    case nir_intrinsic_quad_swizzle_amd: {
       uint32_t mask = nir_intrinsic_swizzle_mask(instr);
       result = ac_build_quad_swizzle(&ctx->ac, get_src(ctx, instr->src[0]), mask & 0x3,
                                      (mask >> 2) & 0x3, (mask >> 4) & 0x3, (mask >> 6) & 0x3);
-      result = ac_build_wqm(&ctx->ac, result);
+      if (ctx->info->stage == MESA_SHADER_FRAGMENT)
+         result = ac_build_wqm(&ctx->ac, result);
       break;
    }
    case nir_intrinsic_masked_swizzle_amd: {

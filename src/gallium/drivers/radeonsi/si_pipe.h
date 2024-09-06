@@ -527,7 +527,6 @@ struct si_screen {
 
    struct radeon_info info;
    struct nir_shader_compiler_options *nir_options;
-   struct nir_lower_subgroups_options *nir_lower_subgroups_options;
    uint64_t debug_flags;
    char renderer_string[183];
 
@@ -1021,7 +1020,10 @@ struct si_context {
    unsigned last_dirty_tex_counter;
    unsigned last_dirty_buf_counter;
    unsigned last_compressed_colortex_counter;
-   unsigned last_num_draw_calls;
+   struct {
+      unsigned with_cb;
+      unsigned with_db;
+   } num_draw_calls_sh_coherent;
    unsigned flags; /* flush flags */
 
    /* Atoms (state emit functions). */

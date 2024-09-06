@@ -473,9 +473,11 @@ transition_depth_buffer(struct anv_cmd_buffer *cmd_buffer,
         initial_layout == VK_IMAGE_LAYOUT_PREINITIALIZED)) {
       const enum isl_format depth_format =
          image->planes[depth_plane].primary_surface.isl.format;
-      assert(ANV_HZ_FC_VAL == 1.0f);
-      const uint32_t depth_value = depth_format == ISL_FORMAT_R32_FLOAT ?
-                                   0x3f800000 : ~0;
+      const union isl_color_value clear_value =
+         anv_image_hiz_clear_value(image);
+
+      uint32_t depth_value;
+      isl_color_value_pack(&clear_value, depth_format, &depth_value);
 
       const uint32_t clear_pixel_offset = clear_color_addr.offset +
          isl_get_sampler_clear_field_offset(cmd_buffer->device->info,
@@ -544,7 +546,7 @@ transition_depth_buffer(struct anv_cmd_buffer *cmd_buffer,
             MIN2(layer_count, aux_layers - base_layer);
 
          anv_image_hiz_op(cmd_buffer, image, VK_IMAGE_ASPECT_DEPTH_BIT,
-                          l, base_layer, level_layer_count, hiz_op);
+                          level, base_layer, level_layer_count, hiz_op);
       }
    }
 
@@ -614,9 +616,10 @@ transition_stencil_buffer(struct anv_cmd_buffer *cmd_buffer,
           *    "When enabled, Stencil Buffer needs to be initialized via
           *    stencil clear (HZ_OP) before any renderpass."
           */
+         const VkClearDepthStencilValue clear_value = {};
          anv_image_hiz_clear(cmd_buffer, image, VK_IMAGE_ASPECT_STENCIL_BIT,
                              level, base_layer, level_layer_count,
-                             clear_rect, 0 /* Stencil clear value */);
+                             clear_rect, &clear_value);
       }
    }
 
@@ -864,64 +867,6 @@ genX(cmd_buffer_mark_image_written)(struct anv_cmd_buffer *cmd_buffer,
 #endif
 }
 
-static void
-init_fast_clear_color(struct anv_cmd_buffer *cmd_buffer,
-                      const struct anv_image *image,
-                      VkImageAspectFlagBits aspect)
-{
-   assert(cmd_buffer && image);
-   assert(image->vk.aspects & VK_IMAGE_ASPECT_ANY_COLOR_BIT_ANV);
-
-   /* Initialize the struct fields that are accessed for fast clears so that
-    * the HW restrictions on the field values are satisfied.
-    *
-    * On generations that do not support indirect clear color natively, we
-    * can just skip initializing the values, because they will be set by
-    * BLORP before actually doing the fast clear.
-    *
-    * For newer generations, we may not be able to skip initialization.
-    * Testing shows that writing to CLEAR_COLOR causes corruption if
-    * the surface is currently being used. So, care must be taken here.
-    * There are two cases that we consider:
-    *
-    *    1. For CCS_E without FCV, we can skip initializing the color-related
-    *       fields, just like on the older platforms. Also, DWORDS 6 and 7
-    *       are marked MBZ (or have a usable field on gfx11), but we can skip
-    *       initializing them because in practice these fields need other
-    *       state to be programmed for their values to matter.
-    *
-    *    2. When the FCV optimization is enabled, we must initialize the
-    *       color-related fields. Otherwise, the engine might reference their
-    *       uninitialized contents before we fill them for a manual fast clear
-    *       with BLORP. Although the surface may be in use, no synchronization
-    *       is needed before initialization. The only possible clear color we
-    *       support in this mode is 0.
-    */
-#if GFX_VER == 12
-   const uint32_t plane = anv_image_aspect_to_plane(image, aspect);
-
-   if (image->planes[plane].aux_usage == ISL_AUX_USAGE_FCV_CCS_E) {
-      struct anv_device *device = cmd_buffer->device;
-
-      assert(!image->planes[plane].can_non_zero_fast_clear);
-      assert(device->isl_dev.ss.clear_color_state_size == 32);
-
-      unsigned num_dwords = 6;
-      struct anv_address addr =
-         anv_image_get_clear_color_addr(device, image, aspect);
-
-      struct mi_builder b;
-      mi_builder_init(&b, device->info, &cmd_buffer->batch);
-      mi_builder_set_mocs(&b, anv_mocs_for_address(device, &addr));
-
-      for (unsigned i = 0; i < num_dwords; i++) {
-         mi_builder_set_write_check(&b, i == (num_dwords - 1));
-         mi_store(&b, mi_mem32(anv_address_add(addr, i * 4)), mi_imm(0));
-      }
-   }
-#endif
-}
-
 /* Copy the fast-clear value dword(s) between a surface state object and an
  * image's fast clear state buffer.
  */
@@ -969,12 +914,59 @@ genX(load_image_clear_color)(struct anv_cmd_buffer *cmd_buffer,
 #endif
 }
 
+static void
+set_image_clear_color(struct anv_cmd_buffer *cmd_buffer,
+                      const struct anv_image *image,
+                      const VkImageAspectFlags aspect,
+                      const uint32_t *pixel)
+{
+   UNUSED struct anv_batch *batch = &cmd_buffer->batch;
+   uint32_t plane = anv_image_aspect_to_plane(image, aspect);
+   enum isl_format format = image->planes[plane].primary_surface.isl.format;
+
+   union isl_color_value clear_color;
+   isl_color_value_unpack(&clear_color, format, pixel);
+
+   struct anv_address addr =
+      anv_image_get_clear_color_addr(cmd_buffer->device, image, aspect);
+   assert(!anv_address_is_null(addr));
+
+#if GFX_VER >= 20
+   assert(cmd_buffer->device->isl_dev.ss.clear_color_state_size == 0);
+   assert(cmd_buffer->device->isl_dev.ss.clear_value_size == 0);
+   unreachable("storing clear colors on invalid gfx_ver" );
+#elif GFX_VER >= 11
+   assert(cmd_buffer->device->isl_dev.ss.clear_color_state_size == 32);
+   uint32_t *dw = anv_batch_emitn(batch, 3 + 6, GENX(MI_STORE_DATA_IMM),
+                                  .StoreQword = true, .Address = addr);
+   dw[3] = clear_color.u32[0];
+   dw[4] = clear_color.u32[1];
+   dw[5] = clear_color.u32[2];
+   dw[6] = clear_color.u32[3];
+   dw[7] = pixel[0];
+   dw[8] = pixel[1];
+#else
+   assert(cmd_buffer->device->isl_dev.ss.clear_color_state_size == 0);
+   assert(cmd_buffer->device->isl_dev.ss.clear_value_size == 16);
+   uint32_t *dw = anv_batch_emitn(batch, 3 + 4, GENX(MI_STORE_DATA_IMM),
+                                  .StoreQword = true, .Address = addr);
+   dw[3] = clear_color.u32[0];
+   dw[4] = clear_color.u32[1];
+   dw[5] = clear_color.u32[2];
+   dw[6] = clear_color.u32[3];
+#endif
+}
+
 void
 genX(set_fast_clear_state)(struct anv_cmd_buffer *cmd_buffer,
                            const struct anv_image *image,
                            const enum isl_format format,
                            union isl_color_value clear_color)
 {
+   uint32_t pixel[4];
+   isl_color_value_pack(&clear_color, format, pixel);
+   set_image_clear_color(cmd_buffer, image, VK_IMAGE_ASPECT_COLOR_BIT, pixel);
+
    if (isl_color_value_is_zero(clear_color, format)) {
       /* This image has the auxiliary buffer enabled. We can mark the
        * subresource as not needing a resolve because the clear color
@@ -1230,11 +1222,15 @@ transition_color_buffer(struct anv_cmd_buffer *cmd_buffer,
    }
 
    if (must_init_fast_clear_state) {
+      if (image->planes[plane].aux_usage == ISL_AUX_USAGE_FCV_CCS_E) {
+         assert(!image->planes[plane].can_non_zero_fast_clear);
+         const uint32_t zero_pixel[4] = {};
+         set_image_clear_color(cmd_buffer, image, aspect, zero_pixel);
+      }
       if (base_level == 0 && base_layer == 0) {
          set_image_fast_clear_state(cmd_buffer, image, aspect,
                                     ANV_FAST_CLEAR_NONE);
       }
-      init_fast_clear_color(cmd_buffer, image, aspect);
    }
 
    if (must_init_aux_surface) {
@@ -3088,57 +3084,25 @@ genX(cmd_buffer_update_color_aux_op)(struct anv_cmd_buffer *cmd_buffer,
             ANV_PIPE_END_OF_PIPE_SYNC_BIT);
    }
 
-   if (next_aux_op == ISL_AUX_OP_FAST_CLEAR &&
+   if (last_aux_op != ISL_AUX_OP_FAST_CLEAR &&
+       next_aux_op == ISL_AUX_OP_FAST_CLEAR &&
        cmd_buffer->device->isl_dev.ss.clear_color_state_size > 0) {
-      /* From the ICL PRM Vol. 9, "Render Target Fast Clear":
-       *
-       *    HwManaged FastClear allows SW to store FastClearValue in separate
-       *    graphics allocation, instead of keeping them in
-       *    RENDER_SURFACE_STATE. This behavior can be enabled by setting
-       *    ClearValueAddressEnable in RENDER_SURFACE_STATE.
-       *
-       *    Proper sequence of commands is as follows:
-       *
-       *       1. Storing clear color to allocation
-       *       2. Ensuring that step 1. is finished and visible for
-       *          TextureCache
-       *       3. Performing FastClear
-       *
-       *    Step 2. is required on products with ClearColorConversion feature.
-       *    This feature is enabled by setting ClearColorConversionEnable.
-       *    This causes HW to read stored color from ClearColorAllocation and
-       *    write back with the native format or RenderTarget - and clear
-       *    color needs to be present and visible. Reading is done from
-       *    TextureCache, writing is done to RenderCache.
-       *
-       * Invalidate the texture cache so that the clear color conversion
-       * feature works properly.
-       */
-      anv_add_pending_pipe_bits(cmd_buffer,
-                                ANV_PIPE_TEXTURE_CACHE_INVALIDATE_BIT,
-                                "Invalidate for clear color conversion");
-
       /* From the ICL PRM Vol. 9, "State Caching":
        *
        *    Any values referenced by pointers within the RENDER_SURFACE_STATE
-       *    or SAMPLER_STATE (e.g. Clear Color Pointer, Border Color or
-       *    Indirect State Pointer) are considered to be part of that state
-       *    and any changes to these referenced values requires an
-       *    invalidation of the L1 state cache to ensure the new values are
-       *    being used as part of the state. In the case of surface data
-       *    pointed to by the Surface Base Address in RENDER SURFACE STATE,
-       *    the Texture Cache must be invalidated if the surface data changes.
+       *    [...] (e.g. Clear Color Pointer, [...]) are considered to be part
+       *    of that state and any changes to these referenced values requires
+       *    an invalidation of the L1 state cache to ensure the new values are
+       *    being used as part of the state. [...]
        *
        * We could alternatively perform this invalidation when we stop
        * fast-clearing. A benefit to doing it now, when transitioning to a
        * fast clear, is that we save a pipe control by combining the state
-       * cache invalidation with the texture cache invalidation.
+       * cache invalidation with the texture cache invalidation done on gfx12.
        */
-      if (last_aux_op != ISL_AUX_OP_FAST_CLEAR) {
-         anv_add_pending_pipe_bits(cmd_buffer,
-                                   ANV_PIPE_STATE_CACHE_INVALIDATE_BIT,
-                                   "Invalidate for new clear color");
-      }
+      anv_add_pending_pipe_bits(cmd_buffer,
+                                ANV_PIPE_STATE_CACHE_INVALIDATE_BIT,
+                                "Invalidate for new clear color");
    }
 
    /* Update the auxiliary surface operation, but with one exception. */
@@ -5055,7 +5019,7 @@ cmd_buffer_emit_depth_stencil(struct anv_cmd_buffer *cmd_buffer)
          info.hiz_surf = &hiz_surface->isl;
          info.hiz_address = anv_address_physical(hiz_address);
 
-         info.depth_clear_value = ANV_HZ_FC_VAL;
+         info.depth_clear_value = anv_image_hiz_clear_value(image).f32[0];
       }
    }
 
@@ -5422,8 +5386,7 @@ void genX(CmdBeginRendering)(
       VkImageLayout initial_stencil_layout = VK_IMAGE_LAYOUT_UNDEFINED;
       enum isl_aux_usage depth_aux_usage = ISL_AUX_USAGE_NONE;
       enum isl_aux_usage stencil_aux_usage = ISL_AUX_USAGE_NONE;
-      float depth_clear_value = 0;
-      uint32_t stencil_clear_value = 0;
+      VkClearDepthStencilValue clear_value = {};
 
       if (d_att != NULL && d_att->imageView != VK_NULL_HANDLE) {
          d_iview = anv_image_view_from_handle(d_att->imageView);
@@ -5436,7 +5399,7 @@ void genX(CmdBeginRendering)(
                                     VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
                                     depth_layout,
                                     cmd_buffer->queue_family->queueFlags);
-         depth_clear_value = d_att->clearValue.depthStencil.depth;
+         clear_value.depth = d_att->clearValue.depthStencil.depth;
       }
 
       if (s_att != NULL && s_att->imageView != VK_NULL_HANDLE) {
@@ -5450,7 +5413,7 @@ void genX(CmdBeginRendering)(
                                     VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
                                     stencil_layout,
                                     cmd_buffer->queue_family->queueFlags);
-         stencil_clear_value = s_att->clearValue.depthStencil.stencil;
+         clear_value.stencil = s_att->clearValue.depthStencil.stencil;
       }
 
       assert(s_iview == NULL || d_iview == NULL || s_iview == d_iview);
@@ -5481,7 +5444,7 @@ void genX(CmdBeginRendering)(
          const bool hiz_clear =
             anv_can_hiz_clear_ds_view(cmd_buffer->device, d_iview,
                                       depth_layout, clear_aspects,
-                                      depth_clear_value,
+                                      clear_value.depth,
                                       render_area,
                                       cmd_buffer->queue_family->queueFlags);
 
@@ -5544,16 +5507,13 @@ void genX(CmdBeginRendering)(
                   anv_image_hiz_clear(cmd_buffer, ds_iview->image,
                                       clear_aspects,
                                       level, layer, 1,
-                                      render_area,
-                                      stencil_clear_value);
+                                      render_area, &clear_value);
                } else {
                   anv_image_clear_depth_stencil(cmd_buffer, ds_iview->image,
                                                 clear_aspects,
                                                 depth_aux_usage,
                                                 level, layer, 1,
-                                                render_area,
-                                                depth_clear_value,
-                                                stencil_clear_value);
+                                                render_area, &clear_value);
                }
             }
          } else {
@@ -5565,16 +5525,13 @@ void genX(CmdBeginRendering)(
                anv_image_hiz_clear(cmd_buffer, ds_iview->image,
                                    clear_aspects,
                                    level, base_layer, layer_count,
-                                   render_area,
-                                   stencil_clear_value);
+                                   render_area, &clear_value);
             } else {
                anv_image_clear_depth_stencil(cmd_buffer, ds_iview->image,
                                              clear_aspects,
                                              depth_aux_usage,
                                              level, base_layer, layer_count,
-                                             render_area,
-                                             depth_clear_value,
-                                             stencil_clear_value);
+                                             render_area, &clear_value);
             }
          }
       } else {

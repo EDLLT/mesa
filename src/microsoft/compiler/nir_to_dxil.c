@@ -2042,7 +2042,7 @@ emit_metadata(struct ntd_context *ctx)
       if (!emit_tag(ctx, DXIL_SHADER_TAG_NUM_THREADS, emit_threads(ctx)))
          return false;
       if (ctx->mod.minor_version >= 6 &&
-          ctx->shader->info.subgroup_size >= SUBGROUP_SIZE_REQUIRE_8) {
+          ctx->shader->info.subgroup_size >= SUBGROUP_SIZE_REQUIRE_4) {
          if (ctx->mod.minor_version < 8) {
             if (!emit_tag(ctx, DXIL_SHADER_TAG_WAVE_SIZE, emit_wave_size(ctx)))
                return false;
@@ -6328,7 +6328,6 @@ optimize_nir(struct nir_shader *s, const struct nir_to_dxil_options *opts)
       NIR_PASS(progress, s, nir_lower_alu);
       NIR_PASS(progress, s, nir_opt_constant_folding);
       NIR_PASS(progress, s, nir_opt_undef);
-      NIR_PASS(progress, s, nir_lower_undef_to_zero);
       NIR_PASS(progress, s, nir_opt_deref);
       NIR_PASS(progress, s, dxil_nir_lower_upcast_phis, opts->lower_int16 ? 32 : 16);
       NIR_PASS(progress, s, nir_lower_64bit_phis);
@@ -6343,6 +6342,8 @@ optimize_nir(struct nir_shader *s, const struct nir_to_dxil_options *opts)
       progress = false;
       NIR_PASS(progress, s, nir_opt_algebraic_late);
    } while (progress);
+
+   NIR_PASS_V(s, nir_lower_undef_to_zero);
 }
 
 static
@@ -6353,7 +6354,7 @@ void dxil_fill_validation_state(struct ntd_context *ctx,
       sizeof(struct dxil_resource_v1) : sizeof(struct dxil_resource_v0);
    state->num_resources = ctx->resources.size / resource_element_size;
    state->resources.v0 = (struct dxil_resource_v0*)ctx->resources.data;
-   if (ctx->shader->info.subgroup_size >= SUBGROUP_SIZE_REQUIRE_8) {
+   if (ctx->shader->info.subgroup_size >= SUBGROUP_SIZE_REQUIRE_4) {
       state->state.psv1.psv0.max_expected_wave_lane_count = ctx->shader->info.subgroup_size;
       state->state.psv1.psv0.min_expected_wave_lane_count = ctx->shader->info.subgroup_size;
    } else {
@@ -6614,7 +6615,7 @@ nir_to_dxil(struct nir_shader *s, const struct nir_to_dxil_options *opts,
     * might be too opaque for the pass to see that they're next to each other. */
    optimize_nir(s, opts);
 
-   /* Vectorize UBO/SSBO accesses aggressively. This can help increase alignment to enable us to do better
+/* Vectorize UBO/SSBO accesses aggressively. This can help increase alignment to enable us to do better
     * chunking of loads and stores after lowering bit sizes. Ignore load/store size limitations here, we'll
     * address them with lower_mem_access_bit_sizes */
    nir_load_store_vectorize_options vectorize_opts = {

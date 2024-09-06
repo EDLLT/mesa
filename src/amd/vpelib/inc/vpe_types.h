@@ -46,7 +46,8 @@ enum vpe_status {
 
     // errors for not supported operations
     VPE_STATUS_NOT_SUPPORTED,
-    VPE_STATUS_DCC_NOT_SUPPORTED,
+    VPE_STATUS_INPUT_DCC_NOT_SUPPORTED,
+    VPE_STATUS_OUTPUT_DCC_NOT_SUPPORTED,
     VPE_STATUS_SWIZZLE_NOT_SUPPORTED,
     VPE_STATUS_NUM_STREAM_NOT_SUPPORTED,
     VPE_STATUS_PIXEL_FORMAT_NOT_SUPPORTED,
@@ -182,6 +183,7 @@ struct vpe_caps {
 
     struct vpe_color_caps color_caps;
     struct vpe_plane_caps plane_caps;
+
 };
 
 /***********************************
@@ -193,6 +195,7 @@ struct vpe_dcc_surface_param {
     enum vpe_surface_pixel_format format;
     enum vpe_swizzle_mode_values  swizzle_mode;
     enum vpe_scan_direction       scan;
+    enum vpe_mirror               mirror;
 };
 
 struct vpe_dcc_setting {
@@ -222,6 +225,7 @@ struct vpe_surface_dcc_cap {
 
     bool capable;
     bool const_color_support;
+
 };
 
 /** Conditional Capability functions */
@@ -235,8 +239,8 @@ struct vpe_cap_funcs {
      * @param[in/out]  output        dcc capable result and related settings
      * @return true if supported
      */
-    bool (*get_dcc_compression_cap)(const struct vpe *vpe,
-        const struct vpe_dcc_surface_param *input, struct vpe_surface_dcc_cap *output);
+    bool (*get_dcc_compression_output_cap)(const struct vpe *vpe, const struct vpe_dcc_surface_param *params, struct vpe_surface_dcc_cap *cap);
+    bool (*get_dcc_compression_input_cap)(const struct vpe *vpe, const struct vpe_dcc_surface_param *params, struct vpe_surface_dcc_cap  *cap);
 };
 
 /****************************************
@@ -347,6 +351,7 @@ struct vpe_debug_options {
         uint32_t bg_bit_depth            : 1;
         uint32_t visual_confirm          : 1;
         uint32_t skip_optimal_tap_check  : 1;
+        uint32_t disable_3dlut_cache     : 1;
     } flags;
 
     // valid only if the corresponding flag is set
@@ -369,6 +374,7 @@ struct vpe_debug_options {
     uint32_t opp_pipe_crc_ctrl       : 1;
     uint32_t mpc_crc_ctrl            : 1;
     uint32_t skip_optimal_tap_check  : 1;
+    uint32_t disable_3dlut_cache     : 1;
     uint32_t bg_bit_depth;
 
     struct vpe_mem_low_power_enable_options enable_mem_low_power;
@@ -634,7 +640,7 @@ struct vpe_bufs_req {
 struct vpe_buf {
     uint64_t gpu_va; /**< GPU start address of the buffer */
     uint64_t cpu_va;
-    uint64_t  size;
+    uint64_t size;
     bool     tmz; /**< allocated from tmz */
 };
 

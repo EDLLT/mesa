@@ -282,9 +282,6 @@ spec@arb_query_buffer_object@coherency@indirect-draw-count-GL_TESS_CONTROL_SHADE
 spec@arb_query_buffer_object@coherency@indirect-draw-count-GL_TESS_EVALUATION_SHADER_INVOCATIONS,Fail
 spec@arb_query_buffer_object@coherency@indirect-draw-count-GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN,Fail
 
-spec@arb_vertex_attrib_64bit@execution@unused-sub-dvec4-01,Crash
-spec@arb_vertex_attrib_64bit@execution@unused-sub-dvec4-02,Crash
-
 spec@arb_gpu_shader5@arb_gpu_shader5-interpolateatsample-dynamically-nonuniform,Fail
 spec@arb_gpu_shader5@arb_gpu_shader5-xfb-streams,Fail
 spec@arb_gpu_shader5@arb_gpu_shader5-xfb-streams-without-invocations,Fail
@@ -311,10 +308,3 @@ spec@glsl-1.30@execution@fs-uint-to-float-of-extract-int8,Fail
 dynamic-dEQP-VK.renderpass2.depth_stencil_resolve.image_2d_32_32.samples_2.d24_unorm_s8_uint.compatibility_depth_zero_stencil_zero_testing_stencil,Fail
 dynamic-dEQP-VK.renderpass2.depth_stencil_resolve.image_2d_32_32.samples_2.d24_unorm_s8_uint_separate_layouts.compatibility_depth_zero_stencil_zero_testing_stencil,Fail
 dynamic-dEQP-VK.renderpass2.depth_stencil_resolve.image_2d_32_32.samples_2.d32_sfloat_s8_uint_separate_layouts.compatibility_depth_zero_stencil_zero_testing_stencil,Fail
-
-# We can't support VK_EXT_sample_locations on pre-A650 GPUs
-# See https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/4665#note_473653
-dEQP-VK.info.device_mandatory_features,Fail
-
-# Can be fixed by https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/26154
-dEQP-VK.dynamic_rendering.primary_cmd_buff.basic.partial_binding_depth_stencil,Fail

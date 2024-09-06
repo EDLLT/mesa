@@ -792,7 +792,7 @@ droid_add_configs_for_visuals(_EGLDisplay *disp)
    } visuals[] = {
       {HAL_PIXEL_FORMAT_RGBA_8888, PIPE_FORMAT_RGBA8888_UNORM},
       {HAL_PIXEL_FORMAT_RGBX_8888, PIPE_FORMAT_RGBX8888_UNORM},
-      {HAL_PIXEL_FORMAT_RGB_565, PIPE_FORMAT_R5G6B5_UNORM},
+      {HAL_PIXEL_FORMAT_RGB_565, PIPE_FORMAT_B5G6R5_UNORM},
       /* This must be after HAL_PIXEL_FORMAT_RGBA_8888, we only keep BGRA
        * visual if it turns out RGBA visual is not available.
        */
@@ -1186,12 +1186,9 @@ dri2_initialize_android(_EGLDisplay *disp)
    struct dri2_egl_display *dri2_dpy;
    const char *err;
 
-   dri2_dpy = calloc(1, sizeof(*dri2_dpy));
+   dri2_dpy = dri2_display_create();
    if (!dri2_dpy)
       return _eglError(EGL_BAD_ALLOC, "eglInitialize");
-
-   dri2_dpy->fd_render_gpu = -1;
-   dri2_dpy->fd_display_gpu = -1;
 
    dri2_dpy->gralloc = u_gralloc_create(U_GRALLOC_TYPE_AUTO);
    if (dri2_dpy->gralloc == NULL) {

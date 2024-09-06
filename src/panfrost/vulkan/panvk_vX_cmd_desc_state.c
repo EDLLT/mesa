@@ -12,6 +12,7 @@
 #include "genxml/gen_macros.h"
 
 #include "panvk_buffer.h"
+#include "panvk_cmd_buffer.h"
 #include "panvk_cmd_desc_state.h"
 #include "panvk_entrypoints.h"
 
@@ -22,29 +23,6 @@
 #include "vk_alloc.h"
 #include "vk_command_buffer.h"
 #include "vk_command_pool.h"
-
-void
-panvk_per_arch(cmd_desc_state_reset)(
-   struct panvk_descriptor_state *gfx_desc_state,
-   struct panvk_descriptor_state *compute_desc_state)
-{
-   memset(&gfx_desc_state->sets, 0, sizeof(gfx_desc_state->sets));
-   memset(&compute_desc_state->sets, 0, sizeof(compute_desc_state->sets));
-}
-
-void
-panvk_per_arch(cmd_desc_state_cleanup)(
-   struct vk_command_buffer *cmdbuf,
-   struct panvk_descriptor_state *gfx_desc_state,
-   struct panvk_descriptor_state *compute_desc_state)
-{
-   for (unsigned i = 0; i < MAX_SETS; i++) {
-      if (gfx_desc_state->push_sets[i])
-         vk_free(&cmdbuf->pool->alloc, gfx_desc_state->push_sets[i]);
-      if (compute_desc_state->push_sets[i])
-         vk_free(&cmdbuf->pool->alloc, compute_desc_state->push_sets[i]);
-   }
-}
 
 void
 panvk_per_arch(cmd_desc_state_bind_sets)(
@@ -85,25 +63,40 @@ panvk_per_arch(cmd_desc_state_bind_sets)(
 }
 
 struct panvk_descriptor_set *
-panvk_per_arch(cmd_push_descriptors)(struct vk_command_buffer *cmdbuf,
+panvk_per_arch(cmd_push_descriptors)(struct vk_command_buffer *vk_cmdbuf,
                                      struct panvk_descriptor_state *desc_state,
                                      uint32_t set_idx)
 {
+   struct panvk_cmd_buffer *cmdbuf =
+      container_of(vk_cmdbuf, struct panvk_cmd_buffer, vk);
+   struct panvk_cmd_pool *pool =
+      container_of(cmdbuf->vk.pool, struct panvk_cmd_pool, vk);
+   struct panvk_push_set *push_set;
+
    assert(set_idx < MAX_SETS);
 
-   if (unlikely(desc_state->push_sets[set_idx] == NULL)) {
-      VK_MULTIALLOC(ma);
-      VK_MULTIALLOC_DECL(&ma, struct panvk_descriptor_set, set, 1);
-      VK_MULTIALLOC_DECL(&ma, struct panvk_opaque_desc, descs, MAX_PUSH_DESCS);
+   if (likely(desc_state->push_sets[set_idx])) {
+      push_set = container_of(desc_state->push_sets[set_idx],
+                              struct panvk_push_set, set);
+   } else if (!list_is_empty(&pool->push_sets)) {
+      push_set =
+         list_first_entry(&pool->push_sets, struct panvk_push_set, base.node);
+      list_del(&push_set->base.node);
+      list_addtail(&push_set->base.node, &cmdbuf->push_sets);
+   } else {
+      push_set = vk_zalloc(&pool->vk.alloc, sizeof(*push_set), 8,
+                           VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+      list_addtail(&push_set->base.node, &cmdbuf->push_sets);
+   }
 
-      if (unlikely(!vk_multialloc_zalloc(&ma, &cmdbuf->pool->alloc,
-                                         VK_SYSTEM_ALLOCATION_SCOPE_OBJECT))) {
-         vk_command_buffer_set_error(cmdbuf, VK_ERROR_OUT_OF_HOST_MEMORY);
-         return NULL;
-      }
+   if (unlikely(!push_set)) {
+      vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return NULL;
+   }
 
-      desc_state->push_sets[set_idx] = set;
-      set->descs.host = descs;
+   if (desc_state->push_sets[set_idx] == NULL) {
+      desc_state->push_sets[set_idx] = &push_set->set;
+      push_set->set.descs.host = push_set->descs;
    }
 
    struct panvk_descriptor_set *set = desc_state->push_sets[set_idx];
@@ -113,6 +106,7 @@ panvk_per_arch(cmd_push_descriptors)(struct vk_command_buffer *cmdbuf,
    return set;
 }
 
+#if PAN_ARCH <= 7
 void
 panvk_per_arch(cmd_prepare_dyn_ssbos)(
    struct pan_pool *desc_pool, const struct panvk_descriptor_state *desc_state,
@@ -229,6 +223,75 @@ panvk_per_arch(cmd_prepare_shader_desc_tables)(
       shader_desc_state->tables[PANVK_BIFROST_DESC_TABLE_SAMPLER] = sampler.gpu;
    }
 }
+#else
+void
+panvk_per_arch(cmd_fill_dyn_bufs)(
+   struct pan_pool *desc_pool, const struct panvk_descriptor_state *desc_state,
+   const struct panvk_shader *shader, struct mali_buffer_packed *buffers)
+{
+   if (!shader)
+      return;
+
+   for (uint32_t i = 0; i < shader->desc_info.dyn_bufs.count; i++) {
+      uint32_t src_handle = shader->desc_info.dyn_bufs.map[i];
+      uint32_t set_idx = COPY_DESC_HANDLE_EXTRACT_TABLE(src_handle);
+      uint32_t dyn_buf_idx = COPY_DESC_HANDLE_EXTRACT_INDEX(src_handle);
+      const struct panvk_descriptor_set *set = desc_state->sets[set_idx];
+      const uint32_t dyn_buf_offset =
+         desc_state->dyn_buf_offsets[set_idx][dyn_buf_idx];
+
+      assert(set_idx < MAX_SETS);
+      assert(set);
+
+      pan_pack(&buffers[i], BUFFER, cfg) {
+         cfg.size = set->dyn_bufs[dyn_buf_idx].size;
+         cfg.address = set->dyn_bufs[dyn_buf_idx].dev_addr + dyn_buf_offset;
+      }
+   }
+}
+
+void
+panvk_per_arch(cmd_prepare_shader_res_table)(
+   struct pan_pool *desc_pool, const struct panvk_descriptor_state *desc_state,
+   const struct panvk_shader *shader,
+   struct panvk_shader_desc_state *shader_desc_state)
+{
+   if (!shader || shader_desc_state->res_table)
+      return;
+
+   uint32_t first_unused_set = util_last_bit(shader->desc_info.used_set_mask);
+   uint32_t res_count = 1 + first_unused_set;
+   struct panfrost_ptr ptr =
+      pan_pool_alloc_desc_array(desc_pool, res_count, RESOURCE);
+   struct mali_resource_packed *res_table = ptr.cpu;
+
+   /* First entry is the driver set table, where we store the vertex attributes,
+    * the dummy sampler, the dynamic buffers and the vertex buffers. */
+   pan_pack(&res_table[0], RESOURCE, cfg) {
+      cfg.address = shader_desc_state->driver_set.dev_addr;
+      cfg.size = shader_desc_state->driver_set.size;
+      cfg.contains_descriptors = cfg.size > 0;
+   }
+
+   for (uint32_t i = 0; i < first_unused_set; i++) {
+      const struct panvk_descriptor_set *set = desc_state->sets[i];
+
+      pan_pack(&res_table[i + 1], RESOURCE, cfg) {
+         if (shader->desc_info.used_set_mask & BITFIELD_BIT(i)) {
+            cfg.address = set->descs.dev;
+            cfg.contains_descriptors = true;
+            cfg.size = set->desc_count * PANVK_DESCRIPTOR_SIZE;
+         } else {
+            cfg.address = 0;
+            cfg.contains_descriptors = false;
+            cfg.size = 0;
+         }
+      }
+   }
+
+   shader_desc_state->res_table = ptr.gpu | res_count;
+}
+#endif
 
 void
 panvk_per_arch(cmd_prepare_push_descs)(struct pan_pool *desc_pool,

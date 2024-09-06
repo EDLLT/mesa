@@ -200,8 +200,6 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
 
    c->ppp_multisamplectl = cs->ppp_multisamplectl;
    c->sample_size = cs->tib.sample_size_B;
-
-   /* XXX OR 0x80 with eMRT? */
    c->tib_blocks = ALIGN_POT(agx_tilebuffer_total_size(&cs->tib), 2048) / 2048;
 
    float tan_60 = 1.732051f;
@@ -289,8 +287,14 @@ union drm_asahi_cmd {
    struct drm_asahi_cmd_render render;
 };
 
-/* TODO: I think it's 64. Can we query from the kernel? */
-#define MAX_COMMANDS_PER_SUBMIT (16)
+/* XXX: Batching multiple commands per submission is causing rare (7ppm) flakes
+ * on the CTS once lossless compression is enabled. This needs to be
+ * investigated before we can reenable this mechanism. We are likely missing a
+ * cache flush or barrier somewhere.
+ *
+ * TODO: I think the actual maximum is 64. Can we query from the kernel?
+ */
+#define MAX_COMMANDS_PER_SUBMIT (1)
 
 static VkResult
 queue_submit_single(struct agx_device *dev, struct drm_asahi_submit *submit)

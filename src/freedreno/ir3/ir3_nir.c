@@ -1,24 +1,6 @@
 /*
- * Copyright (C) 2015 Rob Clark <robclark@freedesktop.org>
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright © 2015 Rob Clark <robclark@freedesktop.org>
+ * SPDX-License-Identifier: MIT
  *
  * Authors:
  *    Rob Clark <robclark@freedesktop.org>
@@ -607,9 +589,23 @@ lower_subgroup_id_filter(const nir_instr *instr, const void *unused)
 }
 
 static nir_def *
-lower_subgroup_id(nir_builder *b, nir_instr *instr, void *unused)
+lower_subgroup_id(nir_builder *b, nir_instr *instr, void *_shader)
 {
-   (void)unused;
+   struct ir3_shader *shader = _shader;
+
+   /* Vulkan allows implementations to tile workgroup invocations even when
+    * subgroup operations are involved, which is implied by this Note:
+    *
+    *    "There is no direct relationship between SubgroupLocalInvocationId and
+    *    LocalInvocationId or LocalInvocationIndex."
+    *
+    * However there is no way to get SubgroupId directly, so we have to use
+    * LocalInvocationIndex here. This means that whenever we do this lowering we
+    * have to force linear dispatch to make sure that the relation between
+    * SubgroupId/SubgroupLocalInvocationId and LocalInvocationIndex is what we
+    * expect.
+    */
+   shader->cs.force_linear_dispatch = true;
 
    nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
    if (intr->intrinsic == nir_intrinsic_load_subgroup_invocation) {
@@ -638,10 +634,10 @@ lower_subgroup_id(nir_builder *b, nir_instr *instr, void *unused)
 }
 
 static bool
-ir3_nir_lower_subgroup_id_cs(nir_shader *shader)
+ir3_nir_lower_subgroup_id_cs(nir_shader *nir, struct ir3_shader *shader)
 {
-   return nir_shader_lower_instructions(shader, lower_subgroup_id_filter,
-                                        lower_subgroup_id, NULL);
+   return nir_shader_lower_instructions(nir, lower_subgroup_id_filter,
+                                        lower_subgroup_id, shader);
 }
 
 /**
@@ -764,7 +760,7 @@ ir3_nir_post_finalize(struct ir3_shader *shader)
    if ((s->info.stage == MESA_SHADER_COMPUTE) ||
        (s->info.stage == MESA_SHADER_KERNEL)) {
       bool progress = false;
-      NIR_PASS(progress, s, ir3_nir_lower_subgroup_id_cs);
+      NIR_PASS(progress, s, ir3_nir_lower_subgroup_id_cs, shader);
 
       /* ir3_nir_lower_subgroup_id_cs creates extra compute intrinsics which
        * we need to lower again.

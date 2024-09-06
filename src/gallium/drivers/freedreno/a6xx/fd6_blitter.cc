@@ -1,25 +1,7 @@
 /*
- * Copyright (C) 2017 Rob Clark <robclark@freedesktop.org>
+ * Copyright © 2017 Rob Clark <robclark@freedesktop.org>
  * Copyright © 2018 Google, Inc.
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * SPDX-License-Identifier: MIT
  *
  * Authors:
  *    Rob Clark <robclark@freedesktop.org>
@@ -850,7 +832,25 @@ FD_GENX(fd6_clear_lrz);
 static union pipe_color_union
 convert_color(enum pipe_format format, union pipe_color_union *pcolor)
 {
+   const struct util_format_description *desc = util_format_description(format);
    union pipe_color_union color = *pcolor;
+
+   for (unsigned i = 0; i < 4; i++) {
+      unsigned channel = desc->swizzle[i];
+
+      if (desc->channel[channel].normalized)
+         continue;
+
+      switch (desc->channel[channel].type) {
+      case UTIL_FORMAT_TYPE_SIGNED:
+         color.i[i] = MAX2(color.i[i], -(1<<(desc->channel[channel].size - 1)));
+         color.i[i] = MIN2(color.i[i], (1 << (desc->channel[channel].size - 1)) - 1);
+         break;
+      case UTIL_FORMAT_TYPE_UNSIGNED:
+         color.ui[i] = MIN2(color.ui[i], BITFIELD_MASK(desc->channel[channel].size));
+         break;
+      }
+   }
 
    /* For solid-fill blits, the hw isn't going to convert from
     * linear to srgb for us:
@@ -864,8 +864,6 @@ convert_color(enum pipe_format format, union pipe_color_union *pcolor)
       for (int i = 0; i < 3; i++)
          color.f[i] = CLAMP(color.f[i], -1.0f, 1.0f);
    }
-
-   /* Note that float_to_ubyte() already clamps, for the unorm case */
 
    return color;
 }

@@ -164,7 +164,7 @@ nvk_CreateDevice(VkPhysicalDevice physicalDevice,
       goto fail_upload;
 
    memset(dev->zero_page->map, 0, 0x1000);
-   nvkmd_mem_unmap(dev->zero_page);
+   nvkmd_mem_unmap(dev->zero_page, 0);
 
    result = nvk_descriptor_table_init(dev, &dev->images,
                                       8 * 4 /* tic entry size */,
@@ -290,6 +290,9 @@ nvk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
 
    if (!dev)
       return;
+
+   if (dev->copy_queries)
+      vk_shader_destroy(&dev->vk, &dev->copy_queries->vk, &dev->vk.alloc);
 
    nvk_device_finish_meta(dev);
 

@@ -330,9 +330,7 @@ get_blorp_surf_for_anv_image(const struct anv_cmd_buffer *cmd_buffer,
          const struct anv_address clear_color_addr =
             anv_image_get_clear_color_addr(device, image, aspect);
          blorp_surf->clear_color_addr = anv_to_blorp_address(clear_color_addr);
-         blorp_surf->clear_color = (union isl_color_value) {
-            .f32 = { ANV_HZ_FC_VAL },
-         };
+         blorp_surf->clear_color = anv_image_hiz_clear_value(image);
       }
    }
 }
@@ -1715,7 +1713,8 @@ anv_fast_clear_depth_stencil(struct anv_cmd_buffer *cmd_buffer,
                              VkImageAspectFlags aspects,
                              uint32_t level,
                              uint32_t base_layer, uint32_t layer_count,
-                             VkRect2D area, uint8_t stencil_value)
+                             VkRect2D area,
+                             const VkClearDepthStencilValue *clear_value)
 {
    assert(image->vk.aspects & (VK_IMAGE_ASPECT_DEPTH_BIT |
                                VK_IMAGE_ASPECT_STENCIL_BIT));
@@ -1798,9 +1797,9 @@ anv_fast_clear_depth_stencil(struct anv_cmd_buffer *cmd_buffer,
                                  area.offset.x + area.extent.width,
                                  area.offset.y + area.extent.height,
                                  aspects & VK_IMAGE_ASPECT_DEPTH_BIT,
-                                 ANV_HZ_FC_VAL,
+                                 clear_value->depth,
                                  aspects & VK_IMAGE_ASPECT_STENCIL_BIT,
-                                 stencil_value);
+                                 clear_value->stencil);
 
    /* From the SKL PRM, Depth Buffer Clear:
     *
@@ -1905,7 +1904,7 @@ clear_depth_stencil_attachment(struct anv_cmd_buffer *cmd_buffer,
                                    ds_att->iview->planes[0].isl.base_level,
                                    ds_att->iview->planes[0].isl.base_array_layer,
                                    pRects[0].layerCount, pRects->rect,
-                                   attachment->clearValue.depthStencil.stencil);
+                                   &attachment->clearValue.depthStencil);
       return;
    }
 
@@ -2272,7 +2271,7 @@ anv_image_clear_depth_stencil(struct anv_cmd_buffer *cmd_buffer,
                               uint32_t level,
                               uint32_t base_layer, uint32_t layer_count,
                               VkRect2D area,
-                              float depth_value, uint8_t stencil_value)
+                              const VkClearDepthStencilValue *clear_value)
 {
    assert(image->vk.aspects & (VK_IMAGE_ASPECT_DEPTH_BIT |
                                VK_IMAGE_ASPECT_STENCIL_BIT));
@@ -2314,9 +2313,9 @@ anv_image_clear_depth_stencil(struct anv_cmd_buffer *cmd_buffer,
                              area.offset.x + area.extent.width,
                              area.offset.y + area.extent.height,
                              aspects & VK_IMAGE_ASPECT_DEPTH_BIT,
-                             depth_value,
+                             clear_value->depth,
                              (aspects & VK_IMAGE_ASPECT_STENCIL_BIT) ? 0xff : 0,
-                             stencil_value);
+                             clear_value->stencil);
 
    /* Blorp may choose to clear stencil using RGBA32_UINT for better
     * performance.  If it does this, we need to flush it out of the render
@@ -2363,14 +2362,15 @@ anv_image_hiz_clear(struct anv_cmd_buffer *cmd_buffer,
                     VkImageAspectFlags aspects,
                     uint32_t level,
                     uint32_t base_layer, uint32_t layer_count,
-                    VkRect2D area, uint8_t stencil_value)
+                    VkRect2D area,
+                    const VkClearDepthStencilValue *clear_value)
 {
    struct blorp_batch batch;
    anv_blorp_batch_init(cmd_buffer, &batch, 0);
    assert((batch.flags & BLORP_BATCH_USE_COMPUTE) == 0);
 
    anv_fast_clear_depth_stencil(cmd_buffer, &batch, image, aspects, level,
-                                base_layer, layer_count, area, stencil_value);
+                                base_layer, layer_count, area, clear_value);
 
    anv_blorp_batch_finish(&batch);
 }
@@ -2386,8 +2386,7 @@ anv_image_mcs_op(struct anv_cmd_buffer *cmd_buffer,
 {
    struct blorp_batch batch;
    anv_blorp_batch_init(cmd_buffer, &batch,
-                        BLORP_BATCH_PREDICATE_ENABLE * predicate +
-                        BLORP_BATCH_NO_UPDATE_CLEAR_COLOR * !clear_value);
+                        BLORP_BATCH_PREDICATE_ENABLE * predicate);
    assert((batch.flags & BLORP_BATCH_USE_COMPUTE) == 0);
 
    exec_mcs_op(cmd_buffer, &batch, image, format, swizzle, aspect,
@@ -2407,8 +2406,7 @@ anv_image_ccs_op(struct anv_cmd_buffer *cmd_buffer,
 {
    struct blorp_batch batch;
    anv_blorp_batch_init(cmd_buffer, &batch,
-                        BLORP_BATCH_PREDICATE_ENABLE * predicate +
-                        BLORP_BATCH_NO_UPDATE_CLEAR_COLOR * !clear_value);
+                        BLORP_BATCH_PREDICATE_ENABLE * predicate);
    assert((batch.flags & BLORP_BATCH_USE_COMPUTE) == 0);
 
    exec_ccs_op(cmd_buffer, &batch, image, format, swizzle, aspect, level,

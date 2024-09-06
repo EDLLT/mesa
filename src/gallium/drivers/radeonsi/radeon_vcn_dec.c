@@ -1700,7 +1700,7 @@ static struct pb_buffer_lean *rvcn_dec_message_decode(struct radeon_decoder *dec
             align(dec->base.height, dec->db_alignment) * 3 / 2);
 
          dec->dpb_size = calc_dpb_size(dec);
-         r = si_vid_resize_buffer(dec->screen, &dec->cs, &dec->dpb, dec->dpb_size, &buf_offset_info);
+         r = si_vid_resize_buffer(dec->base.context, &dec->cs, &dec->dpb, dec->dpb_size, &buf_offset_info);
          if (!r) {
             RVID_ERR("Can't resize dpb.\n");
             return NULL;
@@ -2503,7 +2503,7 @@ static void radeon_dec_decode_bitstream(struct pipe_video_codec *decoder,
             return;
          }
          si_vid_destroy_buffer(&old_buf);
-      } else if (!si_vid_resize_buffer(dec->screen, &dec->cs, buf, total_bs_size, NULL)) {
+      } else if (!si_vid_resize_buffer(dec->base.context, &dec->cs, buf, total_bs_size, NULL)) {
          RVID_ERR("Can't resize bitstream buffer!");
          return;
       }
@@ -2569,15 +2569,15 @@ void send_cmd_dec(struct radeon_decoder *dec, struct pipe_video_buffer *target,
 /**
  * end decoding of the current frame
  */
-static void radeon_dec_end_frame(struct pipe_video_codec *decoder, struct pipe_video_buffer *target,
-                                 struct pipe_picture_desc *picture)
+static int radeon_dec_end_frame(struct pipe_video_codec *decoder, struct pipe_video_buffer *target,
+                                struct pipe_picture_desc *picture)
 {
    struct radeon_decoder *dec = (struct radeon_decoder *)decoder;
 
    assert(decoder);
 
    if (!dec->bs_ptr)
-      return;
+      return 1;
 
    dec->send_cmd(dec, target, picture);
    flush(dec, picture->flush_flags, picture->fence);
@@ -2585,13 +2585,14 @@ static void radeon_dec_end_frame(struct pipe_video_codec *decoder, struct pipe_v
       dec->ws->fence_reference(dec->ws, &dec->prev_fence, *picture->fence);
 
    next_buffer(dec);
+   return 0;
 }
 
 /**
  * end decoding of the current jpeg frame
  */
-static void radeon_dec_jpeg_end_frame(struct pipe_video_codec *decoder, struct pipe_video_buffer *target,
-                                 struct pipe_picture_desc *picture)
+static int radeon_dec_jpeg_end_frame(struct pipe_video_codec *decoder, struct pipe_video_buffer *target,
+                                     struct pipe_picture_desc *picture)
 {
    struct radeon_decoder *dec = (struct radeon_decoder *)decoder;
    struct pipe_mjpeg_picture_desc *pic = (struct pipe_mjpeg_picture_desc *)picture;
@@ -2599,7 +2600,7 @@ static void radeon_dec_jpeg_end_frame(struct pipe_video_codec *decoder, struct p
    assert(decoder);
 
    if (!dec->bs_ptr)
-      return;
+      return 1;
 
    dec->jpg.crop_x = ROUND_DOWN_TO(pic->picture_parameter.crop_x, VL_MACROBLOCK_WIDTH);
    dec->jpg.crop_y = ROUND_DOWN_TO(pic->picture_parameter.crop_y, VL_MACROBLOCK_HEIGHT);
@@ -2613,6 +2614,7 @@ static void radeon_dec_jpeg_end_frame(struct pipe_video_codec *decoder, struct p
    dec->ws->cs_flush(&dec->jcs[dec->cb_idx], picture->flush_flags, NULL);
    next_buffer(dec);
    dec->cb_idx = (dec->cb_idx+1) % dec->njctx;
+   return 0;
 }
 
 /**

@@ -11,11 +11,11 @@
 #include "asahi/compiler/agx_compile.h"
 #include "asahi/genxml/agx_pack.h"
 #include "asahi/layout/layout.h"
-#include "asahi/lib/agx_formats.h"
 #include "asahi/lib/agx_helpers.h"
 #include "asahi/lib/agx_nir_passes.h"
 #include "asahi/lib/agx_ppp.h"
 #include "asahi/lib/agx_usc.h"
+#include "asahi/lib/shaders/compression.h"
 #include "asahi/lib/shaders/tessellator.h"
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_serialize.h"
@@ -75,27 +75,9 @@ void
 agx_legalize_compression(struct agx_context *ctx, struct agx_resource *rsrc,
                          enum pipe_format format)
 {
-   /* If the resource isn't compressed, we can reinterpret */
-   if (rsrc->layout.tiling != AIL_TILING_TWIDDLED_COMPRESSED)
-      return;
-
-   /* The physical format */
-   enum pipe_format storage = rsrc->layout.format;
-
-   /* If the formats are compatible, we don't have to decompress. Compatible
-    * formats have the same number/size/order of channels, but may differ in
-    * data type. For example, R32_SINT is compatible with Z32_FLOAT, but not
-    * with R16G16_SINT. This is the relation given by the "channels" part of the
-    * decomposed format.
-    *
-    * This has not been exhaustively tested and might be missing some corner
-    * cases around XR formats, but is well-motivated and seems to work.
-    */
-   if (agx_pixel_format[storage].channels == agx_pixel_format[format].channels)
-      return;
-
-   /* Otherwise, decompress. */
-   agx_decompress(ctx, rsrc, "Incompatible formats");
+   if (!ail_is_view_compatible(&rsrc->layout, format)) {
+      agx_decompress(ctx, rsrc, "Incompatible formats");
+   }
 }
 
 static void
@@ -671,7 +653,7 @@ agx_pack_texture(void *out, struct agx_resource *rsrc,
 {
    const struct util_format_description *desc = util_format_description(format);
 
-   assert(agx_is_valid_pixel_format(format));
+   assert(ail_is_valid_pixel_format(format));
 
    uint8_t format_swizzle[4] = {
       desc->swizzle[0],
@@ -707,8 +689,8 @@ agx_pack_texture(void *out, struct agx_resource *rsrc,
       cfg.dimension = agx_translate_tex_dim(state->target,
                                             util_res_sample_count(&rsrc->base));
       cfg.layout = agx_translate_layout(rsrc->layout.tiling);
-      cfg.channels = agx_pixel_format[format].channels;
-      cfg.type = agx_pixel_format[format].type;
+      cfg.channels = ail_pixel_format[format].channels;
+      cfg.type = ail_pixel_format[format].type;
       cfg.swizzle_r = agx_channel_from_pipe(out_swizzle[0]);
       cfg.swizzle_g = agx_channel_from_pipe(out_swizzle[1]);
       cfg.swizzle_b = agx_channel_from_pipe(out_swizzle[2]);
@@ -1199,7 +1181,7 @@ target_is_array(enum pipe_texture_target target)
 static void
 agx_batch_upload_pbe(struct agx_batch *batch, struct agx_pbe_packed *out,
                      struct pipe_image_view *view, bool block_access,
-                     bool arrays_as_2d, bool force_2d_array)
+                     bool arrays_as_2d, bool force_2d_array, bool emrt)
 {
    struct agx_resource *tex = agx_resource(view->resource);
    const struct util_format_description *desc =
@@ -1228,8 +1210,8 @@ agx_batch_upload_pbe(struct agx_batch *batch, struct agx_pbe_packed *out,
       cfg.dimension =
          agx_translate_tex_dim(target, util_res_sample_count(&tex->base));
       cfg.layout = agx_translate_layout(tex->layout.tiling);
-      cfg.channels = agx_pixel_format[view->format].channels;
-      cfg.type = agx_pixel_format[view->format].type;
+      cfg.channels = ail_pixel_format[view->format].channels;
+      cfg.type = ail_pixel_format[view->format].type;
       cfg.srgb = util_format_is_srgb(view->format);
 
       assert(desc->nr_channels >= 1 && desc->nr_channels <= 4);
@@ -1315,7 +1297,7 @@ agx_batch_upload_pbe(struct agx_batch *batch, struct agx_pbe_packed *out,
             cfg.samples = agx_translate_sample_count(tex->base.nr_samples);
       }
 
-      if (ail_is_compressed(&tex->layout)) {
+      if (ail_is_compressed(&tex->layout) && !emrt) {
          cfg.compressed_1 = true;
          cfg.extended = true;
 
@@ -1327,7 +1309,7 @@ agx_batch_upload_pbe(struct agx_batch *batch, struct agx_pbe_packed *out,
       /* When the descriptor isn't extended architecturally, we can use the last
        * 8 bytes as a sideband. We use it to provide metadata for image atomics.
        */
-      if (!cfg.extended && tex->layout.writeable_image &&
+      if (!cfg.extended && (tex->layout.writeable_image || emrt) &&
           tex->base.target != PIPE_BUFFER) {
 
          if (util_res_sample_count(&tex->base) > 1) {
@@ -1341,7 +1323,7 @@ agx_batch_upload_pbe(struct agx_batch *batch, struct agx_pbe_packed *out,
 
          cfg.sample_count_log2_sw = util_logbase2(tex->base.nr_samples);
 
-         if (tex->layout.tiling == AIL_TILING_TWIDDLED) {
+         if (tex->layout.tiling == AIL_TILING_TWIDDLED || emrt) {
             struct ail_tile tile_size = tex->layout.tilesize_el[level];
             cfg.tile_width_sw = tile_size.width_el;
             cfg.tile_height_sw = tile_size.height_el;
@@ -1632,6 +1614,7 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
               _mesa_hash_table_num_entries(so->variants));
 
    struct agx_unlinked_uvs_layout uvs = {0};
+   bool translucent = false;
 
    if (nir->info.stage == MESA_SHADER_VERTEX) {
       struct asahi_vs_shader_key *key = &key_->vs;
@@ -1684,7 +1667,7 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
                                   (2 * BITSET_LAST_BIT(nir->info.images_used));
          unsigned rt_spill = rt_spill_base;
          NIR_PASS(_, nir, agx_nir_lower_tilebuffer, &tib, NULL, &rt_spill, NULL,
-                  NULL);
+                  &translucent);
       }
 
       if (nir->info.fs.uses_sample_shading) {
@@ -1713,6 +1696,7 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
                                  (2 * BITSET_LAST_BIT(nir->info.images_used));
 
       compiled->epilog_key = epilog_key;
+      compiled->b.info.reads_tib |= translucent;
    }
 
    compiled->so = so;
@@ -2605,6 +2589,8 @@ agx_build_meta_shader_internal(struct agx_context *ctx,
                nir_address_format_62bit_generic);
 
       agx_preprocess_nir(b.shader, NULL);
+      NIR_PASS(_, b.shader, agx_nir_lower_texture);
+      NIR_PASS(_, b.shader, agx_nir_lower_multisampled_image_store);
    }
 
    struct agx_compiled_shader *shader = agx_compile_nir(
@@ -2698,7 +2684,7 @@ agx_upload_spilled_rt_descriptors(struct agx_texture_packed *out,
       sampler_view.target = PIPE_TEXTURE_2D_ARRAY;
 
       agx_pack_texture(texture, rsrc, surf->format, &sampler_view);
-      agx_batch_upload_pbe(batch, pbe, &view, false, false, true);
+      agx_batch_upload_pbe(batch, pbe, &view, false, false, true, true);
    }
 }
 
@@ -2778,7 +2764,7 @@ agx_upload_textures(struct agx_batch *batch, struct agx_compiled_shader *cs,
 
       agx_pack_texture(texture, agx_resource(view->resource), view->format,
                        &sampler_view);
-      agx_batch_upload_pbe(batch, pbe, view, false, false, false);
+      agx_batch_upload_pbe(batch, pbe, view, false, false, false, false);
    }
 
    if (stage == PIPE_SHADER_FRAGMENT &&
@@ -2833,16 +2819,7 @@ agx_upload_samplers(struct agx_batch *batch, struct agx_compiled_shader *cs,
       agx_pool_alloc_aligned(&batch->pool, sampler_length * nr_samplers, 64);
 
    /* Sampler #0 is reserved for txf */
-   agx_pack(T.cpu, SAMPLER, cfg) {
-      /* Allow mipmapping. This is respected by txf, weirdly. */
-      cfg.mip_filter = AGX_MIP_FILTER_NEAREST;
-
-      /* Out-of-bounds reads must return 0 */
-      cfg.wrap_s = AGX_WRAP_CLAMP_TO_BORDER;
-      cfg.wrap_t = AGX_WRAP_CLAMP_TO_BORDER;
-      cfg.wrap_r = AGX_WRAP_CLAMP_TO_BORDER;
-      cfg.border_colour = AGX_BORDER_COLOUR_TRANSPARENT_BLACK;
-   }
+   agx_pack_txf_sampler(T.cpu);
 
    /* Remaining samplers are API samplers */
    uint8_t *out_sampler = (uint8_t *)T.cpu + sampler_length;
@@ -3014,28 +2991,8 @@ agx_build_pipeline(struct agx_batch *batch, struct agx_compiled_shader *cs,
 
    if (stage == PIPE_SHADER_FRAGMENT) {
       agx_usc_push_packed(&b, SHARED, &batch->tilebuffer_layout.usc);
-   } else if (stage == PIPE_SHADER_COMPUTE && cs->b.info.imageblock_stride) {
-      assert(cs->b.info.local_size == 0 && "we don't handle this interaction");
-      assert(variable_shared_mem == 0 && "we don't handle this interaction");
-
-      agx_usc_pack(&b, SHARED, cfg) {
-         cfg.layout = AGX_SHARED_LAYOUT_32X32;
-         cfg.uses_shared_memory = true;
-         cfg.sample_count = 1;
-         cfg.sample_stride_in_8_bytes =
-            DIV_ROUND_UP(cs->b.info.imageblock_stride, 8);
-         cfg.bytes_per_threadgroup = cfg.sample_stride_in_8_bytes * 8 * 32 * 32;
-      }
-   } else if (stage == PIPE_SHADER_COMPUTE || stage == PIPE_SHADER_TESS_CTRL) {
-      unsigned size = cs->b.info.local_size + variable_shared_mem;
-
-      agx_usc_pack(&b, SHARED, cfg) {
-         cfg.layout = AGX_SHARED_LAYOUT_VERTEX_COMPUTE;
-         cfg.bytes_per_threadgroup = size > 0 ? size : 65536;
-         cfg.uses_shared_memory = size > 0;
-      }
    } else {
-      agx_usc_shared_none(&b);
+      agx_usc_shared_non_fragment(&b, &cs->b.info, variable_shared_mem);
    }
 
    if (linked) {
@@ -3077,7 +3034,8 @@ agx_build_internal_usc(struct agx_batch *batch, struct agx_compiled_shader *cs,
                        uint64_t data)
 {
    struct agx_device *dev = agx_device(batch->ctx->base.screen);
-   size_t usc_size = agx_usc_size(12);
+   bool needs_sampler = cs->b.info.uses_txf;
+   size_t usc_size = agx_usc_size(12 + (needs_sampler ? 1 : 0));
 
    struct agx_ptr t =
       agx_pool_alloc_aligned(&batch->pipeline_pool, usc_size, 64);
@@ -3086,6 +3044,20 @@ agx_build_internal_usc(struct agx_batch *batch, struct agx_compiled_shader *cs,
 
    agx_usc_uniform(&b, 0, 4, agx_pool_upload(&batch->pool, &data, 8));
    agx_usc_immediates(&b, batch, cs);
+
+   if (needs_sampler) {
+      /* TODO: deduplicate */
+      struct agx_ptr t = agx_pool_alloc_aligned(
+         &batch->pool, sizeof(struct agx_sampler_packed), 64);
+
+      agx_pack_txf_sampler((struct agx_sampler_packed *)t.cpu);
+
+      agx_usc_pack(&b, SAMPLER, cfg) {
+         cfg.start = 0;
+         cfg.count = 1;
+         cfg.buffer = t.gpu;
+      }
+   }
 
    assert(cs->b.info.scratch_size == 0 && "internal kernels don't spill");
    assert(cs->b.info.preamble_scratch_size == 0 && "internal doesn't spill");
@@ -3239,7 +3211,7 @@ agx_build_bg_eot(struct agx_batch *batch, bool store, bool partial_render)
          /* The tilebuffer is already in sRGB space if needed. Do not convert */
          view.format = util_format_linear(view.format);
 
-         agx_batch_upload_pbe(batch, pbe.cpu, &view, true, true, false);
+         agx_batch_upload_pbe(batch, pbe.cpu, &view, true, true, false, false);
 
          agx_usc_pack(&b, TEXTURE, cfg) {
             cfg.start = rt;
@@ -3456,14 +3428,50 @@ agx_batch_init_state(struct agx_batch *batch)
             continue;
 
          struct agx_resource *rsrc = agx_resource(surf->texture);
-         if (rsrc->layout.writeable_image)
+         struct ail_layout *layout = &rsrc->layout;
+         unsigned level = surf->u.tex.level;
+
+         if (!ail_is_level_compressed(layout, level))
             continue;
 
-         /* Decompress if we can and shadow if we can't. */
-         if (rsrc->base.bind & PIPE_BIND_SHARED)
-            unreachable("TODO");
-         else
+         if (true || (rsrc->base.bind & PIPE_BIND_SHARED)) {
+            struct agx_context *ctx = batch->ctx;
+            struct agx_device *dev = agx_device(ctx->base.screen);
+
+            perf_debug(dev, "Decompressing in-place");
+
+            if (!batch->cdm.bo)
+               batch->cdm = agx_encoder_allocate(batch, dev);
+
+            struct agx_ptr data = agx_pool_alloc_aligned(
+               &batch->pool, sizeof(struct libagx_decompress_push), 64);
+            struct libagx_decompress_push *push = data.cpu;
+            agx_fill_decompress_push(push, layout, surf->u.tex.first_layer,
+                                     level, agx_map_texture_gpu(rsrc, 0));
+
+            struct pipe_sampler_view sampler_view =
+               sampler_view_for_surface(surf);
+            sampler_view.target = PIPE_TEXTURE_2D_ARRAY;
+            struct pipe_image_view view = image_view_for_surface(surf);
+            agx_pack_texture(&push->compressed, rsrc, surf->format,
+                             &sampler_view);
+            agx_batch_upload_pbe(batch, &push->uncompressed, &view, false, true,
+                                 true, true);
+
+            struct agx_grid grid = agx_grid_direct(
+               ail_metadata_width_tl(layout, level) * 32,
+               ail_metadata_height_tl(layout, level),
+               surf->u.tex.last_layer - surf->u.tex.first_layer + 1, 32, 1, 1);
+
+            struct agx_decompress_key key = {
+               .nr_samples = layout->sample_count_sa,
+            };
+
+            agx_launch_with_uploaded_data(batch, &grid, agx_nir_decompress,
+                                          &key, sizeof(key), data.gpu);
+         } else {
             agx_decompress(batch->ctx, rsrc, "Render target spilled");
+         }
       }
    }
 

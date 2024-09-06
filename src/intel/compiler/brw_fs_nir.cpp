@@ -28,6 +28,7 @@
 #include "nir.h"
 #include "nir_intrinsics.h"
 #include "nir_search_helpers.h"
+#include "dev/intel_debug.h"
 #include "util/u_math.h"
 #include "util/bitscan.h"
 
@@ -59,6 +60,8 @@ struct nir_to_brw_state {
    struct brw_fs_bind_info *ssa_bind_infos;
    brw_reg *uniform_values;
    brw_reg *system_values;
+
+   bool annotate;
 };
 
 static brw_reg get_nir_src(nir_to_brw_state &ntb, const nir_src &src);
@@ -301,7 +304,7 @@ emit_system_values_block(nir_to_brw_state &ntb, nir_block *block)
          reg = &ntb.system_values[SYSTEM_VALUE_HELPER_INVOCATION];
          if (reg->file == BAD_FILE) {
             const fs_builder abld =
-               ntb.bld.annotate("gl_HelperInvocation", NULL);
+               ntb.bld.annotate("gl_HelperInvocation");
 
             /* On Gfx6+ (gl_HelperInvocation is only exposed on Gfx7+) the
              * pixel mask is in g1.7 of the thread payload.
@@ -938,7 +941,8 @@ fs_nir_emit_alu(nir_to_brw_state &ntb, nir_alu_instr *instr,
       nir_component_mask_t write_mask = get_nir_write_mask(instr->def);
       unsigned last_bit = util_last_bit(write_mask);
 
-      brw_reg comps[last_bit];
+      assert(last_bit <= NIR_MAX_VEC_COMPONENTS);
+      brw_reg comps[NIR_MAX_VEC_COMPONENTS];
 
       for (unsigned i = 0; i < last_bit; i++) {
          if (instr->op == nir_op_mov)
@@ -1812,7 +1816,7 @@ fs_nir_emit_load_const(nir_to_brw_state &ntb,
       brw_type_with_size(BRW_TYPE_D, instr->def.bit_size);
    brw_reg reg = bld.vgrf(reg_type, instr->def.num_components);
 
-   brw_reg comps[instr->def.num_components];
+   brw_reg comps[NIR_MAX_VEC_COMPONENTS];
 
    switch (instr->def.bit_size) {
    case 8:
@@ -2413,9 +2417,10 @@ fs_visitor::emit_gs_control_data_bits(const brw_reg &vertex_count)
 
    /* If there are channel masks, add 3 extra copies of the data. */
    const unsigned length = 1 + 3 * unsigned(channel_mask.file != BAD_FILE);
-   brw_reg sources[length];
+   assert(length <= 4);
+   brw_reg sources[4];
 
-   for (unsigned i = 0; i < ARRAY_SIZE(sources); i++)
+   for (unsigned i = 0; i < length; i++)
       sources[i] = this->control_data_bits;
 
    brw_reg srcs[URB_LOGICAL_NUM_SRCS];
@@ -2462,7 +2467,7 @@ set_gs_stream_control_data_bits(nir_to_brw_state &ntb, const brw_reg &vertex_cou
    if (stream_id == 0)
       return;
 
-   const fs_builder abld = ntb.bld.annotate("set stream control data bits", NULL);
+   const fs_builder abld = ntb.bld.annotate("set stream control data bits");
 
    /* reg::sid = stream_id */
    brw_reg sid = abld.MOV(brw_imm_ud(stream_id));
@@ -2577,6 +2582,17 @@ emit_gs_vertex(nir_to_brw_state &ntb, const nir_src &vertex_count_nir_src,
 }
 
 static void
+brw_combine_with_vec(const fs_builder &bld, const brw_reg &dst,
+                     const brw_reg &src, unsigned n)
+{
+   assert(n <= NIR_MAX_VEC_COMPONENTS);
+   brw_reg comps[NIR_MAX_VEC_COMPONENTS];
+   for (unsigned i = 0; i < n; i++)
+      comps[i] = offset(src, bld, i);
+   bld.VEC(dst, comps, n);
+}
+
+static void
 emit_gs_input_load(nir_to_brw_state &ntb, const brw_reg &dst,
                    const nir_src &vertex_src,
                    unsigned base_offset,
@@ -2600,12 +2616,9 @@ emit_gs_input_load(nir_to_brw_state &ntb, const brw_reg &dst,
       int imm_offset = (base_offset + nir_src_as_uint(offset_src)) * 4 +
                        nir_src_as_uint(vertex_src) * push_reg_count;
 
-      brw_reg comps[num_components];
-      const brw_reg attr = brw_attr_reg(0, dst.type);
-      for (unsigned i = 0; i < num_components; i++) {
-         comps[i] = offset(attr, bld, imm_offset + i + first_component);
-      }
-      bld.VEC(dst, comps, num_components);
+      const brw_reg attr = offset(brw_attr_reg(0, dst.type), bld,
+                                  first_component + imm_offset);
+      brw_combine_with_vec(bld, dst, attr, num_components);
       return;
    }
 
@@ -2695,11 +2708,8 @@ emit_gs_input_load(nir_to_brw_state &ntb, const brw_reg &dst,
                          ARRAY_SIZE(srcs));
          inst->size_written = read_components *
                               tmp.component_size(inst->exec_size);
-         brw_reg comps[num_components];
-         for (unsigned i = 0; i < num_components; i++) {
-            comps[i] = offset(tmp, bld, i + first_component);
-         }
-         bld.VEC(dst, comps, num_components);
+         brw_combine_with_vec(bld, dst, offset(tmp, bld, first_component),
+                              num_components);
       } else {
          inst = bld.emit(SHADER_OPCODE_URB_READ_LOGICAL, dst, srcs,
                          ARRAY_SIZE(srcs));
@@ -2725,11 +2735,8 @@ emit_gs_input_load(nir_to_brw_state &ntb, const brw_reg &dst,
                          srcs, ARRAY_SIZE(srcs));
          inst->size_written = read_components *
                               tmp.component_size(inst->exec_size);
-         brw_reg comps[num_components];
-         for (unsigned i = 0; i < num_components; i++) {
-            comps[i] = offset(tmp, bld, i + first_component);
-         }
-         bld.VEC(dst, comps, num_components);
+         brw_combine_with_vec(bld, dst, offset(tmp, bld, first_component),
+                              num_components);
       } else {
          inst = bld.emit(SHADER_OPCODE_URB_READ_LOGICAL, dst,
                          srcs, ARRAY_SIZE(srcs));
@@ -2787,12 +2794,7 @@ fs_nir_emit_vs_intrinsic(nir_to_brw_state &ntb,
                                 nir_intrinsic_base(instr) * 4 +
                                 nir_intrinsic_component(instr) +
                                 nir_src_as_uint(instr->src[0]));
-
-      brw_reg comps[instr->num_components];
-      for (unsigned i = 0; i < instr->num_components; i++) {
-         comps[i] = offset(src, bld, i);
-      }
-      bld.VEC(dest, comps, instr->num_components);
+      brw_combine_with_vec(bld, dest, src, instr->num_components);
       break;
    }
 
@@ -3085,11 +3087,8 @@ fs_nir_emit_tcs_intrinsic(nir_to_brw_state &ntb,
             brw_reg tmp = bld.vgrf(dst.type, read_components);
             inst = bld.emit(SHADER_OPCODE_URB_READ_LOGICAL, tmp, srcs,
                             ARRAY_SIZE(srcs));
-            brw_reg comps[num_components];
-            for (unsigned i = 0; i < num_components; i++) {
-               comps[i] = offset(tmp, bld, i + first_component);
-            }
-            bld.VEC(dst, comps, num_components);
+            brw_combine_with_vec(bld, dst, offset(tmp, bld, first_component),
+                                 num_components);
          } else {
             inst = bld.emit(SHADER_OPCODE_URB_READ_LOGICAL, dst, srcs,
                             ARRAY_SIZE(srcs));
@@ -3104,11 +3103,8 @@ fs_nir_emit_tcs_intrinsic(nir_to_brw_state &ntb,
             brw_reg tmp = bld.vgrf(dst.type, read_components);
             inst = bld.emit(SHADER_OPCODE_URB_READ_LOGICAL, tmp,
                             srcs, ARRAY_SIZE(srcs));
-            brw_reg comps[num_components];
-            for (unsigned i = 0; i < num_components; i++) {
-               comps[i] = offset(tmp, bld, i + first_component);
-            }
-            bld.VEC(dst, comps, num_components);
+            brw_combine_with_vec(bld, dst, offset(tmp, bld, first_component),
+                                 num_components);
          } else {
             inst = bld.emit(SHADER_OPCODE_URB_READ_LOGICAL, dst,
                             srcs, ARRAY_SIZE(srcs));
@@ -3156,11 +3152,8 @@ fs_nir_emit_tcs_intrinsic(nir_to_brw_state &ntb,
                inst = bld.emit(SHADER_OPCODE_URB_READ_LOGICAL, tmp,
                                srcs, ARRAY_SIZE(srcs));
                inst->size_written = read_components * REG_SIZE * reg_unit(devinfo);
-               brw_reg comps[instr->num_components];
-               for (unsigned i = 0; i < instr->num_components; i++) {
-                  comps[i] = offset(tmp, bld, i + first_component);
-               }
-               bld.VEC(dst, comps, instr->num_components);
+               brw_combine_with_vec(bld, dst, offset(tmp, bld, first_component),
+                                    instr->num_components);
             } else {
                inst = bld.emit(SHADER_OPCODE_URB_READ_LOGICAL, dst,
                                srcs, ARRAY_SIZE(srcs));
@@ -3181,11 +3174,8 @@ fs_nir_emit_tcs_intrinsic(nir_to_brw_state &ntb,
             inst = bld.emit(SHADER_OPCODE_URB_READ_LOGICAL, tmp,
                             srcs, ARRAY_SIZE(srcs));
             inst->size_written = read_components * REG_SIZE * reg_unit(devinfo);
-            brw_reg comps[instr->num_components];
-            for (unsigned i = 0; i < instr->num_components; i++) {
-               comps[i] = offset(tmp, bld, i + first_component);
-            }
-            bld.VEC(dst, comps, instr->num_components);
+            brw_combine_with_vec(bld, dst, offset(tmp, bld, first_component),
+                                 instr->num_components);
          } else {
             inst = bld.emit(SHADER_OPCODE_URB_READ_LOGICAL, dst,
                             srcs, ARRAY_SIZE(srcs));
@@ -3294,7 +3284,7 @@ fs_nir_emit_tes_intrinsic(nir_to_brw_state &ntb,
          if (imm_offset < max_push_slots) {
             const brw_reg src = horiz_offset(brw_attr_reg(0, dest.type),
                                             4 * imm_offset + first_component);
-            brw_reg comps[instr->num_components];
+            brw_reg comps[NIR_MAX_VEC_COMPONENTS];
             for (unsigned i = 0; i < instr->num_components; i++) {
                comps[i] = component(src, i);
             }
@@ -3315,11 +3305,8 @@ fs_nir_emit_tes_intrinsic(nir_to_brw_state &ntb,
                inst = bld.emit(SHADER_OPCODE_URB_READ_LOGICAL, tmp,
                                srcs, ARRAY_SIZE(srcs));
                inst->size_written = read_components * REG_SIZE * reg_unit(devinfo);
-               brw_reg comps[instr->num_components];
-               for (unsigned i = 0; i < instr->num_components; i++) {
-                  comps[i] = offset(tmp, bld, i + first_component);
-               }
-               bld.VEC(dest, comps, instr->num_components);
+               brw_combine_with_vec(bld, dest, offset(tmp, bld, first_component),
+                                    instr->num_components);
             } else {
                inst = bld.emit(SHADER_OPCODE_URB_READ_LOGICAL, dest,
                                srcs, ARRAY_SIZE(srcs));
@@ -3346,11 +3333,8 @@ fs_nir_emit_tes_intrinsic(nir_to_brw_state &ntb,
             brw_reg tmp = bld.vgrf(dest.type, read_components);
             inst = bld.emit(SHADER_OPCODE_URB_READ_LOGICAL, tmp,
                             srcs, ARRAY_SIZE(srcs));
-            brw_reg comps[instr->num_components];
-            for (unsigned i = 0; i < instr->num_components; i++) {
-               comps[i] = offset(tmp, bld, i + first_component);
-            }
-            bld.VEC(dest, comps, instr->num_components);
+            brw_combine_with_vec(bld, dest, offset(tmp, bld, first_component),
+                                 num_components);
          } else {
             inst = bld.emit(SHADER_OPCODE_URB_READ_LOGICAL, dest,
                             srcs, ARRAY_SIZE(srcs));
@@ -3375,7 +3359,6 @@ fs_nir_emit_gs_intrinsic(nir_to_brw_state &ntb,
    fs_visitor &s = ntb.s;
 
    assert(s.stage == MESA_SHADER_GEOMETRY);
-   brw_reg indirect_offset;
 
    brw_reg dest;
    if (nir_intrinsic_infos[instr->intrinsic].has_dest)
@@ -3467,7 +3450,7 @@ fetch_render_target_array_index(const fs_builder &bld)
 
       for (unsigned i = 0; i < v->max_polygons; i++) {
          const fs_builder hbld = bld.group(8, i);
-         const struct brw_reg g1 = brw_uw1_reg(BRW_GENERAL_REGISTER_FILE, 1, 3 + 10 * i);
+         const struct brw_reg g1 = brw_uw1_reg(FIXED_GRF, 1, 3 + 10 * i);
          hbld.AND(offset(idx, hbld, i), g1, brw_imm_uw(0x7ff));
       }
 
@@ -3477,7 +3460,7 @@ fetch_render_target_array_index(const fs_builder &bld)
        * bits 26:16 of r1.1.
        */
       const brw_reg idx = bld.vgrf(BRW_TYPE_UD);
-      bld.AND(idx, brw_uw1_reg(BRW_GENERAL_REGISTER_FILE, 1, 3),
+      bld.AND(idx, brw_uw1_reg(FIXED_GRF, 1, 3),
               brw_imm_uw(0x7ff));
       return idx;
    } else {
@@ -3485,7 +3468,7 @@ fetch_render_target_array_index(const fs_builder &bld)
        * bits 26:16 of r0.0.
        */
       const brw_reg idx = bld.vgrf(BRW_TYPE_UD);
-      bld.AND(idx, brw_uw1_reg(BRW_GENERAL_REGISTER_FILE, 0, 1),
+      bld.AND(idx, brw_uw1_reg(FIXED_GRF, 0, 1),
               brw_imm_uw(0x7ff));
       return idx;
    }
@@ -3524,8 +3507,8 @@ fetch_viewport_index(const fs_builder &bld)
       assert(bld.dispatch_width() == 16);
       const brw_reg idx = bld.vgrf(BRW_TYPE_UD);
       brw_reg vp_idx_per_poly_dw[2] = {
-         brw_ud1_reg(BRW_GENERAL_REGISTER_FILE, 1, 1), /* R1.1 bits 30:27 */
-         brw_ud1_reg(BRW_GENERAL_REGISTER_FILE, 1, 6), /* R1.6 bits 30:27 */
+         brw_ud1_reg(FIXED_GRF, 1, 1), /* R1.1 bits 30:27 */
+         brw_ud1_reg(FIXED_GRF, 1, 6), /* R1.6 bits 30:27 */
       };
 
       for (unsigned i = 0; i < v->max_polygons; i++) {
@@ -3540,7 +3523,7 @@ fetch_viewport_index(const fs_builder &bld)
        */
       const brw_reg idx = bld.vgrf(BRW_TYPE_UD);
       bld.SHR(idx,
-              bld.AND(brw_uw1_reg(BRW_GENERAL_REGISTER_FILE, 1, 3),
+              bld.AND(brw_uw1_reg(FIXED_GRF, 1, 3),
                       brw_imm_uw(0x7800)),
               brw_imm_ud(11));
       return idx;
@@ -3550,7 +3533,7 @@ fetch_viewport_index(const fs_builder &bld)
        */
       const brw_reg idx = bld.vgrf(BRW_TYPE_UD);
       bld.SHR(idx,
-              bld.AND(brw_uw1_reg(BRW_GENERAL_REGISTER_FILE, 0, 1),
+              bld.AND(brw_uw1_reg(FIXED_GRF, 0, 1),
                       brw_imm_uw(0x7800)),
               brw_imm_ud(11));
       return idx;
@@ -4188,15 +4171,11 @@ fs_nir_emit_fs_intrinsic(nir_to_brw_state &ntb,
       const unsigned store_offset = nir_src_as_uint(instr->src[1]);
       const unsigned location = nir_intrinsic_base(instr) +
          SET_FIELD(store_offset, BRW_NIR_FRAG_OUTPUT_LOCATION);
-      const brw_reg new_dest = retype(alloc_frag_output(ntb, location),
-                                     src.type);
+      const brw_reg new_dest =
+         offset(retype(alloc_frag_output(ntb, location), src.type),
+                bld, nir_intrinsic_component(instr));
 
-      brw_reg comps[instr->num_components];
-      for (unsigned i = 0; i < instr->num_components; i++) {
-         comps[i] = offset(src, bld, i);
-      }
-      bld.VEC(offset(new_dest, bld, nir_intrinsic_component(instr)),
-              comps, instr->num_components);
+      brw_combine_with_vec(bld, new_dest, src, instr->num_components);
       break;
    }
 
@@ -4213,11 +4192,9 @@ fs_nir_emit_fs_intrinsic(nir_to_brw_state &ntb,
       else
          emit_non_coherent_fb_read(ntb, bld, tmp, target);
 
-      brw_reg comps[instr->num_components];
-      for (unsigned i = 0; i < instr->num_components; i++) {
-         comps[i] = offset(tmp, bld, i + nir_intrinsic_component(instr));
-      }
-      bld.VEC(dest, comps, instr->num_components);
+      brw_combine_with_vec(bld, dest,
+                           offset(tmp, bld, nir_intrinsic_component(instr)),
+                           instr->num_components);
       break;
    }
 
@@ -5382,7 +5359,7 @@ get_timestamp(const fs_builder &bld)
 {
    fs_visitor &s = *bld.shader;
 
-   brw_reg ts = brw_reg(retype(brw_vec4_reg(BRW_ARCHITECTURE_REGISTER_FILE,
+   brw_reg ts = brw_reg(retype(brw_vec4_reg(ARF,
                                           BRW_ARF_TIMESTAMP, 0), BRW_TYPE_UD));
 
    brw_reg dst = brw_vgrf(s.alloc.allocate(1), BRW_TYPE_UD);
@@ -5507,7 +5484,8 @@ emit_urb_direct_vec4_write_xe2(const fs_builder &bld,
    for (unsigned q = 0; q < bld.dispatch_width() / write_size; q++) {
       fs_builder hbld = bld.group(write_size, q);
 
-      brw_reg payload_srcs[comps];
+      assert(comps <= 4);
+      brw_reg payload_srcs[4];
 
       for (unsigned c = 0; c < comps; c++)
          payload_srcs[c] = horiz_offset(offset(src, bld, c), write_size * q);
@@ -5636,7 +5614,7 @@ emit_urb_indirect_writes_xe2(const fs_builder &bld, nir_intrinsic_instr *instr,
    for (unsigned q = 0; q < bld.dispatch_width() / write_size; q++) {
       fs_builder wbld = bld.group(write_size, q);
 
-      brw_reg payload_srcs[comps];
+      brw_reg payload_srcs[4];
 
       for (unsigned c = 0; c < comps; c++)
          payload_srcs[c] = horiz_offset(offset(src, bld, c), write_size * q);
@@ -6628,16 +6606,8 @@ fs_nir_emit_intrinsic(nir_to_brw_state &ntb,
 
             srcs[SURFACE_LOGICAL_SRC_SURFACE]        = surface;
             srcs[SURFACE_LOGICAL_SRC_SURFACE_HANDLE] = surface_handle;
-
-            const nir_src load_offset = instr->src[1];
-            if (nir_src_is_const(load_offset)) {
-               brw_reg addr =
-                  ubld8.MOV(brw_imm_ud(nir_src_as_uint(load_offset)));
-               srcs[SURFACE_LOGICAL_SRC_ADDRESS] = component(addr, 0);
-            } else {
-               srcs[SURFACE_LOGICAL_SRC_ADDRESS] =
-                  bld.emit_uniformize(get_nir_src(ntb, load_offset));
-            }
+            srcs[SURFACE_LOGICAL_SRC_ADDRESS] =
+               bld.emit_uniformize(get_nir_src(ntb, instr->src[1]));
 
             const unsigned total_dwords =
                ALIGN(instr->num_components, REG_SIZE * reg_unit(devinfo) / 4);
@@ -7033,11 +7003,9 @@ fs_nir_emit_intrinsic(nir_to_brw_state &ntb,
 
       brw_reg new_dest = retype(offset(s.outputs[instr->const_index[0]], bld,
                                       4 * store_offset), src.type);
-      brw_reg comps[num_components];
-      for (unsigned i = 0; i < num_components; i++) {
-         comps[i] = offset(src, bld, i);
-      }
-      bld.VEC(offset(new_dest, bld, first_component), comps, num_components);
+
+      brw_combine_with_vec(bld, offset(new_dest, bld, first_component),
+                           src, num_components);
       break;
    }
 
@@ -8494,7 +8462,7 @@ fs_nir_emit_texture(nir_to_brw_state &ntb,
       /* If mcs is an immediate value, it means there is no MCS.  In that case
        * just return false.
        */
-      if (srcs[TEX_LOGICAL_SRC_MCS].file == BRW_IMMEDIATE_VALUE) {
+      if (srcs[TEX_LOGICAL_SRC_MCS].file == IMM) {
          bld.MOV(dst, brw_imm_ud(0u));
       } else {
          brw_reg tmp =
@@ -8752,7 +8720,12 @@ shuffle_from_32bit_read(const fs_builder &bld,
 static void
 fs_nir_emit_instr(nir_to_brw_state &ntb, nir_instr *instr)
 {
-   ntb.bld = ntb.bld.annotate(NULL, instr);
+#ifndef NDEBUG
+   if (unlikely(ntb.annotate)) {
+      /* Use shader mem_ctx since annotations outlive the NIR conversion. */
+      ntb.bld = ntb.bld.annotate(nir_instr_as_str(instr, ntb.s.mem_ctx));
+   }
+#endif
 
    switch (instr->type) {
    case nir_instr_type_alu:
@@ -8939,6 +8912,9 @@ nir_to_brw(fs_visitor *s)
       .mem_ctx = ralloc_context(NULL),
       .bld     = fs_builder(s).at_end(),
    };
+
+   if (INTEL_DEBUG(DEBUG_ANNOTATION))
+      ntb.annotate = true;
 
    if (ENABLE_FS_TEST_DISPATCH_PACKING)
       brw_fs_test_dispatch_packing(ntb.bld);

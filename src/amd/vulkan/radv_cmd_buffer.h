@@ -75,7 +75,8 @@ enum radv_dynamic_state_bits {
    RADV_DYNAMIC_SAMPLE_LOCATIONS_ENABLE = 1ull << 49,
    RADV_DYNAMIC_ALPHA_TO_ONE_ENABLE = 1ull << 50,
    RADV_DYNAMIC_COLOR_ATTACHMENT_MAP = 1ull << 51,
-   RADV_DYNAMIC_ALL = (1ull << 52) - 1,
+   RADV_DYNAMIC_INPUT_ATTACHMENT_MAP = 1ull << 52,
+   RADV_DYNAMIC_ALL = (1ull << 53) - 1,
 };
 
 enum radv_cmd_dirty_bits {
@@ -92,7 +93,8 @@ enum radv_cmd_dirty_bits {
    RADV_CMD_DIRTY_STREAMOUT_ENABLE = 1ull << 10,
    RADV_CMD_DIRTY_GRAPHICS_SHADERS = 1ull << 11,
    RADV_CMD_DIRTY_COLOR_OUTPUT = 1ull << 12,
-   RADV_CMD_DIRTY_ALL = (1ull << 13) - 1,
+   RADV_CMD_DIRTY_FBFETCH_OUTPUT = 1ull << 13,
+   RADV_CMD_DIRTY_ALL = (1ull << 14) - 1,
 };
 
 enum radv_cmd_flush_bits {
@@ -183,6 +185,7 @@ struct radv_attachment {
 struct radv_rendering_state {
    bool active;
    bool has_image_views;
+   bool has_input_attachment_no_concurrent_writes;
    VkRect2D area;
    uint32_t layer_count;
    uint32_t view_mask;
@@ -326,7 +329,7 @@ struct radv_cmd_state {
    struct radv_compute_pipeline *emitted_compute_pipeline;
    struct radv_ray_tracing_pipeline *rt_pipeline; /* emitted = emitted_compute_pipeline */
    struct radv_dynamic_state dynamic;
-   struct radv_vs_input_state dynamic_vs_input;
+   struct radv_vertex_input_state vertex_input;
    struct radv_streamout_state streamout;
 
    struct radv_rendering_state render;
@@ -445,7 +448,7 @@ struct radv_cmd_state {
    bool uses_vrs_attachment;
    bool uses_vrs_coarse_shading;
    bool uses_dynamic_patch_control_points;
-   bool uses_dynamic_vertex_binding_stride;
+   bool uses_fbfetch_output;
 };
 
 struct radv_enc_state {
@@ -701,8 +704,7 @@ void radv_update_color_clear_metadata(struct radv_cmd_buffer *cmd_buffer, const 
 
 unsigned radv_instance_rate_prolog_index(unsigned num_attributes, uint32_t instance_rate_inputs);
 
-void radv_write_vertex_descriptors(const struct radv_cmd_buffer *cmd_buffer,
-                                   const struct radv_graphics_pipeline *pipeline, bool full_null_descriptors,
+void radv_write_vertex_descriptors(const struct radv_cmd_buffer *cmd_buffer, const struct radv_shader *vs,
                                    void *vb_ptr);
 
 enum radv_cmd_flush_bits radv_src_access_flush(struct radv_cmd_buffer *cmd_buffer, VkPipelineStageFlags2 src_stages,
@@ -781,5 +783,8 @@ void radv_begin_conditional_rendering(struct radv_cmd_buffer *cmd_buffer, uint64
 void radv_end_conditional_rendering(struct radv_cmd_buffer *cmd_buffer);
 
 uint64_t radv_descriptor_get_va(const struct radv_descriptor_state *descriptors_state, unsigned set_idx);
+
+uint32_t radv_get_rsrc3_vbo_desc(const struct radv_cmd_buffer *cmd_buffer, const struct radv_shader *vs,
+                                 uint32_t vbo_idx);
 
 #endif /* RADV_CMD_BUFFER_H */

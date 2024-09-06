@@ -21,22 +21,40 @@ brw_print_instructions_to_file(const fs_visitor &s, FILE *file)
 
       unsigned ip = 0, max_pressure = 0;
       unsigned cf_count = 0;
-      foreach_block_and_inst(block, fs_inst, inst, s.cfg) {
-         if (inst->is_control_flow_end())
-            cf_count -= 1;
+      foreach_block(block, s.cfg) {
+         fprintf(file, "START B%d", block->num);
+         foreach_list_typed(bblock_link, link, link, &block->parents) {
+            fprintf(file, " <%cB%d",
+                    link->kind == bblock_link_logical ? '-' : '~',
+                    link->block->num);
+         }
+         fprintf(file, "\n");
 
-         if (rp) {
-            max_pressure = MAX2(max_pressure, rp->regs_live_at_ip[ip]);
-            fprintf(file, "{%3d} ", rp->regs_live_at_ip[ip]);
+         foreach_inst_in_block(fs_inst, inst, block) {
+            if (inst->is_control_flow_end())
+               cf_count -= 1;
+
+            if (rp) {
+               max_pressure = MAX2(max_pressure, rp->regs_live_at_ip[ip]);
+               fprintf(file, "{%3d} ", rp->regs_live_at_ip[ip]);
+            }
+
+            for (unsigned i = 0; i < cf_count; i++)
+               fprintf(file, "  ");
+            brw_print_instruction(s, inst, file, &defs);
+            ip++;
+
+            if (inst->is_control_flow_begin())
+               cf_count += 1;
          }
 
-         for (unsigned i = 0; i < cf_count; i++)
-            fprintf(file, "  ");
-         brw_print_instruction(s, inst, file, &defs);
-         ip++;
-
-         if (inst->is_control_flow_begin())
-            cf_count += 1;
+         fprintf(file, "END B%d", block->num);
+         foreach_list_typed(bblock_link, link, link, &block->children) {
+            fprintf(file, " %c>B%d",
+                    link->kind == bblock_link_logical ? '-' : '~',
+                    link->block->num);
+         }
+         fprintf(file, "\n");
       }
       if (rp)
          fprintf(file, "Maximum %3d registers live at once.\n", max_pressure);
@@ -400,7 +418,7 @@ brw_print_instruction_to_file(const fs_visitor &s, const fs_inst *inst, FILE *fi
    }
 
    if (inst->dst.offset ||
-       (inst->dst.file == VGRF &&
+       (!s.grf_used && inst->dst.file == VGRF &&
         s.alloc.sizes[inst->dst.nr] * REG_SIZE != inst->size_written)) {
       const unsigned reg_size = (inst->dst.file == UNIFORM ? 4 : REG_SIZE);
       fprintf(file, "+%d.%d", inst->dst.offset / reg_size,
@@ -513,7 +531,7 @@ brw_print_instruction_to_file(const fs_visitor &s, const fs_inst *inst, FILE *fi
 
          fprintf(file, ".%d", inst->src[i].subnr / brw_type_size_bytes(inst->src[i].type));
       } else if (inst->src[i].offset ||
-          (inst->src[i].file == VGRF &&
+          (!s.grf_used && inst->src[i].file == VGRF &&
            s.alloc.sizes[inst->src[i].nr] * REG_SIZE != inst->size_read(i))) {
          const unsigned reg_size = (inst->src[i].file == UNIFORM ? 4 : REG_SIZE);
          fprintf(file, "+%d.%d", inst->src[i].offset / reg_size,

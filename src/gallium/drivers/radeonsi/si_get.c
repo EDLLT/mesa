@@ -17,12 +17,6 @@
 #include "vl/vl_video_buffer.h"
 #include <sys/utsname.h>
 
-#if LLVM_AVAILABLE
-#include <llvm/Config/llvm-config.h> /* for LLVM_VERSION_MAJOR */
-#else
-#define LLVM_VERSION_MAJOR 0
-#endif
-
 /* The capabilities reported by the kernel has priority
    over the existing logic in si_get_video_param */
 #define QUERYABLE_KERNEL   (sscreen->info.is_amdgpu && \
@@ -420,6 +414,15 @@ static int si_get_param(struct pipe_screen *pscreen, enum pipe_cap param)
       /* Conversion to nanos from cycles per millisecond */
       return DIV_ROUND_UP(1000000, sscreen->info.clock_crystal_freq);
 
+   case PIPE_CAP_SHADER_SUBGROUP_SIZE:
+      return 64;
+   case PIPE_CAP_SHADER_SUBGROUP_SUPPORTED_STAGES:
+      return BITFIELD_MASK(PIPE_SHADER_TYPES);
+   case PIPE_CAP_SHADER_SUBGROUP_SUPPORTED_FEATURES:
+      return BITFIELD_MASK(PIPE_SHADER_SUBGROUP_NUM_FEATURES);
+   case PIPE_CAP_SHADER_SUBGROUP_QUAD_ALL_STAGES:
+      return true;
+
    default:
       return u_pipe_screen_get_param_defaults(pscreen, param);
    }
@@ -728,8 +731,12 @@ static int si_get_video_param(struct pipe_screen *screen, enum pipe_video_profil
             pipe_features.bits.constrained_intra_pred = PIPE_ENC_FEATURE_SUPPORTED;
             pipe_features.bits.deblocking_filter_disable
                                                       = PIPE_ENC_FEATURE_SUPPORTED;
-            if (sscreen->info.vcn_ip_version >= VCN_2_0_0)
+            if (sscreen->info.vcn_ip_version >= VCN_2_0_0) {
                pipe_features.bits.sao = PIPE_ENC_FEATURE_SUPPORTED;
+               pipe_features.bits.cu_qp_delta = PIPE_ENC_FEATURE_SUPPORTED;
+            }
+            if (sscreen->info.vcn_ip_version >= VCN_3_0_0)
+               pipe_features.bits.transform_skip = PIPE_ENC_FEATURE_SUPPORTED;
 
             return pipe_features.value;
          } else
@@ -1690,23 +1697,4 @@ void si_init_screen_get_functions(struct si_screen *sscreen)
    options->support_indirect_outputs = BITFIELD_BIT(MESA_SHADER_TESS_CTRL);
    options->varying_expression_max_cost = si_varying_expression_max_cost;
    options->varying_estimate_instr_cost = si_varying_estimate_instr_cost;
-
-   nir_lower_subgroups_options *lower_subgroups_options = sscreen->nir_lower_subgroups_options;
-   lower_subgroups_options->subgroup_size = 64;
-   lower_subgroups_options->ballot_bit_size = 64;
-   lower_subgroups_options->ballot_components = 1;
-   lower_subgroups_options->lower_to_scalar = true;
-   lower_subgroups_options->lower_subgroup_masks = true;
-   lower_subgroups_options->lower_relative_shuffle = true;
-   lower_subgroups_options->lower_rotate_to_shuffle = !sscreen->use_aco;
-   lower_subgroups_options->lower_shuffle_to_32bit = true;
-   lower_subgroups_options->lower_vote_eq = true;
-   lower_subgroups_options->lower_vote_bool_eq = true;
-   lower_subgroups_options->lower_quad_broadcast_dynamic = true;
-   lower_subgroups_options->lower_quad_broadcast_dynamic_to_const = sscreen->info.gfx_level <= GFX7;
-   lower_subgroups_options->lower_shuffle_to_swizzle_amd = true;
-   lower_subgroups_options->lower_ballot_bit_count_to_mbcnt_amd = true;
-   lower_subgroups_options->lower_inverse_ballot = !sscreen->use_aco && LLVM_VERSION_MAJOR < 17;
-   lower_subgroups_options->lower_boolean_reduce = true;
-   lower_subgroups_options->lower_boolean_shuffle = true;
 }

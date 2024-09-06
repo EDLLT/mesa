@@ -1172,6 +1172,18 @@ blorp_emit_surface_state(struct blorp_batch *batch,
    const bool use_clear_address =
       GFX_VER >= 10 && (surface->clear_color_addr.buffer != NULL);
 
+   /* On gfx12 (and optionally on gfx11), hardware will read and write to the
+    * clear color address, converting the raw clear color channels to a pixel
+    * during a fast-clear. To avoid the restrictions associated with the
+    * hardware feature, we instead write a software-converted pixel ourselves.
+    * If we're performing a fast-clear, provide a substitute address to avoid
+    * a collision with hardware. Outside of gfx11 and gfx12, indirect clear
+    * color BOs are not used during fast-clears.
+    */
+   const struct blorp_address op_clear_addr =
+      aux_op == ISL_AUX_OP_FAST_CLEAR ? blorp_get_workaround_address(batch) :
+                                        surface->clear_color_addr;
+
    isl_surf_fill_state(batch->blorp->isl_dev, state,
                        .surf = &surf, .view = &surface->view,
                        .aux_surf = &surface->aux_surf, .aux_usage = aux_usage,
@@ -1180,8 +1192,7 @@ blorp_emit_surface_state(struct blorp_batch *batch,
                        .aux_address = !use_aux_address ? 0 :
                           blorp_get_surface_address(batch, surface->aux_addr),
                        .clear_address = !use_clear_address ? 0 :
-                          blorp_get_surface_address(batch,
-                                                    surface->clear_color_addr),
+                          blorp_get_surface_address(batch, op_clear_addr),
                        .mocs = surface->addr.mocs,
                        .clear_color = surface->clear_color,
                        .use_clear_address = use_clear_address);
@@ -1206,7 +1217,7 @@ blorp_emit_surface_state(struct blorp_batch *batch,
       uint32_t *clear_addr = state + isl_dev->ss.clear_color_state_offset;
       blorp_surface_reloc(batch, state_offset +
                           isl_dev->ss.clear_color_state_offset,
-                          surface->clear_color_addr, *clear_addr);
+                          op_clear_addr, *clear_addr);
 #else
       /* Fast clears just whack the AUX surface and don't actually use the
        * clear color for anything.  We can avoid the MI memcpy on that case.
@@ -1426,13 +1437,10 @@ blorp_emit_gfx8_hiz_op(struct blorp_batch *batch,
     *    (inclusive) defined in the CC_VIEWPORT. If the depth buffer format is
     *    D32_FLOAT, then +/-DENORM values are also allowed.
     *
-    * Set the bounds to match our hardware limits, [0.0, 1.0].
+    * Set the bounds to match our hardware limits.
     */
-   if (params->depth.enabled && params->hiz_op == ISL_AUX_OP_FAST_CLEAR) {
-      assert(params->depth.clear_color.f32[0] >= 0.0f);
-      assert(params->depth.clear_color.f32[0] <= 1.0f);
+   if (params->depth.enabled && params->hiz_op == ISL_AUX_OP_FAST_CLEAR)
       blorp_emit_cc_viewport(batch);
-   }
 
    /* According to the SKL PRM formula for WM_INT::ThreadDispatchEnable, the
     * 3DSTATE_WM::ForceThreadDispatchEnable field can force WM thread dispatch
@@ -1465,6 +1473,16 @@ blorp_emit_gfx8_hiz_op(struct blorp_batch *batch,
          hzp.FullSurfaceDepthandStencilClear = params->full_surface_hiz_op;
 #if GFX_VER >= 20
          hzp.DepthClearValue = params->depth.clear_color.f32[0];
+
+         /* From the Xe2 Bspec 56437 (r61349):
+          *
+          *    The Depth Clear value cannot be a NAN (Not-A-Number) if the
+          *    depth format is Float32.
+          *
+          * We're not required to support NaN in APIs, so flush to zero.
+          */
+         if (util_is_nan(hzp.DepthClearValue))
+            hzp.DepthClearValue = 0;
 #endif
          break;
       case ISL_AUX_OP_FULL_RESOLVE:
@@ -1508,58 +1526,6 @@ blorp_emit_gfx8_hiz_op(struct blorp_batch *batch,
    blorp_measure_end(batch, params);
 }
 
-static void
-blorp_update_clear_color(UNUSED struct blorp_batch *batch,
-                         const struct blorp_surface_info *info)
-{
-   assert(info->clear_color_addr.buffer != NULL);
-#if GFX_VER == 11
-   /* 2 QWORDS */
-   const unsigned inlinedata_dw = 2 * 2;
-   const unsigned num_dwords = GENX(MI_ATOMIC_length) + inlinedata_dw;
-
-   struct blorp_address clear_addr = info->clear_color_addr;
-   uint32_t *dw = blorp_emitn(batch, GENX(MI_ATOMIC), num_dwords,
-                              .DataSize = MI_ATOMIC_QWORD,
-                              .ATOMICOPCODE = MI_ATOMIC_OP_MOVE8B,
-                              .InlineData = true,
-                              .MemoryAddress = clear_addr);
-   /* dw starts at dword 1, but we need to fill dwords 3 and 5 */
-   dw[2] = info->clear_color.u32[0];
-   dw[3] = 0;
-   dw[4] = info->clear_color.u32[1];
-   dw[5] = 0;
-
-   clear_addr.offset += 8;
-   dw = blorp_emitn(batch, GENX(MI_ATOMIC), num_dwords,
-                    .DataSize = MI_ATOMIC_QWORD,
-                    .ATOMICOPCODE = MI_ATOMIC_OP_MOVE8B,
-                    .CSSTALL = true,
-                    .ReturnDataControl = true,
-                    .InlineData = true,
-                    .MemoryAddress = clear_addr);
-   /* dw starts at dword 1, but we need to fill dwords 3 and 5 */
-   dw[2] = info->clear_color.u32[2];
-   dw[3] = 0;
-   dw[4] = info->clear_color.u32[3];
-   dw[5] = 0;
-
-#else
-
-   for (int i = 0; i < 4; i++) {
-      blorp_emit(batch, GENX(MI_STORE_DATA_IMM), sdi) {
-         sdi.Address = info->clear_color_addr;
-         sdi.Address.offset += i * 4;
-         sdi.ImmediateData = info->clear_color.u32[i];
-#if GFX_VER >= 12
-         if (i == 3)
-            sdi.ForceWriteCompletionCheck = true;
-#endif
-      }
-   }
-#endif
-}
-
 static bool
 blorp_uses_bti_rt_writes(const struct blorp_batch *batch, const struct blorp_params *params)
 {
@@ -1573,12 +1539,6 @@ blorp_uses_bti_rt_writes(const struct blorp_batch *batch, const struct blorp_par
 static void
 blorp_exec_3d(struct blorp_batch *batch, const struct blorp_params *params)
 {
-   if (!(batch->flags & BLORP_BATCH_NO_UPDATE_CLEAR_COLOR) &&
-       params->fast_clear_op == ISL_AUX_OP_FAST_CLEAR &&
-       params->dst.clear_color_addr.buffer != NULL) {
-      blorp_update_clear_color(batch, &params->dst);
-   }
-
    if (params->hiz_op != ISL_AUX_OP_NONE) {
       blorp_emit_gfx8_hiz_op(batch, params);
       return;
@@ -1672,7 +1632,6 @@ blorp_get_compute_push_const(struct blorp_batch *batch,
 static void
 blorp_exec_compute(struct blorp_batch *batch, const struct blorp_params *params)
 {
-   assert(!(batch->flags & BLORP_BATCH_NO_UPDATE_CLEAR_COLOR));
    assert(!(batch->flags & BLORP_BATCH_PREDICATE_ENABLE));
    assert(params->hiz_op == ISL_AUX_OP_NONE);
 
@@ -1942,7 +1901,6 @@ blorp_xy_block_copy_blt(struct blorp_batch *batch,
    UNUSED const struct isl_device *isl_dev = batch->blorp->isl_dev;
 
    assert(batch->flags & BLORP_BATCH_USE_BLITTER);
-   assert(!(batch->flags & BLORP_BATCH_NO_UPDATE_CLEAR_COLOR));
    assert(!(batch->flags & BLORP_BATCH_PREDICATE_ENABLE));
    assert(params->hiz_op == ISL_AUX_OP_NONE);
 
@@ -2096,7 +2054,6 @@ blorp_xy_fast_color_blit(struct blorp_batch *batch,
       isl_format_get_layout(params->dst.view.format);
 
    assert(batch->flags & BLORP_BATCH_USE_BLITTER);
-   assert(!(batch->flags & BLORP_BATCH_NO_UPDATE_CLEAR_COLOR));
    assert(!(batch->flags & BLORP_BATCH_PREDICATE_ENABLE));
    assert(params->hiz_op == ISL_AUX_OP_NONE);
 

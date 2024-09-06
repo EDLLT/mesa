@@ -391,6 +391,21 @@ fedora/x86_64_build:
   needs:
     - fedora/x86_64_build
 
+# Get firmware directly rather than using package versions.
+# Change KERNEL_ROOTFS_TAG to add firmware changes.
+# FIRMWARE_FILES is a list of json files arranged by vendor in src/**/ci/
+.firmware_x86_64:
+  variables:
+    FIRMWARE_FILES: |
+      .gitlab-ci/firmware/i915/mtl-fw.json
+
+.firmware_arm64:
+  variables:
+    FIRMWARE_FILES: |
+
+.firmware_arm32:
+  variables:
+    FIRMWARE_FILES: |
 
 .kernel+rootfs:
   extends:
@@ -409,6 +424,7 @@ kernel+rootfs_x86_64:
   extends:
     - .use-debian/x86_64_build-base
     - .kernel+rootfs
+    - .firmware_x86_64
   image: "$FDO_BASE_IMAGE"
   variables:
     DEBIAN_ARCH: "amd64"
@@ -418,6 +434,7 @@ kernel+rootfs_arm64:
   extends:
     - .use-debian/arm64_build
     - .kernel+rootfs
+    - .firmware_arm64
   tags:
     - aarch64
   variables:
@@ -426,6 +443,7 @@ kernel+rootfs_arm64:
 kernel+rootfs_arm32:
   extends:
     - kernel+rootfs_arm64
+    - .firmware_arm32
   variables:
     DEBIAN_ARCH: "armhf"
 

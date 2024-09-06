@@ -59,6 +59,7 @@ with_glx_direct = get_option('glx-direct')
 with_osmesa = get_option('osmesa')
 with_vulkan_overlay_layer = get_option('vulkan-layers').contains('overlay')
 with_vulkan_device_select_layer = get_option('vulkan-layers').contains('device-select')
+with_vulkan_screenshot_layer = get_option('vulkan-layers').contains('screenshot')
 with_tools = get_option('tools')
 if with_tools.contains('all')
   with_tools = [
@@ -263,6 +264,7 @@ if with_any_vk and host_machine.system() == 'windows' and meson.version().versio
 endif
 
 with_any_llvmpipe = with_gallium_llvmpipe or with_swrast_vk
+with_gallium_or_lvp = with_gallium or with_swrast_vk
 
 freedreno_kmds = get_option('freedreno-kmds')
 if freedreno_kmds.length() != 0 and freedreno_kmds != [ 'msm' ] and with_freedreno_vk
@@ -571,21 +573,13 @@ if with_vulkan_icd_dir == ''
 endif
 
 with_dri2 = (with_dri or with_any_vk) and (with_dri_platform == 'drm' or with_dri_platform == 'apple')
-with_dri3 = get_option('dri3').disable_auto_if(not (system_has_kms_drm and with_dri2)).allowed()
 
 with_x11_dri2 = with_dri2 and get_option('legacy-x11').contains('dri2')
 
-if with_any_vk and (with_platform_x11 and not with_dri3)
-  error('Vulkan drivers require dri3 for X11 support')
-endif
 if with_dri
   if with_glx == 'disabled' and not with_egl and not with_gbm
     error('building dri drivers require at least one windowing system')
   endif
-endif
-
-if with_gallium_kmsro and (with_platform_x11 and not with_dri3)
-  error('kmsro requires dri3 for X11 support')
 endif
 
 dep_dxheaders = null_dep
@@ -790,9 +784,6 @@ if with_gallium_st_nine
              with_gallium_zink,
            ].contains(true)
     error('The nine state tracker requires at least one non-swrast gallium driver.')
-  endif
-  if not with_dri3
-    error('Using nine with wine requires dri3')
   endif
 endif
 with_gallium_st_d3d10umd =  get_option('gallium-d3d10umd')
@@ -1754,7 +1745,7 @@ with_gallium_drisw_kms = false
 if system_has_kms_drm
   dep_libdrm = dependency(
     'libdrm', version : '>=' + _drm_ver,
-    required : with_dri2 or with_dri3
+    required : with_dri2 or with_dri
   )
 else
   # We should prevent libdrm from being available when the target doesn't have it to avoid transitive
@@ -1886,7 +1877,7 @@ elif with_amd_vk and with_aco_tests
   error('ACO tests require LLVM, but LLVM is disabled.')
 elif with_swrast_vk
   error('lavapipe requires LLVM and is enabled, but LLVM is disabled.')
-elif with_gallium_llvmpipe
+elif with_any_llvmpipe
   error('llvmpipe requires LLVM and is enabled, but LLVM is disabled.')
 elif with_gallium_clover
   error('The OpenCL "Clover" state tracker requires LLVM, but LLVM is disabled.')
@@ -1923,12 +1914,19 @@ if with_clover_spirv or with_clc
     '>= @0@.@1@'.format(chosen_llvm_version_major, chosen_llvm_version_minor),
     '< @0@.@1@'.format(chosen_llvm_version_major, chosen_llvm_version_minor + 1) ]
 
-  dep_spirv_tools = dependency('SPIRV-Tools', required : true, version : '>= 2018.0')
   # LLVMSPIRVLib is available at https://github.com/KhronosGroup/SPIRV-LLVM-Translator
   dep_llvmspirvlib = dependency('LLVMSPIRVLib', required : true, version : _llvmspirvlib_version)
 else
-  dep_spirv_tools = null_dep
   dep_llvmspirvlib = null_dep
+endif
+
+dep_spirv_tools = dependency(
+  'SPIRV-Tools',
+  required : with_clover_spirv or with_clc,
+  version : '>= 2018.0'
+)
+if dep_spirv_tools.found()
+  pre_args += '-DHAVE_SPIRV_TOOLS'
 endif
 
 dep_clang = null_dep
@@ -2188,25 +2186,24 @@ if with_platform_x11
       error('libdrm required for gallium video statetrackers when using x11')
     endif
   endif
-  if with_any_vk or with_egl or (with_glx == 'dri' and with_dri_platform == 'drm')
+  if with_dri_platform == 'drm'
     dep_xcb_dri2 = dependency('xcb-dri2', version : '>= 1.8', required : with_x11_dri2)
 
-    if with_dri3
-      dep_xcb_dri3 = dependency('xcb-dri3')
-      dep_xcb_present = dependency('xcb-present')
-      # until xcb-dri3 has been around long enough to make a hard-dependency:
-      if (dep_xcb_dri3.version().version_compare('>= 1.13') and
-          dep_xcb_present.version().version_compare('>= 1.13'))
-        with_dri3_modifiers = true
-      endif
-      if (dep_xcb_dri3.version().version_compare('>= 1.17') and
-          dep_xcb_present.version().version_compare('>= 1.17'))
-        with_dri3_explicit_sync = true
-      endif
-      dep_xcb_shm = dependency('xcb-shm')
-      dep_xcb_sync = dependency('xcb-sync')
-      dep_xshmfence = dependency('xshmfence', version : '>= 1.1')
+    dep_xcb_dri3 = dependency('xcb-dri3')
+    dep_xcb_present = dependency('xcb-present')
+    # until xcb-dri3 has been around long enough to make a hard-dependency:
+    if (dep_xcb_dri3.version().version_compare('>= 1.13') and
+        dep_xcb_present.version().version_compare('>= 1.13'))
+      with_dri3_modifiers = true
     endif
+    if (dep_xcb_dri3.version().version_compare('>= 1.17') and
+        dep_xcb_present.version().version_compare('>= 1.17'))
+      with_dri3_explicit_sync = true
+    endif
+    dep_xcb_shm = dependency('xcb-shm')
+    dep_xcb_sync = dependency('xcb-sync')
+    dep_xshmfence = dependency('xshmfence', version : '>= 1.1')
+    pre_args += '-DHAVE_X11_DRM'
   endif
   if with_glx == 'dri' or with_glx == 'xlib'
     dep_glproto = dependency('glproto', version : '>= 1.4.14')
@@ -2220,9 +2217,9 @@ if with_platform_x11
     endif
   endif
   if (with_egl or
-      with_dri3 or (
+      with_any_vk or
       with_gallium_vdpau or with_gallium_xa or
-      with_gallium_omx != 'disabled'))
+      with_gallium_omx != 'disabled')
     dep_xcb_xfixes = dependency('xcb-xfixes')
   endif
   if with_xlib_lease or with_any_vk
@@ -2241,9 +2238,6 @@ if with_dri2
 endif
 if with_x11_dri2
   pre_args += '-DHAVE_X11_DRI2'
-endif
-if with_dri3
-  pre_args += '-DHAVE_DRI3'
 endif
 if with_dri3_modifiers
   pre_args += '-DHAVE_DRI3_MODIFIERS'
@@ -2417,7 +2411,7 @@ if with_egl
   if with_dri
     egl_drivers += 'builtin:egl_dri2'
   endif
-  if with_dri3
+  if with_dri_platform == 'drm'
     egl_drivers += 'builtin:egl_dri3'
   endif
   if with_platform_windows

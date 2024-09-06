@@ -26,6 +26,7 @@
 #include "drm-uapi/panthor_drm.h"
 
 #include "genxml/cs_builder.h"
+#include "panfrost/lib/genxml/cs_builder.h"
 
 #include "pan_blitter.h"
 #include "pan_cmdstream.h"
@@ -717,15 +718,14 @@ csf_get_tiler_desc(struct panfrost_batch *batch)
    return batch->tiler_ctx.bifrost;
 }
 
-void
-GENX(csf_launch_draw)(struct panfrost_batch *batch,
-                      const struct pipe_draw_info *info, unsigned drawid_offset,
-                      const struct pipe_draw_start_count_bias *draw,
-                      unsigned vertex_count)
+static uint32_t
+csf_emit_draw_state(struct panfrost_batch *batch,
+                    const struct pipe_draw_info *info, unsigned drawid_offset)
 {
    struct panfrost_context *ctx = batch->ctx;
    struct panfrost_compiled_shader *vs = ctx->prog[PIPE_SHADER_VERTEX];
    struct panfrost_compiled_shader *fs = ctx->prog[PIPE_SHADER_FRAGMENT];
+
    bool idvs = vs->info.vs.idvs;
    bool fs_required = panfrost_fs_required(
       fs, ctx->blend, &ctx->pipe_framebuffer, ctx->depth_stencil);
@@ -757,20 +757,6 @@ GENX(csf_launch_draw)(struct panfrost_batch *batch,
    cs_move64_to(b, cs_reg64(b, 24), batch->tls.gpu);
    cs_move64_to(b, cs_reg64(b, 30), batch->tls.gpu);
    cs_move32_to(b, cs_reg32(b, 32), 0);
-   cs_move32_to(b, cs_reg32(b, 33), draw->count);
-   cs_move32_to(b, cs_reg32(b, 34), info->instance_count);
-   cs_move32_to(b, cs_reg32(b, 35), 0);
-
-   /* Base vertex offset on Valhall is used for both indexed and
-    * non-indexed draws, in a simple way for either. Handle both cases.
-    */
-   if (info->index_size) {
-      cs_move32_to(b, cs_reg32(b, 36), draw->index_bias);
-      cs_move32_to(b, cs_reg32(b, 39), info->index_size * draw->count);
-   } else {
-      cs_move32_to(b, cs_reg32(b, 36), draw->start);
-      cs_move32_to(b, cs_reg32(b, 39), 0);
-   }
    cs_move32_to(b, cs_reg32(b, 37), 0);
    cs_move32_to(b, cs_reg32(b, 38), 0);
 
@@ -936,10 +922,99 @@ GENX(csf_launch_draw)(struct panfrost_batch *batch,
       cfg.draw_mode = pan_draw_mode(info->mode);
       cfg.index_type = panfrost_translate_index_size(info->index_size);
       cfg.secondary_shader = secondary_shader;
+   };
+
+   return flags_override;
+}
+
+static struct cs_index
+csf_emit_draw_id_register(struct panfrost_batch *batch, unsigned offset)
+{
+   struct cs_builder *b = batch->csf.cs.builder;
+   struct panfrost_context *ctx = batch->ctx;
+   struct panfrost_uncompiled_shader *vs = ctx->uncompiled[PIPE_SHADER_VERTEX];
+
+   if (!BITSET_TEST(vs->nir->info.system_values_read, SYSTEM_VALUE_DRAW_ID))
+      return cs_undef();
+
+   struct cs_index drawid = cs_reg32(b, 67);
+   cs_move32_to(b, drawid, offset);
+
+   return drawid;
+}
+
+void
+GENX(csf_launch_draw)(struct panfrost_batch *batch,
+                      const struct pipe_draw_info *info, unsigned drawid_offset,
+                      const struct pipe_draw_start_count_bias *draw,
+                      unsigned vertex_count)
+{
+   struct cs_builder *b = batch->csf.cs.builder;
+
+   uint32_t flags_override = csf_emit_draw_state(batch, info, drawid_offset);
+   struct cs_index drawid = csf_emit_draw_id_register(batch, drawid_offset);
+
+   cs_move32_to(b, cs_reg32(b, 33), draw->count);
+   cs_move32_to(b, cs_reg32(b, 34), info->instance_count);
+   cs_move32_to(b, cs_reg32(b, 35), 0);
+
+   /* Base vertex offset on Valhall is used for both indexed and
+    * non-indexed draws, in a simple way for either. Handle both cases.
+    */
+   if (info->index_size) {
+      cs_move32_to(b, cs_reg32(b, 36), draw->index_bias);
+      cs_move32_to(b, cs_reg32(b, 39), info->index_size * draw->count);
+   } else {
+      cs_move32_to(b, cs_reg32(b, 36), draw->start);
+      cs_move32_to(b, cs_reg32(b, 39), 0);
    }
 
    cs_run_idvs(b, flags_override, false, true, cs_shader_res_sel(0, 0, 1, 0),
-               cs_shader_res_sel(2, 2, 2, 0), cs_undef());
+               cs_shader_res_sel(2, 2, 2, 0), drawid);
+}
+
+void
+GENX(csf_launch_draw_indirect)(struct panfrost_batch *batch,
+                               const struct pipe_draw_info *info,
+                               unsigned drawid_offset,
+                               const struct pipe_draw_indirect_info *indirect)
+{
+   struct cs_builder *b = batch->csf.cs.builder;
+
+   uint32_t flags_override = csf_emit_draw_state(batch, info, drawid_offset);
+   struct cs_index drawid = csf_emit_draw_id_register(batch, drawid_offset);
+
+   struct cs_index address = cs_reg64(b, 64);
+   struct cs_index counter = cs_reg32(b, 66);
+   cs_move64_to(
+      b, address,
+      pan_resource(indirect->buffer)->image.data.base + indirect->offset);
+   cs_move32_to(b, counter, indirect->draw_count);
+
+   cs_while(b, MALI_CS_CONDITION_GREATER, counter) {
+      if (info->index_size) {
+         /* loads vertex count, instance count, index offset, vertex offset */
+         cs_load_to(b, cs_reg_tuple(b, 33, 4), address, BITFIELD_MASK(4), 0);
+         cs_move32_to(b, cs_reg32(b, 39), info->index.resource->width0);
+      } else {
+         /* vertex count, instance count */
+         cs_load_to(b, cs_reg_tuple(b, 33, 2), address, BITFIELD_MASK(2), 0);
+         cs_move32_to(b, cs_reg32(b, 35), 0);
+         cs_load_to(b, cs_reg_tuple(b, 36, 1), address, BITFIELD_MASK(1),
+                    2 * sizeof(uint32_t)); // instance offset
+         cs_move32_to(b, cs_reg32(b, 37), 0);
+         cs_move32_to(b, cs_reg32(b, 39), 0);
+      }
+
+      cs_wait_slot(b, 0, false);
+      cs_run_idvs(b, flags_override, false, true, cs_shader_res_sel(0, 0, 1, 0),
+                  cs_shader_res_sel(2, 2, 2, 0), drawid);
+
+      cs_add64(b, address, address, indirect->stride);
+      cs_add32(b, counter, counter, (unsigned int)-1);
+      if (drawid.type != CS_INDEX_UNDEF)
+         cs_add32(b, drawid, drawid, 1);
+   }
 }
 
 #define POSITION_FIFO_SIZE (64 * 1024)

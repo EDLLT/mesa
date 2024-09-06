@@ -776,6 +776,22 @@ struct _mesa_glsl_parse_state {
     */
    bool KHR_blend_equation_advanced_enable;
    bool KHR_blend_equation_advanced_warn;
+   bool KHR_shader_subgroup_arithmetic_enable;
+   bool KHR_shader_subgroup_arithmetic_warn;
+   bool KHR_shader_subgroup_ballot_enable;
+   bool KHR_shader_subgroup_ballot_warn;
+   bool KHR_shader_subgroup_basic_enable;
+   bool KHR_shader_subgroup_basic_warn;
+   bool KHR_shader_subgroup_clustered_enable;
+   bool KHR_shader_subgroup_clustered_warn;
+   bool KHR_shader_subgroup_quad_enable;
+   bool KHR_shader_subgroup_quad_warn;
+   bool KHR_shader_subgroup_shuffle_enable;
+   bool KHR_shader_subgroup_shuffle_warn;
+   bool KHR_shader_subgroup_shuffle_relative_enable;
+   bool KHR_shader_subgroup_shuffle_relative_warn;
+   bool KHR_shader_subgroup_vote_enable;
+   bool KHR_shader_subgroup_vote_warn;
 
    /* OES extensions go here, sorted alphabetically.
     */
@@ -1087,7 +1103,8 @@ extern bool _mesa_glsl_process_extension(const char *name, YYLTYPE *name_locp,
  * \endverbatim
  */
 extern bool _mesa_glsl_can_implicitly_convert(const glsl_type *from, const glsl_type *desired,
-                                              _mesa_glsl_parse_state *state);
+                                              bool has_implicit_conversions,
+                                              bool has_implicit_int_to_uint_conversion);
 
 #endif /* __cplusplus */
 

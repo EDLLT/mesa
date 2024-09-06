@@ -4517,9 +4517,8 @@ tc_call_blit(struct pipe_context *pipe, void *call)
 }
 
 static void
-tc_blit(struct pipe_context *_pipe, const struct pipe_blit_info *info)
+tc_blit_enqueue(struct threaded_context *tc, const struct pipe_blit_info *info)
 {
-   struct threaded_context *tc = threaded_context(_pipe);
    struct tc_blit_call *blit = tc_add_call(tc, TC_CALL_blit, tc_blit_call);
 
    tc_set_resource_batch_usage(tc, info->dst.resource);
@@ -4527,23 +4526,33 @@ tc_blit(struct pipe_context *_pipe, const struct pipe_blit_info *info)
    tc_set_resource_batch_usage(tc, info->src.resource);
    tc_set_resource_reference(&blit->info.src.resource, info->src.resource);
    memcpy(&blit->info, info, sizeof(*info));
+}
+
+static void
+tc_blit(struct pipe_context *_pipe, const struct pipe_blit_info *info)
+{
+   struct threaded_context *tc = threaded_context(_pipe);
 
    /* filter out untracked non-resolves */
    if (!tc->options.parse_renderpass_info ||
        info->src.resource->nr_samples <= 1 ||
-       info->dst.resource->nr_samples > 1)
+       info->dst.resource->nr_samples > 1) {
+      tc_blit_enqueue(tc, info);
       return;
+   }
 
    if (tc->fb_resolve == info->dst.resource) {
+      /* optimize out this blit entirely */
       tc->renderpass_info_recording->has_resolve = true;
-   } else {
-      for (unsigned i = 0; i < PIPE_MAX_COLOR_BUFS; i++) {
-         if (tc->fb_resources[i] == info->src.resource) {
-            tc->renderpass_info_recording->has_resolve = true;
-            break;
-         }
+      return;
+   }
+   for (unsigned i = 0; i < PIPE_MAX_COLOR_BUFS; i++) {
+      if (tc->fb_resources[i] == info->src.resource) {
+         tc->renderpass_info_recording->has_resolve = true;
+         break;
       }
    }
+   tc_blit_enqueue(tc, info);
 }
 
 struct tc_generate_mipmap {

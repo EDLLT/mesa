@@ -10,7 +10,6 @@
 #include <xf86drm.h>
 #include "asahi/compiler/agx_compile.h"
 #include "asahi/layout/layout.h"
-#include "asahi/lib/agx_formats.h"
 #include "asahi/lib/decode.h"
 #include "asahi/lib/unstable_asahi_drm.h"
 #include "drm-uapi/drm_fourcc.h"
@@ -28,6 +27,7 @@
 #include "pipe/p_state.h"
 #include "util/bitscan.h"
 #include "util/format/u_format.h"
+#include "util/format/u_formats.h"
 #include "util/half_float.h"
 #include "util/macros.h"
 #include "util/simple_mtx.h"
@@ -424,23 +424,14 @@ agx_compression_allowed(const struct agx_resource *pres)
       return false;
    }
 
-   /* We use the PBE for compression via staging blits, so we can only compress
-    * renderable formats. As framebuffer compression, other formats don't make a
-    * ton of sense to compress anyway.
-    */
-   if (agx_pixel_format[pres->base.format].renderable == PIPE_FORMAT_NONE &&
-       !util_format_is_depth_or_stencil(pres->base.format)) {
-      rsrc_debug(pres, "No compression: format not renderable\n");
+   if (!ail_can_compress(pres->base.format, pres->base.width0,
+                         pres->base.height0, MAX2(pres->base.nr_samples, 1))) {
+      rsrc_debug(pres, "No compression: incompatible layout\n");
       return false;
    }
 
-   /* Lossy-compressed texture formats cannot be compressed */
-   assert(!util_format_is_compressed(pres->base.format) &&
-          "block-compressed formats are not renderable");
-
-   if (!ail_can_compress(pres->base.width0, pres->base.height0,
-                         MAX2(pres->base.nr_samples, 1))) {
-      rsrc_debug(pres, "No compression: too small\n");
+   if (pres->base.format == PIPE_FORMAT_R9G9B9E5_FLOAT) {
+      rsrc_debug(pres, "No compression: RGB9E5 copies need work\n");
       return false;
    }
 
@@ -2497,9 +2488,9 @@ agx_is_format_supported(struct pipe_screen *pscreen, enum pipe_format format,
       if (tex_format == PIPE_FORMAT_X24S8_UINT)
          tex_format = PIPE_FORMAT_S8_UINT;
 
-      struct agx_pixel_format_entry ent = agx_pixel_format[tex_format];
+      struct ail_pixel_format_entry ent = ail_pixel_format[tex_format];
 
-      if (!agx_is_valid_pixel_format(tex_format))
+      if (!ail_is_valid_pixel_format(tex_format))
          return false;
 
       /* RGB32, luminance/alpha/intensity emulated for texture buffers only */
@@ -2511,7 +2502,9 @@ agx_is_format_supported(struct pipe_screen *pscreen, enum pipe_format format,
           target != PIPE_BUFFER)
          return false;
 
-      if ((usage & PIPE_BIND_RENDER_TARGET) && !ent.renderable)
+      /* XXX: sort out rgb9e5 rendering */
+      if ((usage & PIPE_BIND_RENDER_TARGET) &&
+          (!ent.renderable || (tex_format == PIPE_FORMAT_R9G9B9E5_FLOAT)))
          return false;
    }
 

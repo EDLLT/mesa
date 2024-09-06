@@ -1216,6 +1216,7 @@ try_constant_propagate_value(brw_reg val, brw_reg_type dst_type,
    case SHADER_OPCODE_BYTE_SCATTERED_WRITE_LOGICAL:
    case SHADER_OPCODE_BYTE_SCATTERED_READ_LOGICAL:
    case FS_OPCODE_UNIFORM_PULL_CONSTANT_LOAD:
+   case FS_OPCODE_VARYING_PULL_CONSTANT_LOAD_LOGICAL:
    case SHADER_OPCODE_BROADCAST:
    case BRW_OPCODE_MAD:
    case BRW_OPCODE_LRP:
@@ -1223,6 +1224,17 @@ try_constant_propagate_value(brw_reg val, brw_reg_type dst_type,
    case SHADER_OPCODE_SHUFFLE:
       inst->src[arg] = val;
       progress = true;
+      break;
+
+   case SHADER_OPCODE_UNALIGNED_OWORD_BLOCK_READ_LOGICAL:
+      /* The address of the send message cannot be immediate (see the
+       * assertions in brw_set_src0 in brw_eu_emit.c). There is no mechanism
+       * to legalize it later, so do not generate the invalid thing here.
+       */
+      if (arg != SURFACE_LOGICAL_SRC_ADDRESS) {
+         inst->src[arg] = val;
+         progress = true;
+      }
       break;
 
    default:
@@ -1274,8 +1286,12 @@ can_propagate_from(fs_inst *inst)
             inst->src[0].file == IMM ||
             (inst->src[0].file == FIXED_GRF &&
              inst->src[0].is_contiguous())) &&
-           inst->src[0].type == inst->dst.type &&
-           !inst->saturate &&
+           /* is_raw_move also rejects source modifiers, but copy propagation
+            * can handle that if the types are the same.
+            */
+           ((inst->src[0].type == inst->dst.type &&
+             !inst->saturate) ||
+            inst->is_raw_move()) &&
            /* Subset of !is_partial_write() conditions. */
            !inst->predicate && inst->dst.is_contiguous()) ||
           is_identity_payload(FIXED_GRF, inst);
@@ -1740,16 +1756,7 @@ extract_imm(brw_reg val, brw_reg_type type, unsigned offset)
 
    assert(bitsize < brw_type_size_bits(val.type));
 
-   switch (val.type) {
-   case BRW_TYPE_UD:
-      val.ud = (val.ud >> (bitsize * offset)) & ((1u << bitsize) - 1);
-      break;
-   case BRW_TYPE_D:
-      val.d = (val.d << (bitsize * (32/bitsize - 1 - offset))) >> ((32/bitsize - 1) * bitsize);
-      break;
-   default:
-      return brw_reg();
-   }
+   val.u64 = (val.u64 >> (bitsize * offset)) & ((1ull << bitsize) - 1);
 
    return val;
 }
@@ -1761,7 +1768,11 @@ find_value_for_offset(fs_inst *def, const brw_reg &src, unsigned src_size)
 
    switch (def->opcode) {
    case BRW_OPCODE_MOV:
-      if (def->dst.type == def->src[0].type && def->src[0].stride <= 1) {
+      /* is_raw_move also rejects source modifiers, but copy propagation
+       * can handle that if the tyeps are the same.
+       */
+      if ((def->dst.type == def->src[0].type || def->is_raw_move()) &&
+          def->src[0].stride <= 1) {
          val = def->src[0];
 
          unsigned rel_offset = src.offset - def->dst.offset;

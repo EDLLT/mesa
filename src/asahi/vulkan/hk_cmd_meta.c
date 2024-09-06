@@ -4,6 +4,9 @@
  * Copyright 2022-2023 Collabora Ltd. and Red Hat Inc.
  * SPDX-License-Identifier: MIT
  */
+#include "util/format/u_format.h"
+#include "util/format/u_formats.h"
+#include "util/u_math.h"
 #include "vulkan/vulkan_core.h"
 #include "agx_pack.h"
 #include "hk_buffer.h"
@@ -13,11 +16,20 @@
 #include "hk_image.h"
 #include "hk_physical_device.h"
 
+#include "layout.h"
 #include "nir_builder.h"
+#include "nir_builder_opcodes.h"
+#include "nir_format_convert.h"
 #include "shader_enums.h"
 #include "vk_format.h"
 #include "vk_meta.h"
 #include "vk_pipeline.h"
+
+/* For block based blit kernels, we hardcode the maximum tile size which we can
+ * always achieve. This simplifies our life.
+ */
+#define TILE_WIDTH  32
+#define TILE_HEIGHT 32
 
 static VkResult
 hk_cmd_bind_map_buffer(struct vk_command_buffer *vk_cmd,
@@ -240,28 +252,61 @@ aspect_format(VkFormat fmt, VkImageAspectFlags aspect)
    return fmt;
 }
 
+/*
+ * Canonicalize formats to simplify the copies. The returned format must in the
+ * same compression class, and should roundtrip lossless (minifloat formats are
+ * the unfortunate exception).
+ */
+static enum pipe_format
+canonical_format_pipe(enum pipe_format fmt, bool canonicalize_zs)
+{
+   if (!canonicalize_zs && util_format_is_depth_or_stencil(fmt))
+      return fmt;
+
+   assert(ail_is_valid_pixel_format(fmt));
+
+   if (util_format_is_compressed(fmt)) {
+      unsigned size_B = util_format_get_blocksize(fmt);
+      assert(size_B == 8 || size_B == 16);
+
+      return size_B == 16 ? PIPE_FORMAT_R32G32B32A32_UINT
+                          : PIPE_FORMAT_R32G32_UINT;
+   }
+
+#define CASE(x, y) [AGX_CHANNELS_##x] = PIPE_FORMAT_##y
+   /* clang-format off */
+   static enum pipe_format map[] = {
+      CASE(R8,           R8_UINT),
+      CASE(R16,          R16_UNORM /* XXX: Hack for Z16 copies */),
+      CASE(R8G8,         R8G8_UINT),
+      CASE(R5G6B5,       R5G6B5_UNORM),
+      CASE(R4G4B4A4,     R4G4B4A4_UNORM),
+      CASE(A1R5G5B5,     A1R5G5B5_UNORM),
+      CASE(R5G5B5A1,     B5G5R5A1_UNORM),
+      CASE(R32,          R32_UINT),
+      CASE(R16G16,       R16G16_UINT),
+      CASE(R11G11B10,    R11G11B10_FLOAT),
+      CASE(R10G10B10A2,  R10G10B10A2_UNORM),
+      CASE(R9G9B9E5,     R9G9B9E5_FLOAT),
+      CASE(R8G8B8A8,     R8G8B8A8_UINT),
+      CASE(R32G32,       R32G32_UINT),
+      CASE(R16G16B16A16, R16G16B16A16_UINT),
+      CASE(R32G32B32A32, R32G32B32A32_UINT),
+   };
+   /* clang-format on */
+#undef CASE
+
+   enum agx_channels channels = ail_pixel_format[fmt].channels;
+   assert(channels < ARRAY_SIZE(map) && "all valid channels handled");
+   assert(map[channels] != PIPE_FORMAT_NONE && "all valid channels handled");
+   return map[channels];
+}
+
 static VkFormat
 canonical_format(VkFormat fmt)
 {
-   enum pipe_format p_format = vk_format_to_pipe_format(fmt);
-
-   if (util_format_is_depth_or_stencil(p_format))
-      return fmt;
-
-   switch (util_format_get_blocksize(p_format)) {
-   case 1:
-      return VK_FORMAT_R8_UINT;
-   case 2:
-      return VK_FORMAT_R16_UINT;
-   case 4:
-      return VK_FORMAT_R32_UINT;
-   case 8:
-      return VK_FORMAT_R32G32_UINT;
-   case 16:
-      return VK_FORMAT_R32G32B32A32_UINT;
-   default:
-      unreachable("invalid bpp");
-   }
+   return vk_format_from_pipe_format(
+      canonical_format_pipe(vk_format_to_pipe_format(fmt), false));
 }
 
 enum copy_type {
@@ -271,7 +316,8 @@ enum copy_type {
 };
 
 struct vk_meta_push_data {
-   uint32_t buffer_offset;
+   uint64_t buffer;
+
    uint32_t row_extent;
    uint32_t slice_or_layer_extent;
 
@@ -288,8 +334,10 @@ struct vk_meta_push_data {
 struct vk_meta_image_copy_key {
    enum vk_meta_object_key_type key_type;
    enum copy_type type;
+   enum pipe_format src_format, dst_format;
    unsigned block_size;
    unsigned nr_samples;
+   bool block_based;
 };
 
 static nir_def *
@@ -304,13 +352,90 @@ linearize_coords(nir_builder *b, nir_def *coord,
    nir_def *y = nir_channel(b, coord, 1);
    nir_def *z_or_layer = nir_channel(b, coord, 2);
 
-   nir_def *v = get_push(b, buffer_offset);
+   nir_def *v = nir_imul_imm(b, x, key->block_size);
 
-   v = nir_iadd(b, v, nir_imul_imm(b, x, key->block_size));
    v = nir_iadd(b, v, nir_imul(b, y, row_extent));
    v = nir_iadd(b, v, nir_imul(b, z_or_layer, slice_or_layer_extent));
 
    return nir_udiv_imm(b, v, key->block_size);
+}
+
+static bool
+is_format_native(enum pipe_format format)
+{
+   switch (format) {
+   case PIPE_FORMAT_R8_UINT:
+   case PIPE_FORMAT_R8G8_UINT:
+   case PIPE_FORMAT_R32_UINT:
+   case PIPE_FORMAT_R32G32_UINT:
+   case PIPE_FORMAT_R16G16_UINT:
+   case PIPE_FORMAT_R16_UNORM:
+      /* TODO: debug me .. why do these fail */
+      return false;
+   case PIPE_FORMAT_R11G11B10_FLOAT:
+   case PIPE_FORMAT_R9G9B9E5_FLOAT:
+   case PIPE_FORMAT_R16G16B16A16_UINT:
+   case PIPE_FORMAT_R32G32B32A32_UINT:
+   case PIPE_FORMAT_R8G8B8A8_UINT:
+   case PIPE_FORMAT_R10G10B10A2_UNORM:
+      return true;
+   case PIPE_FORMAT_R5G6B5_UNORM:
+   case PIPE_FORMAT_R4G4B4A4_UNORM:
+   case PIPE_FORMAT_A1R5G5B5_UNORM:
+   case PIPE_FORMAT_B5G5R5A1_UNORM:
+      return false;
+   default:
+      unreachable("expected canonical");
+   }
+}
+
+static nir_def *
+load_store_formatted(nir_builder *b, nir_def *base, nir_def *index,
+                     nir_def *value, enum pipe_format format)
+{
+   if (util_format_is_depth_or_stencil(format))
+      format = canonical_format_pipe(format, true);
+
+   if (is_format_native(format)) {
+      enum pipe_format isa = ail_pixel_format[format].renderable;
+      unsigned isa_size = util_format_get_blocksize(isa);
+      unsigned isa_components = util_format_get_blocksize(format) / isa_size;
+      unsigned shift = util_logbase2(isa_components);
+
+      if (value) {
+         nir_store_agx(b, value, base, index, .format = isa, .base = shift);
+      } else {
+         return nir_load_agx(b, 4, 32, base, index, .format = isa,
+                             .base = shift);
+      }
+   } else {
+      unsigned blocksize_B = util_format_get_blocksize(format);
+      nir_def *addr =
+         nir_iadd(b, base, nir_imul_imm(b, nir_u2u64(b, index), blocksize_B));
+
+      if (value) {
+         nir_def *raw = nir_format_pack_rgba(b, format, value);
+
+         if (blocksize_B <= 4) {
+            assert(raw->num_components == 1);
+            raw = nir_u2uN(b, raw, blocksize_B * 8);
+         } else {
+            assert(raw->bit_size == 32);
+            raw = nir_trim_vector(b, raw, blocksize_B / 4);
+         }
+
+         nir_store_global(b, addr, blocksize_B, raw,
+                          nir_component_mask(raw->num_components));
+      } else {
+         nir_def *raw =
+            nir_load_global(b, addr, blocksize_B, DIV_ROUND_UP(blocksize_B, 4),
+                            MIN2(32, blocksize_B * 8));
+
+         return nir_format_unpack_rgba(b, raw, format);
+      }
+   }
+
+   return NULL;
 }
 
 static nir_shader *
@@ -320,8 +445,8 @@ build_image_copy_shader(const struct vk_meta_image_copy_key *key)
       nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, NULL, "vk-meta-copy");
 
    nir_builder *b = &build;
-   b->shader->info.workgroup_size[0] = 32;
-   b->shader->info.workgroup_size[1] = 32;
+   b->shader->info.workgroup_size[0] = TILE_WIDTH;
+   b->shader->info.workgroup_size[1] = TILE_HEIGHT;
 
    bool src_is_buf = key->type == BUF2IMG;
    bool dst_is_buf = key->type == IMG2BUF;
@@ -359,40 +484,132 @@ build_image_copy_shader(const struct vk_meta_image_copy_key *key)
       b, 3, 32,
       nir_imm_int(b, offsetof(struct vk_meta_push_data, dst_offset_el)));
 
-   nir_def *grid_el = nir_load_push_constant(
-      b, 3, 32, nir_imm_int(b, offsetof(struct vk_meta_push_data, grid_el)));
+   nir_def *grid_2d_el = nir_load_push_constant(
+      b, 2, 32, nir_imm_int(b, offsetof(struct vk_meta_push_data, grid_el)));
 
    /* We're done setting up variables, do the copy */
    nir_def *coord = nir_load_global_invocation_id(b, 32);
 
-   nir_push_if(b,
-               nir_ball(b, nir_trim_vector(b, nir_ult(b, coord, grid_el), 2)));
-   {
-      nir_def *src_coord = nir_iadd(b, coord, src_offset_el);
-      nir_def *dst_coord = nir_iadd(b, coord, dst_offset_el);
+   /* The destination format is already canonical, convert to an ISA format */
+   enum pipe_format isa_format;
+   if (key->block_based) {
+      isa_format =
+         ail_pixel_format[canonical_format_pipe(key->dst_format, true)]
+            .renderable;
+      assert(isa_format != PIPE_FORMAT_NONE);
+   }
 
-      /* Special case handle buffer indexing */
-      if (dst_is_buf) {
-         dst_coord = linearize_coords(b, coord, key);
-      } else if (src_is_buf) {
-         src_coord = linearize_coords(b, coord, key);
-      }
+   nir_def *local_offset = nir_imm_intN_t(b, 0, 16);
+   nir_def *lid = nir_trim_vector(b, nir_load_local_invocation_id(b), 2);
+   lid = nir_u2u16(b, lid);
 
-      /* Copy formatted texel from texture to storage image */
-      for (unsigned s = 0; s < key->nr_samples; ++s) {
+   nir_def *src_coord = src_is_buf ? coord : nir_iadd(b, coord, src_offset_el);
+   nir_def *dst_coord = dst_is_buf ? coord : nir_iadd(b, coord, dst_offset_el);
+
+   nir_def *image_deref = &nir_build_deref_var(b, image)->def;
+
+   nir_def *coord_2d_el = nir_trim_vector(b, coord, 2);
+   nir_def *in_bounds;
+   if (key->block_based) {
+      nir_def *offset_in_block_el =
+         nir_umod_imm(b, nir_trim_vector(b, dst_offset_el, 2), TILE_WIDTH);
+
+      dst_coord =
+         nir_vector_insert_imm(b, nir_isub(b, dst_coord, offset_in_block_el),
+                               nir_channel(b, dst_coord, 2), 2);
+
+      src_coord =
+         nir_vector_insert_imm(b, nir_isub(b, src_coord, offset_in_block_el),
+                               nir_channel(b, src_coord, 2), 2);
+
+      in_bounds = nir_uge(b, coord_2d_el, offset_in_block_el);
+      in_bounds = nir_iand(
+         b, in_bounds,
+         nir_ult(b, coord_2d_el, nir_iadd(b, offset_in_block_el, grid_2d_el)));
+   } else {
+      in_bounds = nir_ult(b, coord_2d_el, grid_2d_el);
+   }
+
+   /* Special case handle buffer indexing */
+   if (dst_is_buf) {
+      assert(!key->block_based);
+      dst_coord = linearize_coords(b, dst_coord, key);
+   } else if (src_is_buf) {
+      src_coord = linearize_coords(b, src_coord, key);
+   }
+
+   for (unsigned s = 0; s < key->nr_samples; ++s) {
+      nir_def *ms_index = nir_imm_int(b, s);
+      nir_def *value1, *value2;
+
+      nir_push_if(b, nir_ball(b, in_bounds));
+      {
+         /* Copy formatted texel from texture to storage image */
          nir_deref_instr *deref = nir_build_deref_var(b, texture);
-         nir_def *ms_index = nir_imm_int(b, s);
 
-         nir_def *value = msaa ? nir_txf_ms_deref(b, deref, src_coord, ms_index)
-                               : nir_txf_deref(b, deref, src_coord, NULL);
+         if (src_is_buf) {
+            value1 = load_store_formatted(b, get_push(b, buffer), src_coord,
+                                          NULL, key->dst_format);
+         } else {
+            if (msaa) {
+               value1 = nir_txf_ms_deref(b, deref, src_coord, ms_index);
+            } else {
+               value1 = nir_txf_deref(b, deref, src_coord, NULL);
+            }
 
-         nir_image_deref_store(b, &nir_build_deref_var(b, image)->def,
-                               nir_pad_vec4(b, dst_coord), ms_index, value,
-                               nir_imm_int(b, 0), .image_dim = dim_dst,
-                               .image_array = !dst_is_buf);
+            /* Munge according to the implicit conversions so we get a bit copy */
+            if (key->src_format != key->dst_format) {
+               nir_def *packed =
+                  nir_format_pack_rgba(b, key->src_format, value1);
+
+               value1 = nir_format_unpack_rgba(b, packed, key->dst_format);
+            }
+         }
+
+         if (dst_is_buf) {
+            load_store_formatted(b, get_push(b, buffer), dst_coord, value1,
+                                 key->dst_format);
+         } else if (!key->block_based) {
+            nir_image_deref_store(b, image_deref, nir_pad_vec4(b, dst_coord),
+                                  ms_index, value1, nir_imm_int(b, 0),
+                                  .image_dim = dim_dst,
+                                  .image_array = !dst_is_buf);
+         }
+      }
+      nir_push_else(b, NULL);
+      if (key->block_based) {
+         /* Copy back the existing destination content */
+         value2 = nir_image_deref_load(b, 4, 32, image_deref,
+                                       nir_pad_vec4(b, dst_coord), ms_index,
+                                       nir_imm_int(b, 0), .image_dim = dim_dst,
+                                       .image_array = !dst_is_buf);
+      }
+      nir_pop_if(b, NULL);
+
+      if (key->block_based) {
+         nir_store_local_pixel_agx(b, nir_if_phi(b, value1, value2),
+                                   nir_imm_int(b, 1 << s), lid, .base = 0,
+                                   .write_mask = 0xf, .format = isa_format,
+                                   .explicit_coord = true);
       }
    }
-   nir_pop_if(b, NULL);
+
+   if (key->block_based) {
+      assert(!dst_is_buf);
+
+      nir_barrier(b, .execution_scope = SCOPE_WORKGROUP);
+
+      nir_push_if(b, nir_ball(b, nir_ieq_imm(b, lid, 0)));
+      {
+         nir_image_deref_store_block_agx(
+            b, image_deref, local_offset, dst_coord, .format = isa_format,
+            .image_dim = dim_2d, .image_array = true, .explicit_coord = true);
+      }
+      nir_pop_if(b, NULL);
+      b->shader->info.cs.image_block_size_per_thread_agx =
+         util_format_get_blocksize(key->dst_format);
+   }
+
    return b->shader;
 }
 
@@ -418,17 +635,13 @@ get_image_copy_descriptor_set_layout(struct vk_device *device,
    const VkDescriptorSetLayoutBinding bindings[] = {
       {
          .binding = BINDING_OUTPUT,
-         .descriptorType = type != IMG2BUF
-                              ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
-                              : VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER,
+         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
          .descriptorCount = 1,
          .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
       },
       {
          .binding = BINDING_INPUT,
-         .descriptorType = type == BUF2IMG
-                              ? VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER
-                              : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+         .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,
          .descriptorCount = 1,
          .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
       },
@@ -526,6 +739,7 @@ hk_meta_copy_image_to_buffer2(struct vk_command_buffer *cmd,
 {
    VK_FROM_HANDLE(vk_image, image, pCopyBufferInfo->srcImage);
    VK_FROM_HANDLE(vk_image, src_image, pCopyBufferInfo->srcImage);
+   VK_FROM_HANDLE(hk_buffer, buffer, pCopyBufferInfo->dstBuffer);
 
    struct vk_device *device = cmd->base.device;
    const struct vk_device_dispatch_table *disp = &device->dispatch_table;
@@ -582,6 +796,8 @@ hk_meta_copy_image_to_buffer2(struct vk_command_buffer *cmd,
             .type = IMG2BUF,
             .block_size = blocksize_B,
             .nr_samples = image->samples,
+            .src_format = vk_format_to_pipe_format(canonical),
+            .dst_format = vk_format_to_pipe_format(canonical),
          };
 
          VkPipelineLayout pipeline_layout;
@@ -629,40 +845,7 @@ hk_meta_copy_image_to_buffer2(struct vk_command_buffer *cmd,
             .imageView = src_view,
          };
 
-         VkWriteDescriptorSet desc_writes[2];
-
-         const VkBufferViewCreateInfo dst_view_info = {
-            .sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO,
-            .buffer = pCopyBufferInfo->dstBuffer,
-            .format = canonical,
-
-            /* Ideally, this would be region->bufferOffset, but that might not
-             * be aligned to minTexelBufferOffsetAlignment. Instead, we use a 0
-             * offset (which is definitely aligned) and add the offset ourselves
-             * in the shader.
-             */
-            .offset = 0,
-            .range = VK_WHOLE_SIZE,
-         };
-
-         VkBufferView dst_view;
-         VkResult result =
-            vk_meta_create_buffer_view(cmd, meta, &dst_view_info, &dst_view);
-         if (unlikely(result != VK_SUCCESS)) {
-            vk_command_buffer_set_error(cmd, result);
-            return;
-         }
-
-         desc_writes[0] = (VkWriteDescriptorSet){
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = 0,
-            .dstBinding = BINDING_OUTPUT,
-            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER,
-            .descriptorCount = 1,
-            .pTexelBufferView = &dst_view,
-         };
-
-         desc_writes[1] = (VkWriteDescriptorSet){
+         VkWriteDescriptorSet desc_write = {
             .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             .dstSet = 0,
             .dstBinding = BINDING_INPUT,
@@ -671,9 +854,9 @@ hk_meta_copy_image_to_buffer2(struct vk_command_buffer *cmd,
             .pImageInfo = &src_info,
          };
 
-         disp->CmdPushDescriptorSetKHR(
-            vk_command_buffer_to_handle(cmd), VK_PIPELINE_BIND_POINT_COMPUTE,
-            pipeline_layout, 0, ARRAY_SIZE(desc_writes), desc_writes);
+         disp->CmdPushDescriptorSetKHR(vk_command_buffer_to_handle(cmd),
+                                       VK_PIPELINE_BIND_POINT_COMPUTE,
+                                       pipeline_layout, 0, 1, &desc_write);
 
          VkPipeline pipeline;
          result = get_image_copy_pipeline(device, meta, &key, pipeline_layout,
@@ -690,7 +873,7 @@ hk_meta_copy_image_to_buffer2(struct vk_command_buffer *cmd,
             vk_format_to_pipe_format(src_image->format);
 
          struct vk_meta_push_data push = {
-            .buffer_offset = region->bufferOffset,
+            .buffer = hk_buffer_address(buffer, region->bufferOffset),
             .row_extent = row_extent,
             .slice_or_layer_extent = is_3d ? slice_extent : layer_extent,
 
@@ -706,7 +889,7 @@ hk_meta_copy_image_to_buffer2(struct vk_command_buffer *cmd,
             .grid_el[2] = per_layer ? 1 : layers,
          };
 
-         push.buffer_offset += push.slice_or_layer_extent * layer_offs;
+         push.buffer += push.slice_or_layer_extent * layer_offs;
 
          disp->CmdPushConstants(vk_command_buffer_to_handle(cmd),
                                 pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
@@ -720,11 +903,48 @@ hk_meta_copy_image_to_buffer2(struct vk_command_buffer *cmd,
 }
 
 static void
+hk_meta_dispatch_to_image(struct vk_command_buffer *cmd,
+                          const struct vk_device_dispatch_table *disp,
+                          VkPipelineLayout pipeline_layout,
+                          struct vk_meta_push_data *push, VkOffset3D offset,
+                          VkExtent3D extent, bool per_layer, unsigned layers,
+                          enum pipe_format p_dst_fmt, enum pipe_format p_format)
+{
+   push->dst_offset_el[0] = util_format_get_nblocksx(p_dst_fmt, offset.x);
+   push->dst_offset_el[1] = util_format_get_nblocksy(p_dst_fmt, offset.y);
+   push->dst_offset_el[2] = 0;
+
+   push->grid_el[0] = util_format_get_nblocksx(p_format, extent.width);
+   push->grid_el[1] = util_format_get_nblocksy(p_format, extent.height);
+   push->grid_el[2] = per_layer ? 1 : layers;
+
+   unsigned w_el = util_format_get_nblocksx(p_format, extent.width);
+   unsigned h_el = util_format_get_nblocksy(p_format, extent.height);
+
+   /* Expand the grid so destinations are in tiles */
+   unsigned expanded_x0 = push->dst_offset_el[0] & ~(TILE_WIDTH - 1);
+   unsigned expanded_y0 = push->dst_offset_el[1] & ~(TILE_HEIGHT - 1);
+   unsigned expanded_x1 = align(push->dst_offset_el[0] + w_el, TILE_WIDTH);
+   unsigned expanded_y1 = align(push->dst_offset_el[1] + h_el, TILE_HEIGHT);
+
+   /* TODO: clamp to the destination size to save some redundant threads? */
+
+   disp->CmdPushConstants(vk_command_buffer_to_handle(cmd), pipeline_layout,
+                          VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(*push), push);
+
+   disp->CmdDispatch(vk_command_buffer_to_handle(cmd),
+                     (expanded_x1 - expanded_x0) / TILE_WIDTH,
+                     (expanded_y1 - expanded_y0) / TILE_HEIGHT,
+                     push->grid_el[2]);
+}
+
+static void
 hk_meta_copy_buffer_to_image2(struct vk_command_buffer *cmd,
                               struct vk_meta_device *meta,
                               const struct VkCopyBufferToImageInfo2 *info)
 {
    VK_FROM_HANDLE(vk_image, image, info->dstImage);
+   VK_FROM_HANDLE(hk_buffer, buffer, info->srcBuffer);
 
    struct vk_device *device = cmd->base.device;
    const struct vk_device_dispatch_table *disp = &device->dispatch_table;
@@ -761,6 +981,14 @@ hk_meta_copy_buffer_to_image2(struct vk_command_buffer *cmd,
             .type = BUF2IMG,
             .block_size = blocksize_B,
             .nr_samples = image->samples,
+            .src_format = vk_format_to_pipe_format(canonical),
+            .dst_format = canonical_format_pipe(
+               vk_format_to_pipe_format(aspect_format(image->format, aspect)),
+               false),
+
+            /* TODO: MSAA path */
+            .block_based =
+               (image->image_type != VK_IMAGE_TYPE_1D) && image->samples == 1,
          };
 
          VkPipelineLayout pipeline_layout;
@@ -770,8 +998,6 @@ hk_meta_copy_buffer_to_image2(struct vk_command_buffer *cmd,
             vk_command_buffer_set_error(cmd, result);
             return;
          }
-
-         VkWriteDescriptorSet desc_writes[2];
 
          unsigned row_extent = util_format_get_nblocksx(
                                   p_format, MAX2(region->bufferRowLength,
@@ -785,31 +1011,6 @@ hk_meta_copy_buffer_to_image2(struct vk_command_buffer *cmd,
          unsigned layer_extent =
             util_format_get_nblocksz(p_format, region->imageExtent.depth) *
             slice_extent;
-
-         /* Create a view into the source buffer as a texel buffer */
-         const VkBufferViewCreateInfo src_view_info = {
-            .sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO,
-            .buffer = info->srcBuffer,
-            .format = canonical,
-
-            /* Ideally, this would be region->bufferOffset, but that might not
-             * be aligned to minTexelBufferOffsetAlignment. Instead, we use a 0
-             * offset (which is definitely aligned) and add the offset ourselves
-             * in the shader.
-             */
-            .offset = 0,
-            .range = VK_WHOLE_SIZE,
-         };
-
-         assert((region->bufferOffset % blocksize_B) == 0 && "must be aligned");
-
-         VkBufferView src_view;
-         result =
-            vk_meta_create_buffer_view(cmd, meta, &src_view_info, &src_view);
-         if (unlikely(result != VK_SUCCESS)) {
-            vk_command_buffer_set_error(cmd, result);
-            return;
-         }
 
          VkImageView dst_view;
          const VkImageViewUsageCreateInfo dst_view_usage = {
@@ -848,7 +1049,7 @@ hk_meta_copy_buffer_to_image2(struct vk_command_buffer *cmd,
             .imageLayout = info->dstImageLayout,
          };
 
-         desc_writes[0] = (VkWriteDescriptorSet){
+         VkWriteDescriptorSet desc_write = {
             .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             .dstSet = 0,
             .dstBinding = BINDING_OUTPUT,
@@ -857,18 +1058,9 @@ hk_meta_copy_buffer_to_image2(struct vk_command_buffer *cmd,
             .pImageInfo = &dst_info,
          };
 
-         desc_writes[1] = (VkWriteDescriptorSet){
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = 0,
-            .dstBinding = BINDING_INPUT,
-            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,
-            .descriptorCount = 1,
-            .pTexelBufferView = &src_view,
-         };
-
-         disp->CmdPushDescriptorSetKHR(
-            vk_command_buffer_to_handle(cmd), VK_PIPELINE_BIND_POINT_COMPUTE,
-            pipeline_layout, 0, ARRAY_SIZE(desc_writes), desc_writes);
+         disp->CmdPushDescriptorSetKHR(vk_command_buffer_to_handle(cmd),
+                                       VK_PIPELINE_BIND_POINT_COMPUTE,
+                                       pipeline_layout, 0, 1, &desc_write);
 
          VkPipeline pipeline;
          result = get_image_copy_pipeline(device, meta, &key, pipeline_layout,
@@ -882,31 +1074,16 @@ hk_meta_copy_buffer_to_image2(struct vk_command_buffer *cmd,
                                VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
 
          struct vk_meta_push_data push = {
-            .buffer_offset = region->bufferOffset,
+            .buffer = hk_buffer_address(buffer, region->bufferOffset),
             .row_extent = row_extent,
             .slice_or_layer_extent = is_3d ? slice_extent : layer_extent,
-
-            .dst_offset_el[0] =
-               util_format_get_nblocksx(p_format, region->imageOffset.x),
-            .dst_offset_el[1] =
-               util_format_get_nblocksy(p_format, region->imageOffset.y),
-
-            .grid_el[0] =
-               util_format_get_nblocksx(p_format, region->imageExtent.width),
-            .grid_el[1] =
-               util_format_get_nblocksy(p_format, region->imageExtent.height),
-            .grid_el[2] = per_layer ? 1 : layers,
          };
 
-         push.buffer_offset += push.slice_or_layer_extent * layer_offs;
+         push.buffer += push.slice_or_layer_extent * layer_offs;
 
-         disp->CmdPushConstants(vk_command_buffer_to_handle(cmd),
-                                pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                                sizeof(push), &push);
-
-         disp->CmdDispatch(vk_command_buffer_to_handle(cmd),
-                           DIV_ROUND_UP(push.grid_el[0], 32),
-                           DIV_ROUND_UP(push.grid_el[1], 32), push.grid_el[2]);
+         hk_meta_dispatch_to_image(cmd, disp, pipeline_layout, &push,
+                                   region->imageOffset, region->imageExtent,
+                                   per_layer, layers, p_format, p_format);
       }
    }
 }
@@ -952,11 +1129,26 @@ hk_meta_copy_image2(struct vk_command_buffer *cmd, struct vk_meta_device *meta,
             uint32_t blocksize_B =
                util_format_get_blocksize(vk_format_to_pipe_format(canonical));
 
+            VkImageAspectFlagBits dst_aspect_mask =
+               vk_format_get_ycbcr_info(dst_image->format) ||
+                     vk_format_get_ycbcr_info(src_image->format)
+                  ? region->dstSubresource.aspectMask
+                  : (1 << aspect);
+
             struct vk_meta_image_copy_key key = {
                .key_type = VK_META_OBJECT_KEY_COPY_IMAGE_TO_BUFFER_PIPELINE,
                .type = IMG2IMG,
                .block_size = blocksize_B,
                .nr_samples = dst_image->samples,
+               .src_format = vk_format_to_pipe_format(canonical),
+               .dst_format =
+                  canonical_format_pipe(vk_format_to_pipe_format(aspect_format(
+                                           dst_image->format, dst_aspect_mask)),
+                                        false),
+
+               /* TODO: MSAA path */
+               .block_based = (dst_image->image_type != VK_IMAGE_TYPE_1D) &&
+                              dst_image->samples == 1,
             };
 
             assert(key.nr_samples == src_image->samples);
@@ -1020,14 +1212,10 @@ hk_meta_copy_image2(struct vk_command_buffer *cmd, struct vk_meta_device *meta,
                .pNext = &dst_view_usage,
                .image = info->dstImage,
                .viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY,
-               .format = canonical,
+               .format = vk_format_from_pipe_format(key.dst_format),
                .subresourceRange =
                   {
-                     .aspectMask =
-                        vk_format_get_ycbcr_info(dst_image->format) ||
-                              vk_format_get_ycbcr_info(src_image->format)
-                           ? region->dstSubresource.aspectMask
-                           : (1 << aspect),
+                     .aspectMask = dst_aspect_mask,
                      .baseMipLevel = region->dstSubresource.mipLevel,
                      .baseArrayLayer =
                         MAX2(region->dstOffset.z,
@@ -1094,27 +1282,11 @@ hk_meta_copy_image2(struct vk_command_buffer *cmd, struct vk_meta_device *meta,
                   util_format_get_nblocksx(p_src_fmt, region->srcOffset.x),
                .src_offset_el[1] =
                   util_format_get_nblocksy(p_src_fmt, region->srcOffset.y),
-
-               .dst_offset_el[0] =
-                  util_format_get_nblocksx(p_dst_fmt, region->dstOffset.x),
-               .dst_offset_el[1] =
-                  util_format_get_nblocksy(p_dst_fmt, region->dstOffset.y),
-
-               .grid_el[0] =
-                  util_format_get_nblocksx(p_format, region->extent.width),
-               .grid_el[1] =
-                  util_format_get_nblocksy(p_format, region->extent.height),
-               .grid_el[2] = per_layer ? 1 : layers,
             };
 
-            disp->CmdPushConstants(vk_command_buffer_to_handle(cmd),
-                                   pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-                                   0, sizeof(push), &push);
-
-            disp->CmdDispatch(vk_command_buffer_to_handle(cmd),
-                              DIV_ROUND_UP(push.grid_el[0], 32),
-                              DIV_ROUND_UP(push.grid_el[1], 32),
-                              push.grid_el[2]);
+            hk_meta_dispatch_to_image(cmd, disp, pipeline_layout, &push,
+                                      region->dstOffset, region->extent,
+                                      per_layer, layers, p_dst_fmt, p_format);
          }
       }
    }

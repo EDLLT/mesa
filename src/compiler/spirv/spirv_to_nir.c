@@ -103,6 +103,7 @@ static const struct spirv_capabilities implemented_capabilities = {
    .ImageCubeArray = true,
    .ImageGatherBiasLodAMD = true,
    .ImageGatherExtended = true,
+   .ImageMipmap = true,
    .ImageMSArray = true,
    .ImageQuery = true,
    .ImageReadWrite = true,
@@ -119,6 +120,7 @@ static const struct spirv_capabilities implemented_capabilities = {
    .IntegerFunctions2INTEL = true,
    .InterpolationFunction = true,
    .Kernel = true,
+   .Linkage = true,
    .LiteralSampler = true,
    .Matrix = true,
    .MeshShadingEXT = true,
@@ -197,7 +199,6 @@ static const struct spirv_capabilities implemented_capabilities = {
    .WorkgroupMemoryExplicitLayout16BitAccessKHR = true,
 };
 
-#ifndef NDEBUG
 uint32_t mesa_spirv_debug = 0;
 
 static const struct debug_named_value mesa_spirv_debug_control[] = {
@@ -205,11 +206,28 @@ static const struct debug_named_value mesa_spirv_debug_control[] = {
      "Print information of the SPIR-V structured control flow parsing" },
    { "values", MESA_SPIRV_DEBUG_VALUES,
      "Print information of the SPIR-V values" },
+   { "asm", MESA_SPIRV_DEBUG_ASM, "Print the SPIR-V assembly" },
+   { "color", MESA_SPIRV_DEBUG_COLOR, "Debug in color, if available" },
    DEBUG_NAMED_VALUE_END,
 };
 
 DEBUG_GET_ONCE_FLAGS_OPTION(mesa_spirv_debug, "MESA_SPIRV_DEBUG", mesa_spirv_debug_control, 0)
 
+/* DO NOT CALL THIS FUNCTION DIRECTLY. Use mesa_spirv_debug_init() instead */
+static void
+initialize_mesa_spirv_debug(void)
+{
+   mesa_spirv_debug = debug_get_option_mesa_spirv_debug();
+}
+
+static void
+mesa_spirv_debug_init(void)
+{
+   static once_flag initialized_debug_flag = ONCE_FLAG_INIT;
+   call_once(&initialized_debug_flag, initialize_mesa_spirv_debug);
+}
+
+#ifndef NDEBUG
 static enum nir_spirv_debug_level
 vtn_default_log_level(void)
 {
@@ -745,10 +763,6 @@ const uint32_t *
 vtn_foreach_instruction(struct vtn_builder *b, const uint32_t *start,
                         const uint32_t *end, vtn_instruction_handler handler)
 {
-   b->file = NULL;
-   b->line = -1;
-   b->col = -1;
-
    const uint32_t *w = start;
    while (w < end) {
       SpvOp opcode = w[0] & SpvOpCodeMask;
@@ -781,11 +795,6 @@ vtn_foreach_instruction(struct vtn_builder *b, const uint32_t *start,
 
       w += count;
    }
-
-   b->spirv_offset = 0;
-   b->file = NULL;
-   b->line = -1;
-   b->col = -1;
 
    assert(w == end);
    return w;
@@ -3776,17 +3785,11 @@ vtn_handle_image(struct vtn_builder *b, SpvOp opcode,
       image.lod = vtn_ssa_value(b, w[4])->def;
       break;
 
-   case SpvOpImageQuerySize:
-   case SpvOpImageQuerySamples:
-      res_val = vtn_untyped_value(b, w[3]);
-      image.image = vtn_get_image(b, w[3], &access);
-      image.coord = NULL;
-      image.sample = NULL;
-      image.lod = NULL;
-      break;
-
    case SpvOpImageQueryFormat:
+   case SpvOpImageQueryLevels:
    case SpvOpImageQueryOrder:
+   case SpvOpImageQuerySamples:
+   case SpvOpImageQuerySize:
       res_val = vtn_untyped_value(b, w[3]);
       image.image = vtn_get_image(b, w[3], &access);
       image.coord = NULL;
@@ -3912,6 +3915,7 @@ vtn_handle_image(struct vtn_builder *b, SpvOp opcode,
    OP(AtomicFMinEXT,             atomic)
    OP(AtomicFMaxEXT,             atomic)
    OP(ImageQueryFormat,          format)
+   OP(ImageQueryLevels,          levels)
    OP(ImageQueryOrder,           order)
    OP(ImageQuerySamples,         samples)
 #undef OP
@@ -3929,6 +3933,7 @@ vtn_handle_image(struct vtn_builder *b, SpvOp opcode,
       glsl_sampler_type_is_array(image.image->type));
 
    switch (opcode) {
+   case SpvOpImageQueryLevels:
    case SpvOpImageQuerySamples:
    case SpvOpImageQuerySize:
    case SpvOpImageQuerySizeLod:
@@ -3961,6 +3966,7 @@ vtn_handle_image(struct vtn_builder *b, SpvOp opcode,
    nir_intrinsic_set_access(intrin, access);
 
    switch (opcode) {
+   case SpvOpImageQueryLevels:
    case SpvOpImageQuerySamples:
    case SpvOpImageQueryFormat:
    case SpvOpImageQueryOrder:
@@ -4898,12 +4904,6 @@ vtn_handle_preamble_instruction(struct vtn_builder *b, SpvOp opcode,
    case SpvOpCapability: {
       SpvCapability cap = w[1];
       switch (cap) {
-      case SpvCapabilityLinkage:
-         if (!b->options->create_library)
-            vtn_warn("Unsupported SPIR-V capability: %s",
-                     spirv_capability_to_string(cap));
-         break;
-
       case SpvCapabilitySubgroupDispatch:
          /* Missing :
           *   - SpvOpGetKernelLocalSizeForSubgroupCount
@@ -5274,12 +5274,12 @@ vtn_handle_execution_mode(struct vtn_builder *b, struct vtn_value *entry_point,
 
    case SpvExecutionModeDerivativeGroupQuadsNV:
       vtn_assert(b->shader->info.stage == MESA_SHADER_COMPUTE);
-      b->shader->info.cs.derivative_group = DERIVATIVE_GROUP_QUADS;
+      b->shader->info.derivative_group = DERIVATIVE_GROUP_QUADS;
       break;
 
    case SpvExecutionModeDerivativeGroupLinearNV:
       vtn_assert(b->shader->info.stage == MESA_SHADER_COMPUTE);
-      b->shader->info.cs.derivative_group = DERIVATIVE_GROUP_LINEAR;
+      b->shader->info.derivative_group = DERIVATIVE_GROUP_LINEAR;
       break;
 
    case SpvExecutionModePixelInterlockOrderedEXT:
@@ -6096,6 +6096,34 @@ static bool
 vtn_handle_body_instruction(struct vtn_builder *b, SpvOp opcode,
                             const uint32_t *w, unsigned count)
 {
+   if (b->options->debug_info) {
+      nir_debug_info_instr *instr =
+         nir_debug_info_instr_create(b->shader, nir_debug_info_src_loc, 0);
+      instr->src_loc.spirv_offset = b->spirv_offset;
+      instr->src_loc.source = nir_debug_info_spirv;
+
+      if (b->file) {
+         nir_def *filename;
+         struct hash_entry *he = _mesa_hash_table_search(b->strings, b->file);
+         if (he) {
+            filename = he->data;
+         } else {
+            nir_builder _b = nir_builder_at(nir_before_cf_list(&b->nb.impl->body));
+            filename = nir_build_string(&_b, b->file);
+            _mesa_hash_table_insert(b->strings, b->file, filename);
+         }
+
+         instr->src_loc.filename = nir_src_for_ssa(filename);
+         /* Make sure line is at least 1 since 0 is reserved for spirv_offset-only
+          * source locations.
+          */
+         instr->src_loc.line = MAX2(b->line, 1);
+         instr->src_loc.column = b->col;
+      }
+
+      nir_builder_instr_insert(&b->nb, &instr->instr);
+   }
+
    switch (opcode) {
    case SpvOpLabel:
       break;
@@ -6162,7 +6190,6 @@ vtn_handle_body_instruction(struct vtn_builder *b, SpvOp opcode,
    case SpvOpImageDrefGather:
    case SpvOpImageSparseDrefGather:
    case SpvOpImageQueryLod:
-   case SpvOpImageQueryLevels:
       vtn_handle_texture(b, opcode, w, count);
       break;
 
@@ -6175,6 +6202,7 @@ vtn_handle_body_instruction(struct vtn_builder *b, SpvOp opcode,
       vtn_handle_image(b, opcode, w, count);
       break;
 
+   case SpvOpImageQueryLevels:
    case SpvOpImageQuerySamples:
    case SpvOpImageQuerySizeLod:
    case SpvOpImageQuerySize: {
@@ -6671,6 +6699,9 @@ vtn_create_builder(const uint32_t *words, size_t word_count,
    else
       b->supported_capabilities = implemented_capabilities;
 
+   spirv_capabilities_set(&b->supported_capabilities, SpvCapabilityLinkage,
+                          b->options->create_library);
+
    /* In GLSLang commit 8297936dd6eb3, their handling of barrier() was fixed
     * to provide correct memory semantics on compute shader barrier()
     * commands.  Prior to that, we need to fix them up ourselves.  This
@@ -6716,6 +6747,9 @@ vtn_create_builder(const uint32_t *words, size_t word_count,
 
    if (b->options->environment == NIR_SPIRV_VULKAN && b->version < 0x10400)
       b->vars_used_indirectly = _mesa_pointer_set_create(b);
+
+   if (b->options->debug_info)
+      b->strings = _mesa_pointer_hash_table_create(b);
 
    return b;
  fail:
@@ -6805,14 +6839,6 @@ can_remove(nir_variable *var, void *data)
    return !_mesa_set_search(vars_used_indirectly, var);
 }
 
-#ifndef NDEBUG
-static void
-initialize_mesa_spirv_debug(void)
-{
-   mesa_spirv_debug = debug_get_option_mesa_spirv_debug();
-}
-#endif
-
 nir_shader *
 spirv_to_nir(const uint32_t *words, size_t word_count,
              struct nir_spirv_specialization *spec, unsigned num_spec,
@@ -6821,10 +6847,10 @@ spirv_to_nir(const uint32_t *words, size_t word_count,
              const nir_shader_compiler_options *nir_options)
 
 {
-#ifndef NDEBUG
-   static once_flag initialized_debug_flag = ONCE_FLAG_INIT;
-   call_once(&initialized_debug_flag, initialize_mesa_spirv_debug);
-#endif
+   mesa_spirv_debug_init();
+
+   if (MESA_SPIRV_DEBUG(ASM))
+      spirv_print_asm(stderr, words, word_count);
 
    const uint32_t *word_end = words + word_count;
 
@@ -6933,6 +6959,7 @@ spirv_to_nir(const uint32_t *words, size_t word_count,
       progress = false;
       vtn_foreach_function(func, &b->functions) {
          if ((options->create_library || func->referenced) && !func->emitted) {
+            _mesa_hash_table_clear(b->strings, NULL);
             vtn_function_emit(b, func, vtn_handle_body_instruction);
             progress = true;
          }
@@ -7200,8 +7227,7 @@ spirv_library_to_nir_builder(FILE *fp, const uint32_t *words, size_t word_count,
                              const struct spirv_to_nir_options *options)
 {
 #ifndef NDEBUG
-   static once_flag initialized_debug_flag = ONCE_FLAG_INIT;
-   call_once(&initialized_debug_flag, initialize_mesa_spirv_debug);
+   mesa_spirv_debug_init();
 #endif
 
    const uint32_t *word_end = words + word_count;

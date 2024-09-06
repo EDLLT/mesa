@@ -422,20 +422,23 @@ op("stop", (0x88, 0xFFFF, 2, _), dests = 0, can_eliminate = False,
    schedule_class = "invalid")
 op("trap", (0x08, 0xFFFF, 2, _), dests = 0, can_eliminate = False,
    schedule_class = "invalid")
+
+# These are modelled as total barriers since they can guard global memory
+# access too, and even need to be properly ordered with loads.
 op("wait_pix", (0x48, 0xFF, 4, _), dests = 0, imms = [WRITEOUT],
-   can_eliminate = False, schedule_class = "coverage")
+   can_eliminate = False, schedule_class = "barrier")
 op("signal_pix", (0x58, 0xFF, 4, _), dests = 0, imms = [WRITEOUT],
-   can_eliminate = False, schedule_class = "coverage")
+   can_eliminate = False, schedule_class = "barrier")
 
 # Sources are the data vector, the coordinate vector, the LOD, the bindless
 # table if present (zero for texture state registers), and texture index.
 op("image_write", (0xF1 | (1 << 23) | (9 << 43), 0xFF, 6, 8), dests = 0, srcs = 5, imms
    = [DIM], can_eliminate = False, schedule_class = "store")
 
-# Sources are the image, the offset within shared memory, and the coordinates
-# (or just the layer if implicit).
+# Sources are the image base, image index, the offset within shared memory, and
+# the coordinates (or just the layer if implicit).
 # TODO: Do we need the short encoding?
-op("block_image_store", (0xB1, 0xFF, 10, _), dests = 0, srcs = 3,
+op("block_image_store", (0xB1, 0xFF, 10, _), dests = 0, srcs = 4,
    imms = [FORMAT, DIM, EXPLICIT_COORDS], can_eliminate = False, schedule_class = "store")
 
 # Barriers

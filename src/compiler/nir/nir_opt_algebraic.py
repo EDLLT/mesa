@@ -1888,12 +1888,10 @@ optimizations.extend([
    (('iadd', ('pack_half_2x16_rtz_split', a, 0), ('pack_half_2x16_rtz_split', 0, b)), ('pack_half_2x16_rtz_split', a, b)),
    (('ior',  ('pack_half_2x16_rtz_split', a, 0), ('pack_half_2x16_rtz_split', 0, b)), ('pack_half_2x16_rtz_split', a, b)),
 
+   (('pack_uint_2x16', ('vec2', ('pack_half_2x16_rtz_split', a, 0), ('pack_half_2x16_rtz_split', b, 0))), ('pack_half_2x16_rtz_split', a, b)),
+
    (('bfi', 0xffff0000, ('pack_half_2x16_split', a, b), ('pack_half_2x16_split', c, d)),
     ('pack_half_2x16_split', c, a)),
-
-   # Part of the BFI operation is src2&~src0. This expands to (b & 3) & ~0xc
-   # which is (b & 3) & 3.
-   (('bfi', 0x0000000c, a, ('iand', b, 3)), ('bfi', 0x0000000c, a, b)),
 
    # The important part here is that ~0xf & 0xfffffffc = ~0xf.
    (('iand', ('bfi', 0x0000000f, '#a', b), 0xfffffffc),
@@ -2005,6 +2003,7 @@ optimizations.extend([
    (('iand', '#a', ('iand', 'b(is_not_const)', '#c')), ('iand', ('iand', a, c), b)),
    (('ior',  '#a', ('ior',  'b(is_not_const)', '#c')), ('ior',  ('ior',  a, c), b)),
    (('ixor', '#a', ('ixor', 'b(is_not_const)', '#c')), ('ixor', ('ixor', a, c), b)),
+   (('ior', ('iand', a, '#c'), ('ior', b, ('iand', a, '#d'))), ('ior', b, ('iand', a, ('ior', c, d)))),
 
    # Reassociate add chains for more MAD/FMA-friendly code
    (('~fadd', ('fadd(is_used_once)', 'a(is_fmul)', 'b(is_fmul)'), 'c(is_not_fmul)'), ('fadd', ('fadd', a, c), b)),
@@ -2889,7 +2888,7 @@ for op in ['fadd', 'fmul', 'fmulz', 'iadd', 'imul']:
 for op in ['fddx', 'fddx_fine', 'fddx_coarse',
            'fddy', 'fddy_fine', 'fddy_coarse']:
    optimizations += [
-      ((op, 'a'), 0.0, 'info->stage == MESA_SHADER_COMPUTE && info->cs.derivative_group == DERIVATIVE_GROUP_NONE')
+      ((op, 'a'), 0.0, 'info->stage == MESA_SHADER_COMPUTE && info->derivative_group == DERIVATIVE_GROUP_NONE')
 ]
 
 # Some optimizations for ir3-specific instructions.

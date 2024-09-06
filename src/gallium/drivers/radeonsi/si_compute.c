@@ -999,7 +999,7 @@ static void si_emit_dispatch_packets(struct si_context *sctx, const struct pipe_
       }
 
       /* Thread tiling within a workgroup. */
-      switch (sctx->cs_shader_state.program->shader.selector->info.base.cs.derivative_group) {
+      switch (sctx->cs_shader_state.program->shader.selector->info.base.derivative_group) {
       case DERIVATIVE_GROUP_LINEAR:
          break;
       case DERIVATIVE_GROUP_QUADS:
@@ -1186,20 +1186,24 @@ static void si_launch_grid(struct pipe_context *ctx, const struct pipe_grid_info
    si_check_dirty_buffers_textures(sctx);
 
    if (sctx->has_graphics) {
-      if (sctx->last_num_draw_calls != sctx->num_draw_calls) {
+      if (sctx->num_draw_calls_sh_coherent.with_cb != sctx->num_draw_calls ||
+          sctx->num_draw_calls_sh_coherent.with_db != sctx->num_draw_calls) {
          si_update_fb_dirtiness_after_rendering(sctx);
-         sctx->last_num_draw_calls = sctx->num_draw_calls;
 
          if (sctx->force_shader_coherency.with_cb ||
-             si_check_needs_implicit_sync(sctx, RADEON_USAGE_CB_NEEDS_IMPLICIT_SYNC))
+             si_check_needs_implicit_sync(sctx, RADEON_USAGE_CB_NEEDS_IMPLICIT_SYNC)) {
+            sctx->num_draw_calls_sh_coherent.with_cb = sctx->num_draw_calls;
             si_make_CB_shader_coherent(sctx, 0,
                                        sctx->framebuffer.CB_has_shader_readable_metadata,
                                        sctx->framebuffer.all_DCC_pipe_aligned);
+         }
 
-          if (sctx->gfx_level == GFX12 &&
-              (sctx->force_shader_coherency.with_db ||
-               si_check_needs_implicit_sync(sctx, RADEON_USAGE_DB_NEEDS_IMPLICIT_SYNC)))
-             si_make_DB_shader_coherent(sctx, 0, false, false);
+         if (sctx->gfx_level == GFX12 &&
+             (sctx->force_shader_coherency.with_db ||
+              si_check_needs_implicit_sync(sctx, RADEON_USAGE_DB_NEEDS_IMPLICIT_SYNC))) {
+            sctx->num_draw_calls_sh_coherent.with_db = sctx->num_draw_calls;
+            si_make_DB_shader_coherent(sctx, 0, false, false);
+         }
       }
 
       if (sctx->gfx_level < GFX11)
@@ -1229,10 +1233,10 @@ static void si_launch_grid(struct pipe_context *ctx, const struct pipe_grid_info
                          NULL);
       }
    }
-   
+
    if (u_trace_perfetto_active(&sctx->ds.trace_context))
       trace_si_begin_compute(&sctx->trace);
-   
+
    if (sctx->bo_list_add_all_compute_resources)
       si_compute_resources_add_all_to_bo_list(sctx);
 
@@ -1306,7 +1310,7 @@ static void si_launch_grid(struct pipe_context *ctx, const struct pipe_grid_info
 
    if (u_trace_perfetto_active(&sctx->ds.trace_context))
       trace_si_end_compute(&sctx->trace, info->grid[0], info->grid[1], info->grid[2]);
-   
+
    if (cs_regalloc_hang) {
       sctx->flags |= SI_CONTEXT_CS_PARTIAL_FLUSH;
       si_mark_atom_dirty(sctx, &sctx->atoms.s.cache_flush);

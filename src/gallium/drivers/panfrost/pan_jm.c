@@ -354,7 +354,7 @@ GENX(jm_launch_grid)(struct panfrost_batch *batch,
 #endif
 
    unsigned indirect_dep = 0;
-#if PAN_GPU_INDIRECTS
+#if PAN_GPU_SUPPORTS_DISPATCH_INDIRECT
    if (info->indirect) {
       struct panfrost_device *dev = pan_device(batch->ctx->base.screen);
       struct pan_indirect_dispatch_info indirect = {
@@ -968,4 +968,13 @@ GENX(jm_launch_draw)(struct panfrost_batch *batch,
       jm_push_vertex_tiler_jobs(batch, &vertex, &tiler);
    }
 #endif
+}
+
+void
+GENX(jm_launch_draw_indirect)(struct panfrost_batch *batch,
+                              const struct pipe_draw_info *info,
+                              unsigned drawid_offset,
+                              const struct pipe_draw_indirect_info *indirect)
+{
+   unreachable("draw indirect not implemented for jm");
 }

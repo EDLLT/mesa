@@ -1,24 +1,6 @@
 /*
- * Copyright (c) 2013 Rob Clark <robdclark@gmail.com>
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright © 2013 Rob Clark <robdclark@gmail.com>
+ * SPDX-License-Identifier: MIT
  */
 
 #ifndef IR3_H_
@@ -1419,6 +1401,8 @@ is_reg_gpr(const struct ir3_register *reg)
 static inline bool
 is_reg_a0(const struct ir3_register *reg)
 {
+   if (reg->flags & (IR3_REG_CONST | IR3_REG_IMMED))
+      return false;
    return reg->num == regid(REG_A0, 0);
 }
 
@@ -1499,6 +1483,7 @@ static inline unsigned
 ir3_reg_file_offset(const struct ir3_register *reg, unsigned num,
                     bool mergedregs, enum ir3_reg_file *file)
 {
+   assert(!(reg->flags & (IR3_REG_IMMED | IR3_REG_CONST)));
    unsigned size = reg_elem_size(reg);
    if (!is_reg_gpr(reg)) {
       *file = IR3_FILE_NONGPR;
@@ -2167,6 +2152,15 @@ soft_sy_delay(struct ir3_instruction *instr, struct ir3 *shader)
       else
          return 109 + components;
    }
+}
+
+/* Some instructions don't immediately consume their sources so may introduce a
+ * WAR hazard.
+ */
+static inline bool
+is_war_hazard_producer(struct ir3_instruction *instr)
+{
+   return is_tex(instr) || is_mem(instr) || is_ss_producer(instr);
 }
 
 bool ir3_cleanup_rpt(struct ir3 *ir, struct ir3_shader_variant *v);

@@ -13,9 +13,7 @@ dEQP-VK.binding_model.descriptor_buffer.capture_replay.graphics_tese_sampled_ima
 dEQP-VK.binding_model.descriptor_buffer.capture_replay.graphics_vert_sampled_image,Fail
 dEQP-VK.binding_model.descriptor_buffer.capture_replay.graphics_vert_sampled_image_custom_border_color,Fail
 
-dEQP-VK.drm_format_modifiers.export_import.b10g11r11_ufloat_pack32,Fail
-dEQP-VK.drm_format_modifiers.export_import_fmt_features2.b10g11r11_ufloat_pack32,Fail
-
+# CTS bug, see https://gitlab.khronos.org/Tracker/vk-gl-cts/-/issues/5268
 dEQP-VK.fragment_shading_barycentric.data.shader_combos.with_tess_geom_shader.array2.double,Fail
 dEQP-VK.fragment_shading_barycentric.data.shader_combos.with_tess_geom_shader.array2.dvec2,Fail
 dEQP-VK.fragment_shading_barycentric.data.shader_combos.with_tess_geom_shader.array2.dvec3,Fail
@@ -257,24 +255,9 @@ dEQP-VK.fragment_shading_barycentric.pipeline_library.data.shader_combos.with_te
 dEQP-VK.fragment_shading_barycentric.pipeline_library.data.shader_combos.with_tess_shader.type.vec3,Fail
 dEQP-VK.fragment_shading_barycentric.pipeline_library.data.shader_combos.with_tess_shader.type.vec4,Fail
 
-dEQP-VK.pipeline.fast_linked_library.extended_dynamic_state.misc.dynamic_sample_shading_static_1_dynamic_2,Fail
-dEQP-VK.pipeline.fast_linked_library.extended_dynamic_state.misc.dynamic_sample_shading_static_1_dynamic_4,Fail
-dEQP-VK.pipeline.fast_linked_library.extended_dynamic_state.misc.dynamic_sample_shading_static_1_dynamic_8,Fail
-dEQP-VK.pipeline.fast_linked_library.extended_dynamic_state.misc.dynamic_sample_shading_static_2_dynamic_4,Fail
-dEQP-VK.pipeline.fast_linked_library.extended_dynamic_state.misc.dynamic_sample_shading_static_2_dynamic_8,Fail
 dEQP-VK.pipeline.fast_linked_library.pipeline_cache.robustness2.storage,Fail
-dEQP-VK.pipeline.pipeline_library.extended_dynamic_state.misc.dynamic_sample_shading_static_1_dynamic_2,Fail
-dEQP-VK.pipeline.pipeline_library.extended_dynamic_state.misc.dynamic_sample_shading_static_1_dynamic_4,Fail
-dEQP-VK.pipeline.pipeline_library.extended_dynamic_state.misc.dynamic_sample_shading_static_1_dynamic_8,Fail
 dEQP-VK.pipeline.pipeline_library.pipeline_cache.robustness2.storage,Fail
 dEQP-VK.pipeline.shader_object_linked_binary.pipeline_cache.robustness2.storage,Fail
 dEQP-VK.pipeline.shader_object_linked_spirv.pipeline_cache.robustness2.storage,Fail
 dEQP-VK.pipeline.shader_object_unlinked_binary.pipeline_cache.robustness2.storage,Fail
 dEQP-VK.pipeline.shader_object_unlinked_spirv.pipeline_cache.robustness2.storage,Fail
-
-dEQP-VK.spirv_assembly.instruction.compute.float_controls.fp16.generated_args.signed_zero_sub_var_preserve,Fail
-dEQP-VK.spirv_assembly.instruction.compute.float_controls.fp16.generated_args.signed_zero_sub_var_preserve_nostorage,Fail
-dEQP-VK.spirv_assembly.instruction.graphics.float_controls.fp16.generated_args.signed_zero_sub_var_preserve_frag,Fail
-dEQP-VK.spirv_assembly.instruction.graphics.float_controls.fp16.generated_args.signed_zero_sub_var_preserve_nostorage_frag,Fail
-dEQP-VK.spirv_assembly.instruction.graphics.float_controls.fp16.generated_args.signed_zero_sub_var_preserve_nostorage_vert,Fail
-dEQP-VK.spirv_assembly.instruction.graphics.float_controls.fp16.generated_args.signed_zero_sub_var_preserve_vert,Fail

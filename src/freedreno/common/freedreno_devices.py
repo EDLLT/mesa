@@ -1,24 +1,7 @@
 #
 # Copyright © 2021 Google, Inc.
 #
-# Permission is hereby granted, free of charge, to any person obtaining a
-# copy of this software and associated documentation files (the "Software"),
-# to deal in the Software without restriction, including without limitation
-# the rights to use, copy, modify, merge, publish, distribute, sublicense,
-# and/or sell copies of the Software, and to permit persons to whom the
-# Software is furnished to do so, subject to the following conditions:
-#
-# The above copyright notice and this permission notice (including the next
-# paragraph) shall be included in all copies or substantial portions of the
-# Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
-# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-# IN THE SOFTWARE.
+# SPDX-License-Identifier: MIT
 
 from mako.template import Template
 import sys
@@ -251,6 +234,7 @@ add_gpus([
     ))
 
 add_gpus([
+        GPUId(505),
         GPUId(506),
         GPUId(508),
         GPUId(509),
@@ -525,6 +509,36 @@ add_gpus([
             UCHE_CLIENT_PF = 0x00000004,
             PC_MODE_CNTL = 0x1f,
             SP_DBG_ECO_CNTL = 0x01000000,
+            RB_DBG_ECO_CNTL = 0x04100000,
+            RB_DBG_ECO_CNTL_blit = 0x04100000,
+            HLSQ_DBG_ECO_CNTL = 0x0,
+            RB_UNKNOWN_8E01 = 0x0,
+            VPC_DBG_ECO_CNTL = 0x02000000,
+            UCHE_UNKNOWN_0E12 = 0x00000001
+        )
+    ))
+
+add_gpus([
+        GPUId(chip_id=0xffff06020100, name="FD621"),
+    ], A6xxGPUInfo(
+        CHIP.A6XX,
+        [a6xx_base, a6xx_gen3, A6XXProps(lrz_track_quirk = False)],
+        num_ccu = 2,
+        tile_align_w = 96,
+        tile_align_h = 16,
+        num_vsc_pipes = 32,
+        cs_shared_mem_size = 32 * 1024,
+        wave_granularity = 2,
+        fibers_per_sp = 128 * 2 * 16,
+        magic_regs = dict(
+            PC_POWER_CNTL = 0,
+            # this seems to be a chicken bit that fixes cubic filtering:
+            TPL1_DBG_ECO_CNTL = 0x01008000,
+            GRAS_DBG_ECO_CNTL = 0x0,
+            SP_CHICKEN_BITS = 0x00001400,
+            # UCHE_CLIENT_PF = 0x00000004,
+            PC_MODE_CNTL = 0x1f,
+            SP_DBG_ECO_CNTL = 0x03000000,
             RB_DBG_ECO_CNTL = 0x04100000,
             RB_DBG_ECO_CNTL_blit = 0x04100000,
             HLSQ_DBG_ECO_CNTL = 0x0,
@@ -872,16 +886,13 @@ a7xx_750 = A7XXProps(
         sysmem_vpc_attr_buf_size = 0x20000,
         gmem_vpc_attr_buf_size = 0xc000,
         ubwc_unorm_snorm_int_compatible = True,
-        # a750 has a bug where writing and then reading a UBWC-compressed IBO
-        # requires flushing UCHE. This is reproducible in many CTS tests, for
-        # example dEQP-VK.image.load_store.with_format.2d.*. Disable this for
-        # now.
-        #supports_ibo_ubwc = True,
+        supports_ibo_ubwc = True,
         has_generic_clear = True,
         gs_vpc_adjacency_quirk = True,
         storage_8bit = True,
         ubwc_all_formats_compatible = True,
         has_compliant_dp4acc = True,
+        ubwc_coherency_quirk = True,
     )
 
 a730_magic_regs = dict(
@@ -1311,26 +1322,9 @@ add_gpus([
     ))
 
 template = """\
-/* Copyright (C) 2021 Google, Inc.
+/* Copyright © 2021 Google, Inc.
  *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
- * IN THE SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 #include "freedreno_dev_info.h"

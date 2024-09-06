@@ -69,7 +69,7 @@ pipeline_compute_sha1_from_nir(struct v3dv_pipeline_stage *p_stage)
       .stage = mesa_to_vk_shader_stage(p_stage->nir->info.stage),
    };
 
-   vk_pipeline_hash_shader_stage(&info, NULL, p_stage->shader_sha1);
+   vk_pipeline_hash_shader_stage(0, &info, NULL, p_stage->shader_sha1);
 }
 
 void
@@ -353,21 +353,6 @@ shader_module_compile_to_nir(struct v3dv_device *device,
 
    gl_shader_stage gl_stage = broadcom_shader_stage_to_gl(stage->stage);
 
-   if (V3D_DBG(DUMP_SPIRV)) {
-      char *spirv_data = NULL;
-      uint32_t spirv_size = 0;
-      if (stage->module != NULL && !stage->module->nir) {
-         spirv_data = (char *) stage->module->data;
-         spirv_size = stage->module->size;
-      } else if (stage->module_info) {
-         spirv_data = (char *) stage->module_info->pCode;
-         spirv_size = stage->module_info->codeSize;
-      }
-
-      if (spirv_data)
-         v3dv_print_spirv(spirv_data, spirv_size, stderr);
-   }
-
    const VkPipelineShaderStageCreateInfo stage_info = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
       .pNext = !stage->module ? stage->module_info : NULL,
@@ -382,6 +367,7 @@ shader_module_compile_to_nir(struct v3dv_device *device,
     * so we don't have to call it here.
     */
    VkResult result = vk_pipeline_shader_stage_to_nir(&device->vk,
+                                                     stage->pipeline->flags,
                                                      &stage_info,
                                                      &default_spirv_options,
                                                      nir_options,
@@ -397,7 +383,7 @@ shader_module_compile_to_nir(struct v3dv_device *device,
    }
 
    if (V3D_DBG(NIR) || v3d_debug_flag_for_shader_stage(gl_stage)) {
-      fprintf(stderr, "NIR after vk_shader_module_to_nir: %s prog %d NIR:\n",
+      fprintf(stderr, "NIR after vk_pipeline_shader_stage_to_nir: %s prog %d NIR:\n",
               broadcom_shader_stage_name(stage->stage),
               stage->program_id);
       nir_print_shader(nir, stderr);
@@ -2428,7 +2414,8 @@ pipeline_compile_graphics(struct v3dv_pipeline *pipeline,
       vk_pipeline_robustness_state_fill(&device->vk, &p_stage->robustness,
                                         pCreateInfo->pNext, sinfo->pNext);
 
-      vk_pipeline_hash_shader_stage(&pCreateInfo->pStages[i],
+      vk_pipeline_hash_shader_stage(pipeline->flags,
+                                    &pCreateInfo->pStages[i],
                                     &p_stage->robustness,
                                     p_stage->shader_sha1);
 
@@ -3171,7 +3158,8 @@ pipeline_compile_compute(struct v3dv_pipeline *pipeline,
    vk_pipeline_robustness_state_fill(&device->vk, &p_stage->robustness,
                                      info->pNext, sinfo->pNext);
 
-   vk_pipeline_hash_shader_stage(&info->stage,
+   vk_pipeline_hash_shader_stage(pipeline->flags,
+                                 &info->stage,
                                  &p_stage->robustness,
                                  p_stage->shader_sha1);
 

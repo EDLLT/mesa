@@ -148,8 +148,6 @@ static void radeon_enc_encode_params_h264(struct radeon_encoder *enc)
 {
    enc->enc_pic.h264_enc_params.input_picture_structure = RENCODE_H264_PICTURE_STRUCTURE_FRAME;
    enc->enc_pic.h264_enc_params.input_pic_order_cnt = 0;
-   enc->enc_pic.h264_enc_params.is_reference = !enc->enc_pic.not_referenced;
-   enc->enc_pic.h264_enc_params.is_long_term = enc->enc_pic.is_ltr;
    enc->enc_pic.h264_enc_params.interlaced_mode = RENCODE_H264_INTERLACING_MODE_PROGRESSIVE;
 
    if (enc->enc_pic.enc_params.reference_picture_index != 0xFFFFFFFF){
@@ -416,9 +414,6 @@ static void radeon_enc_encode_params_av1(struct radeon_encoder *enc)
 
 static void radeon_enc_spec_misc_hevc(struct radeon_encoder *enc)
 {
-   enc->enc_pic.hevc_spec_misc.transform_skip_discarded = 0;
-   enc->enc_pic.hevc_spec_misc.cu_qp_delta_enabled_flag = 0;
-
    RADEON_ENC_BEGIN(enc->cmd.spec_misc_hevc);
    RADEON_ENC_CS(enc->enc_pic.hevc_spec_misc.log2_min_luma_coding_block_size_minus3);
    RADEON_ENC_CS(enc->enc_pic.hevc_spec_misc.amp_disabled);
@@ -427,7 +422,7 @@ static void radeon_enc_spec_misc_hevc(struct radeon_encoder *enc)
    RADEON_ENC_CS(enc->enc_pic.hevc_spec_misc.cabac_init_flag);
    RADEON_ENC_CS(enc->enc_pic.hevc_spec_misc.half_pel_enabled);
    RADEON_ENC_CS(enc->enc_pic.hevc_spec_misc.quarter_pel_enabled);
-   RADEON_ENC_CS(enc->enc_pic.hevc_spec_misc.transform_skip_discarded);
+   RADEON_ENC_CS(enc->enc_pic.hevc_spec_misc.transform_skip_disabled);
    RADEON_ENC_CS(0);
    RADEON_ENC_CS(enc->enc_pic.hevc_spec_misc.cu_qp_delta_enabled_flag);
    RADEON_ENC_END();

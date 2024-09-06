@@ -48,19 +48,6 @@
 #include "vk_descriptor_update_template.h"
 #include "vk_format.h"
 
-static uint32_t
-panvk_debug_adjust_bo_flags(const struct panvk_device *device,
-                            uint32_t bo_flags)
-{
-   struct panvk_instance *instance =
-      to_panvk_instance(device->vk.physical->instance);
-
-   if (instance->debug_flags & PANVK_DEBUG_DUMP)
-      bo_flags &= ~PAN_KMOD_BO_FLAG_NO_MMAP;
-
-   return bo_flags;
-}
-
 static void
 panvk_cmd_prepare_fragment_job(struct panvk_cmd_buffer *cmdbuf, mali_ptr fbd)
 {
@@ -333,13 +320,9 @@ panvk_reset_cmdbuf(struct vk_command_buffer *vk_cmdbuf,
    panvk_pool_reset(&cmdbuf->desc_pool);
    panvk_pool_reset(&cmdbuf->tls_pool);
    panvk_pool_reset(&cmdbuf->varying_pool);
+   panvk_cmd_buffer_obj_list_reset(cmdbuf, push_sets);
 
-   panvk_per_arch(cmd_desc_state_reset)(&cmdbuf->state.gfx.desc_state,
-                                        &cmdbuf->state.compute.desc_state);
-   memset(&cmdbuf->state.gfx.vs.desc, 0, sizeof(cmdbuf->state.gfx.vs.desc));
-   memset(&cmdbuf->state.gfx.fs.desc, 0, sizeof(cmdbuf->state.gfx.fs.desc));
-   memset(&cmdbuf->state.compute.cs.desc, 0,
-          sizeof(cmdbuf->state.compute.cs.desc));
+   memset(&cmdbuf->state, 0, sizeof(cmdbuf->state));
 }
 
 static void
@@ -348,10 +331,6 @@ panvk_destroy_cmdbuf(struct vk_command_buffer *vk_cmdbuf)
    struct panvk_cmd_buffer *cmdbuf =
       container_of(vk_cmdbuf, struct panvk_cmd_buffer, vk);
    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
-
-   panvk_per_arch(cmd_desc_state_cleanup)(&cmdbuf->vk,
-                                          &cmdbuf->state.gfx.desc_state,
-                                          &cmdbuf->state.compute.desc_state);
 
    list_for_each_entry_safe(struct panvk_batch, batch, &cmdbuf->batches, node) {
       list_del(&batch->node);
@@ -364,6 +343,7 @@ panvk_destroy_cmdbuf(struct vk_command_buffer *vk_cmdbuf)
    panvk_pool_cleanup(&cmdbuf->desc_pool);
    panvk_pool_cleanup(&cmdbuf->tls_pool);
    panvk_pool_cleanup(&cmdbuf->varying_pool);
+   panvk_cmd_buffer_obj_list_cleanup(cmdbuf, push_sets);
    vk_command_buffer_finish(&cmdbuf->vk);
    vk_free(&dev->vk.alloc, cmdbuf);
 }
@@ -390,6 +370,7 @@ panvk_create_cmdbuf(struct vk_command_pool *vk_pool, VkCommandBufferLevel level,
       return result;
    }
 
+   panvk_cmd_buffer_obj_list_init(cmdbuf, push_sets);
    cmdbuf->vk.dynamic_graphics_state.vi = &cmdbuf->state.gfx.dynamic.vi;
    cmdbuf->vk.dynamic_graphics_state.ms.sample_locations =
       &cmdbuf->state.gfx.dynamic.sl;
@@ -407,7 +388,7 @@ panvk_create_cmdbuf(struct vk_command_pool *vk_pool, VkCommandBufferLevel level,
 
    struct panvk_pool_properties tls_pool_props = {
       .create_flags =
-         panvk_debug_adjust_bo_flags(device, PAN_KMOD_BO_FLAG_NO_MMAP),
+         panvk_device_adjust_bo_flags(device, PAN_KMOD_BO_FLAG_NO_MMAP),
       .slab_size = 64 * 1024,
       .label = "TLS pool",
       .prealloc = false,
@@ -419,7 +400,7 @@ panvk_create_cmdbuf(struct vk_command_pool *vk_pool, VkCommandBufferLevel level,
 
    struct panvk_pool_properties var_pool_props = {
       .create_flags =
-         panvk_debug_adjust_bo_flags(device, PAN_KMOD_BO_FLAG_NO_MMAP),
+         panvk_device_adjust_bo_flags(device, PAN_KMOD_BO_FLAG_NO_MMAP),
       .slab_size = 64 * 1024,
       .label = "TLS pool",
       .prealloc = false,
@@ -447,8 +428,6 @@ panvk_per_arch(BeginCommandBuffer)(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
 
    vk_command_buffer_begin(&cmdbuf->vk, pBeginInfo);
-
-   memset(&cmdbuf->state, 0, sizeof(cmdbuf->state));
 
    return VK_SUCCESS;
 }

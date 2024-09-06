@@ -723,25 +723,15 @@ enum ENUM_PACKED brw_predicate {
 };
 
 enum ENUM_PACKED brw_reg_file {
-   BRW_ARCHITECTURE_REGISTER_FILE = 0,
-   BRW_GENERAL_REGISTER_FILE      = 1,
-   BRW_IMMEDIATE_VALUE            = 3,
+   BAD_FILE = 0,
 
-   ARF = BRW_ARCHITECTURE_REGISTER_FILE,
-   FIXED_GRF = BRW_GENERAL_REGISTER_FILE,
-   IMM = BRW_IMMEDIATE_VALUE,
+   ARF,
+   FIXED_GRF,
+   IMM,
 
-   /* These are not hardware values */
    VGRF,
    ATTR,
    UNIFORM, /* prog_data->params[reg] */
-   BAD_FILE,
-};
-
-enum ENUM_PACKED gfx10_align1_3src_reg_file {
-   BRW_ALIGN1_3SRC_GENERAL_REGISTER_FILE = 0,
-   BRW_ALIGN1_3SRC_IMMEDIATE_VALUE       = 1, /* src0, src2 */
-   BRW_ALIGN1_3SRC_ACCUMULATOR           = 1, /* dest, src1 */
 };
 
 /* CNL adds Align1 support for 3-src instructions. Bit 35 of the instruction
@@ -759,8 +749,6 @@ enum ENUM_PACKED gfx10_align1_3src_exec_type {
 #define BRW_ARF_ACCUMULATOR           0x20
 #define BRW_ARF_FLAG                  0x30
 #define BRW_ARF_MASK                  0x40
-#define BRW_ARF_MASK_STACK            0x50
-#define BRW_ARF_MASK_STACK_DEPTH      0x60
 #define BRW_ARF_STATE                 0x70
 #define BRW_ARF_CONTROL               0x80
 #define BRW_ARF_NOTIFICATION_COUNT    0x90

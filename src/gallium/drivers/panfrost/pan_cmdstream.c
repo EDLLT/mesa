@@ -1850,28 +1850,33 @@ emit_image_bufs(struct panfrost_batch *batch, enum pipe_shader_type shader,
 
       pan_pack(bufs + (i * 2) + 1, ATTRIBUTE_BUFFER_CONTINUATION_3D, cfg) {
          unsigned level = image->u.tex.level;
-         unsigned r_dim;
+         unsigned samples = rsrc->image.layout.nr_samples;
 
-         if (is_3d) {
-            r_dim = u_minify(rsrc->base.depth0, level);
-         } else if (is_msaa) {
-            r_dim = u_minify(image->resource->nr_samples, level);
-         } else {
-            r_dim = image->u.tex.last_layer - image->u.tex.first_layer + 1;
-         }
          cfg.s_dimension = u_minify(rsrc->base.width0, level);
          cfg.t_dimension = u_minify(rsrc->base.height0, level);
-         cfg.r_dimension = r_dim;
+         cfg.r_dimension = is_3d ? u_minify(rsrc->image.layout.depth, level)
+            : (image->u.tex.last_layer - image->u.tex.first_layer + 1);
 
          cfg.row_stride = rsrc->image.layout.slices[level].row_stride;
-
-         if (is_msaa) {
-            unsigned samples = rsrc->base.nr_samples;
-            cfg.slice_stride =
-               panfrost_get_layer_stride(&rsrc->image.layout, level) / samples;
-         } else if (rsrc->base.target != PIPE_TEXTURE_2D) {
+         if (cfg.r_dimension > 1) {
             cfg.slice_stride =
                panfrost_get_layer_stride(&rsrc->image.layout, level);
+         }
+
+         if (is_msaa) {
+            if (cfg.r_dimension == 1) {
+               /* regular multisampled images get the sample index in
+                  the R dimension */
+               cfg.r_dimension = samples;
+               cfg.slice_stride =
+                  panfrost_get_layer_stride(&rsrc->image.layout, level) / samples;
+            } else {
+               /* multisampled image arrays are emulated by making the
+                  image "samples" times higher than the original image,
+                  and fixing up the T coordinate by the sample number
+                  to address the correct sample (on bifrost) */
+               cfg.t_dimension *= samples;
+            }
          }
       }
    }
@@ -2912,9 +2917,10 @@ panfrost_draw_get_vertex_count(struct panfrost_batch *batch,
 }
 
 static void
-panfrost_direct_draw(struct panfrost_batch *batch,
-                     const struct pipe_draw_info *info, unsigned drawid_offset,
-                     const struct pipe_draw_start_count_bias *draw)
+panfrost_single_draw_direct(struct panfrost_batch *batch,
+                            const struct pipe_draw_info *info,
+                            unsigned drawid_offset,
+                            const struct pipe_draw_start_count_bias *draw)
 {
    if (!draw->count || !info->instance_count)
       return;
@@ -2995,28 +3001,11 @@ panfrost_compatible_batch_state(struct panfrost_batch *batch,
       return pan_tristate_set(&batch->first_provoking_vertex, first);
 }
 
-static void
-panfrost_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
-                  unsigned drawid_offset,
-                  const struct pipe_draw_indirect_info *indirect,
-                  const struct pipe_draw_start_count_bias *draws,
-                  unsigned num_draws)
+static struct panfrost_batch *
+prepare_draw(struct pipe_context *pipe, const struct pipe_draw_info *info)
 {
    struct panfrost_context *ctx = pan_context(pipe);
    struct panfrost_device *dev = pan_device(pipe->screen);
-
-   if (!panfrost_render_condition_check(ctx))
-      return;
-
-   ctx->draw_calls++;
-
-   /* Emulate indirect draws on JM */
-   if (indirect && indirect->buffer) {
-      assert(num_draws == 1);
-      util_draw_indirect(pipe, info, drawid_offset, indirect);
-      perf_debug(ctx, "Emulating indirect draw on the CPU");
-      return;
-   }
 
    /* Do some common setup */
    struct panfrost_batch *batch = panfrost_get_batch_for_fbo(ctx);
@@ -3053,16 +3042,101 @@ panfrost_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    /* Conservatively assume draw parameters always change */
    ctx->dirty |= PAN_DIRTY_PARAMS | PAN_DIRTY_DRAWID;
 
+   return batch;
+}
+
+static void
+panfrost_draw_indirect(struct pipe_context *pipe,
+                       const struct pipe_draw_info *info,
+                       unsigned drawid_offset,
+                       const struct pipe_draw_indirect_info *indirect)
+{
+   struct panfrost_context *ctx = pan_context(pipe);
+
+   if (!PAN_GPU_SUPPORTS_DRAW_INDIRECT || ctx->active_queries ||
+       ctx->streamout.num_targets) {
+      util_draw_indirect(pipe, info, drawid_offset, indirect);
+      perf_debug(ctx, "Emulating indirect draw on the CPU");
+      return;
+   }
+
+   struct panfrost_batch *batch = prepare_draw(pipe, info);
+   struct pipe_draw_info tmp_info = *info;
+
+   panfrost_batch_read_rsrc(batch, pan_resource(indirect->buffer),
+                            PIPE_SHADER_VERTEX);
+
+   panfrost_update_active_prim(ctx, &tmp_info);
+
+   ctx->drawid = drawid_offset;
+
+   batch->indices = 0;
+   if (info->index_size) {
+      struct panfrost_resource *index_buffer =
+         pan_resource(info->index.resource);
+      panfrost_batch_read_rsrc(batch, index_buffer, PIPE_SHADER_VERTEX);
+      batch->indices = index_buffer->image.data.base;
+   }
+
+   panfrost_update_state_3d(batch);
+   panfrost_update_shader_state(batch, PIPE_SHADER_VERTEX);
+   panfrost_update_shader_state(batch, PIPE_SHADER_FRAGMENT);
+   panfrost_clean_state_3d(ctx);
+
+   /* Increment transform feedback offsets */
+   panfrost_update_streamout_offsets(ctx);
+
+   /* Any side effects must be handled by the XFB shader, so we only need
+    * to run vertex shaders if we need rasterization.
+    */
+   if (panfrost_batch_skip_rasterization(batch))
+      return;
+
+   JOBX(launch_draw_indirect)(batch, &tmp_info, drawid_offset, indirect);
+   batch->draw_count++;
+}
+
+static void
+panfrost_multi_draw_direct(struct pipe_context *pipe,
+                           const struct pipe_draw_info *info,
+                           unsigned drawid_offset,
+                           const struct pipe_draw_start_count_bias *draws,
+                           unsigned num_draws)
+{
+   struct panfrost_context *ctx = pan_context(pipe);
+   struct panfrost_batch *batch = prepare_draw(pipe, info);
    struct pipe_draw_info tmp_info = *info;
    unsigned drawid = drawid_offset;
 
    for (unsigned i = 0; i < num_draws; i++) {
-      panfrost_direct_draw(batch, &tmp_info, drawid, &draws[i]);
+      panfrost_single_draw_direct(batch, &tmp_info, drawid, &draws[i]);
 
       if (tmp_info.increment_draw_id) {
          ctx->dirty |= PAN_DIRTY_DRAWID;
          drawid++;
       }
+   }
+}
+
+static void
+panfrost_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
+                  unsigned drawid_offset,
+                  const struct pipe_draw_indirect_info *indirect,
+                  const struct pipe_draw_start_count_bias *draws,
+                  unsigned num_draws)
+{
+   struct panfrost_context *ctx = pan_context(pipe);
+
+   if (!panfrost_render_condition_check(ctx))
+      return;
+
+   ctx->draw_calls++;
+
+   if (indirect && indirect->buffer) {
+      assert(num_draws == 1);
+      panfrost_draw_indirect(pipe, info, drawid_offset, indirect);
+   } else {
+      panfrost_multi_draw_direct(pipe, info, drawid_offset, draws, num_draws);
    }
 }
 
@@ -3085,7 +3159,7 @@ panfrost_launch_grid_on_batch(struct pipe_context *pipe,
       panfrost_batch_write_rsrc(batch, buffer, PIPE_SHADER_COMPUTE);
    }
 
-   if (info->indirect && !PAN_GPU_INDIRECTS) {
+   if (info->indirect && !PAN_GPU_SUPPORTS_DISPATCH_INDIRECT) {
       struct pipe_transfer *transfer;
       uint32_t *params =
          pipe_buffer_map_range(pipe, info->indirect, info->indirect_offset,
@@ -3850,7 +3924,7 @@ GENX(panfrost_cmdstream_screen_init)(struct panfrost_screen *screen)
    (&dev->blitter, panfrost_device_gpu_id(dev), &dev->blend_shaders,
     &screen->blitter.bin_pool.base, &screen->blitter.desc_pool.base);
 
-#if PAN_GPU_INDIRECTS
+#if PAN_GPU_SUPPORTS_DISPATCH_INDIRECT
    pan_indirect_dispatch_meta_init(
       &dev->indirect_dispatch, panfrost_device_gpu_id(dev),
       &screen->blitter.bin_pool.base, &screen->blitter.desc_pool.base);

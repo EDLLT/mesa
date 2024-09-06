@@ -1763,8 +1763,6 @@ brw_postprocess_nir(nir_shader *nir, const struct brw_compiler *compiler,
       }
    }
 
-   OPT(intel_nir_lower_conversions);
-
    OPT(nir_lower_alu_to_scalar, NULL, NULL);
 
    while (OPT(nir_opt_algebraic_distribute_src_mods)) {
@@ -1808,11 +1806,24 @@ brw_postprocess_nir(nir_shader *nir, const struct brw_compiler *compiler,
       /* Some of the optimizations can generate 64-bit integer multiplication
        * that must be lowered.
        */
-      if (OPT(nir_lower_int64))
-         brw_nir_optimize(nir, devinfo);
+      OPT(nir_lower_int64);
+
+      /* Even if nir_lower_int64 did not make progress, re-run the main
+       * optimization loop. nir_opt_uniform_subgroup may have made some things
+       * that previously appeared divergent be marked as convergent. This
+       * allows the elimination of some loops over, say, a TXF instruction
+       * with a non-uniform texture handle.
+       */
+      brw_nir_optimize(nir, devinfo);
 
       OPT(nir_lower_subgroups, &subgroups_options);
    }
+
+   /* Run intel_nir_lower_conversions only after the last tiem
+    * brw_nir_optimize is called. Various optimizations invoked there can
+    * rematerialize the conversions that the lowering pass eliminates.
+    */
+   OPT(intel_nir_lower_conversions);
 
    /* Do this only after the last opt_gcm. GCM will undo this lowering. */
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
@@ -1910,6 +1921,9 @@ get_subgroup_size(const struct shader_info *info, unsigned max_subgroup_size)
        * size.
        */
       return info->stage == MESA_SHADER_FRAGMENT ? 0 : max_subgroup_size;
+
+   case SUBGROUP_SIZE_REQUIRE_4:
+      unreachable("Unsupported subgroup size type");
 
    case SUBGROUP_SIZE_REQUIRE_8:
    case SUBGROUP_SIZE_REQUIRE_16:

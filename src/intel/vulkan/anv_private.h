@@ -149,21 +149,6 @@ struct intel_perf_query_result;
 
 #define BINDING_TABLE_POOL_BLOCK_SIZE (65536)
 
-/* Allowing different clear colors requires us to perform a depth resolve at
- * the end of certain render passes. This is because while slow clears store
- * the clear color in the HiZ buffer, fast clears (without a resolve) don't.
- * See the PRMs for examples describing when additional resolves would be
- * necessary. To enable fast clears without requiring extra resolves, we set
- * the clear value to a globally-defined one. We could allow different values
- * if the user doesn't expect coherent data during or after a render passes
- * (VK_ATTACHMENT_STORE_OP_DONT_CARE), but such users (aside from the CTS)
- * don't seem to exist yet. In almost all Vulkan applications tested thus far,
- * 1.0f seems to be the only value used. The only application that doesn't set
- * this value does so through the usage of an seemingly uninitialized clear
- * value.
- */
-#define ANV_HZ_FC_VAL 1.0f
-
 /* 3DSTATE_VERTEX_BUFFER supports 33 VBs, we use 2 for base & drawid SGVs */
 #define MAX_VBS         (33 - 2)
 
@@ -593,6 +578,13 @@ static inline struct anv_address
 anv_address_add(struct anv_address addr, uint64_t offset)
 {
    addr.offset += offset;
+   return addr;
+}
+
+static inline struct anv_address
+anv_address_add_aligned(struct anv_address addr, uint64_t offset, uint32_t alignment)
+{
+   addr.offset = align(addr.offset + offset, alignment);
    return addr;
 }
 
@@ -1287,6 +1279,7 @@ struct anv_instance {
      * Workarounds for game bugs.
      */
     uint8_t                                     assume_full_subgroups;
+    bool                                        assume_full_subgroups_with_barrier;
     bool                                        limit_trig_input_range;
     bool                                        sample_mask_out_opengl_behaviour;
     bool                                        force_filter_addr_rounding;
@@ -1959,7 +1952,6 @@ struct anv_device {
     struct anv_cmd_buffer                      *cmd_buffer_being_decoded;
 
     int                                         perf_fd; /* -1 if no opened */
-    uint64_t                                    perf_metric; /* 0 if unset */
 
     struct intel_aux_map_context                *aux_map_ctx;
 
@@ -3327,6 +3319,7 @@ enum anv_cmd_dirty_bits {
    ANV_CMD_DIRTY_OCCLUSION_QUERY_ACTIVE              = 1 << 6,
    ANV_CMD_DIRTY_FS_MSAA_FLAGS                       = 1 << 7,
    ANV_CMD_DIRTY_COARSE_PIXEL_ACTIVE                 = 1 << 8,
+   ANV_CMD_DIRTY_INDIRECT_DATA_STRIDE                = 1 << 9,
 };
 typedef enum anv_cmd_dirty_bits anv_cmd_dirty_mask_t;
 
@@ -3847,6 +3840,9 @@ struct anv_cmd_graphics_state {
    uint32_t index_offset;
    uint32_t index_size;
 
+   uint32_t indirect_data_stride;
+   bool indirect_data_stride_aligned;
+
    struct vk_vertex_input_state vertex_input;
    struct vk_sample_locations_state sample_locations;
 
@@ -3897,8 +3893,6 @@ struct anv_cmd_compute_state {
    struct anv_cmd_pipeline_state base;
 
    bool pipeline_dirty;
-
-   struct anv_state push_data;
 
    struct anv_address num_workgroups;
 
@@ -5705,12 +5699,26 @@ anv_image_clear_depth_stencil(struct anv_cmd_buffer *cmd_buffer,
                               uint32_t level,
                               uint32_t base_layer, uint32_t layer_count,
                               VkRect2D area,
-                              float depth_value, uint8_t stencil_value);
+                              const VkClearDepthStencilValue *clear_value);
 void
 anv_attachment_msaa_resolve(struct anv_cmd_buffer *cmd_buffer,
                             const struct anv_attachment *att,
                             VkImageLayout layout,
                             VkImageAspectFlagBits aspect);
+
+static inline union isl_color_value
+anv_image_hiz_clear_value(const struct anv_image *image)
+{
+   /* The benchmarks we're tracking tend to prefer clearing depth buffers to
+    * 0.0f when the depth buffers are part of images with multiple aspects.
+    * Otherwise, they tend to prefer clearing depth buffers to 1.0f.
+    */
+   if (image->n_planes == 2)
+      return (union isl_color_value) { .f32 = { 0.0f, } };
+   else
+      return (union isl_color_value) { .f32 = { 1.0f, } };
+}
+
 void
 anv_image_hiz_op(struct anv_cmd_buffer *cmd_buffer,
                  const struct anv_image *image,
@@ -5723,7 +5731,8 @@ anv_image_hiz_clear(struct anv_cmd_buffer *cmd_buffer,
                     VkImageAspectFlags aspects,
                     uint32_t level,
                     uint32_t base_layer, uint32_t layer_count,
-                    VkRect2D area, uint8_t stencil_value);
+                    VkRect2D area,
+                    const VkClearDepthStencilValue *clear_value);
 void
 anv_image_mcs_op(struct anv_cmd_buffer *cmd_buffer,
                  const struct anv_image *image,
@@ -6164,6 +6173,7 @@ struct anv_performance_configuration_intel {
 void anv_physical_device_init_va_ranges(struct anv_physical_device *device);
 void anv_physical_device_init_perf(struct anv_physical_device *device, int fd);
 void anv_device_perf_init(struct anv_device *device);
+void anv_device_perf_close(struct anv_device *device);
 void anv_perf_write_pass_results(struct intel_perf_config *perf,
                                  struct anv_query_pool *pool, uint32_t pass,
                                  const struct intel_perf_query_result *accumulated_results,

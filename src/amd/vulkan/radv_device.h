@@ -337,7 +337,6 @@ struct radv_meta_state {
    struct {
       VkDescriptorSetLayout ds_layout;
       VkPipelineLayout p_layout;
-      VkPipeline pipeline;
    } dgc_prepare;
 };
 
@@ -565,7 +564,7 @@ radv_device_physical(const struct radv_device *dev)
 static inline bool
 radv_uses_device_generated_commands(const struct radv_device *device)
 {
-   return device->vk.enabled_features.deviceGeneratedCommands || device->vk.enabled_features.deviceGeneratedCompute;
+   return device->vk.enabled_features.deviceGeneratedCommandsNV || device->vk.enabled_features.deviceGeneratedCompute;
 }
 
 static inline bool

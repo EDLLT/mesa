@@ -67,6 +67,34 @@ vlVaCreateSurfaces(VADriverContextP ctx, int width, int height, int format,
                               NULL, 0);
 }
 
+static void
+vlVaRemoveDpbSurface(vlVaSurface *surf, VASurfaceID id)
+{
+   assert(surf->ctx->templat.entrypoint == PIPE_VIDEO_ENTRYPOINT_ENCODE);
+
+   switch (u_reduce_video_profile(surf->ctx->templat.profile)) {
+   case PIPE_VIDEO_FORMAT_MPEG4_AVC:
+      for (unsigned i = 0; i < surf->ctx->desc.h264enc.dpb_size; i++) {
+         if (surf->ctx->desc.h264enc.dpb[i].id == id) {
+            memset(&surf->ctx->desc.h264enc.dpb[i], 0, sizeof(surf->ctx->desc.h264enc.dpb[i]));
+            break;
+         }
+      }
+      break;
+   case PIPE_VIDEO_FORMAT_HEVC:
+      for (unsigned i = 0; i < surf->ctx->desc.h265enc.dpb_size; i++) {
+         if (surf->ctx->desc.h265enc.dpb[i].id == id) {
+            memset(&surf->ctx->desc.h265enc.dpb[i], 0, sizeof(surf->ctx->desc.h265enc.dpb[i]));
+            break;
+         }
+      }
+      break;
+   default:
+      assert(false);
+      break;
+   }
+}
+
 VAStatus
 vlVaDestroySurfaces(VADriverContextP ctx, VASurfaceID *surface_list, int num_surfaces)
 {
@@ -91,6 +119,8 @@ vlVaDestroySurfaces(VADriverContextP ctx, VASurfaceID *surface_list, int num_sur
          _mesa_set_remove_key(surf->ctx->surfaces, surf);
          if (surf->fence && surf->ctx->decoder && surf->ctx->decoder->destroy_fence)
             surf->ctx->decoder->destroy_fence(surf->ctx->decoder, surf->fence);
+         if (surf->is_dpb)
+            vlVaRemoveDpbSurface(surf, surface_list[i]);
       }
       if (drv->last_efc_surface) {
          vlVaSurface *efc_surf = drv->last_efc_surface;
@@ -125,8 +155,7 @@ _vlVaSyncSurface(VADriverContextP ctx, VASurfaceID render_target, uint64_t timeo
 
    mtx_lock(&drv->mutex);
    surf = handle_table_get(drv->htab, render_target);
-
-   if (!surf || !surf->buffer) {
+   if (!surf) {
       mtx_unlock(&drv->mutex);
       return VA_STATUS_ERROR_INVALID_SURFACE;
    }
@@ -137,7 +166,7 @@ _vlVaSyncSurface(VADriverContextP ctx, VASurfaceID render_target, uint64_t timeo
     * Some apps try to sync/map the surface right after creation and
     * would get VA_STATUS_ERROR_INVALID_CONTEXT
     */
-   if ((!surf->feedback) && (!surf->fence)) {
+   if (!surf->buffer || (!surf->feedback && !surf->fence)) {
       // No outstanding encode/decode operation: nothing to do.
       mtx_unlock(&drv->mutex);
       return VA_STATUS_SUCCESS;
@@ -177,7 +206,7 @@ _vlVaSyncSurface(VADriverContextP ctx, VASurfaceID render_target, uint64_t timeo
       mtx_unlock(&drv->mutex);
       // Assume that the GPU has hung otherwise.
       return ret ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_TIMEDOUT;
-   } else if (context->decoder->entrypoint == PIPE_VIDEO_ENTRYPOINT_ENCODE) {
+   } else if (context->decoder->entrypoint == PIPE_VIDEO_ENTRYPOINT_ENCODE && surf->feedback) {
       if (!drv->pipe->screen->get_video_param(drv->pipe->screen,
                               context->decoder->profile,
                               context->decoder->entrypoint,
@@ -195,6 +224,11 @@ _vlVaSyncSurface(VADriverContextP ctx, VASurfaceID render_target, uint64_t timeo
                context->first_single_submitted = true;
             }
          }
+      }
+      if (context->decoder->get_feedback_fence &&
+          !context->decoder->get_feedback_fence(context->decoder, surf->fence, timeout_ns)) {
+         mtx_unlock(&drv->mutex);
+         return VA_STATUS_ERROR_TIMEDOUT;
       }
       context->decoder->get_feedback(context->decoder, surf->feedback, &(surf->coded_buf->coded_size), &(surf->coded_buf->extended_metadata));
       surf->feedback = NULL;
@@ -236,7 +270,7 @@ vlVaQuerySurfaceStatus(VADriverContextP ctx, VASurfaceID render_target, VASurfac
    mtx_lock(&drv->mutex);
 
    surf = handle_table_get(drv->htab, render_target);
-   if (!surf || !surf->buffer) {
+   if (!surf) {
       mtx_unlock(&drv->mutex);
       return VA_STATUS_ERROR_INVALID_SURFACE;
    }
@@ -247,7 +281,7 @@ vlVaQuerySurfaceStatus(VADriverContextP ctx, VASurfaceID render_target, VASurfac
     * Some apps try to sync/map the surface right after creation and
     * would get VA_STATUS_ERROR_INVALID_CONTEXT
     */
-   if ((!surf->feedback) && (!surf->fence)) {
+   if (!surf->buffer || (!surf->feedback && !surf->fence)) {
       // No outstanding encode/decode operation: nothing to do.
       *status = VASurfaceReady;
       mtx_unlock(&drv->mutex);
@@ -450,7 +484,8 @@ vlVaPutSurface(VADriverContextP ctx, VASurfaceID surface_id, void* draw, short s
    drv = VL_VA_DRIVER(ctx);
    mtx_lock(&drv->mutex);
    surf = handle_table_get(drv->htab, surface_id);
-   if (!surf) {
+   vlVaGetSurfaceBuffer(drv, surf);
+   if (!surf || !surf->buffer) {
       mtx_unlock(&drv->mutex);
       return VA_STATUS_ERROR_INVALID_SURFACE;
    }
@@ -616,9 +651,7 @@ vlVaQuerySurfaceAttributes(VADriverContextP ctx, VAConfigID config_id,
       i++;
    }
 
-   if (config->rt_format & VA_RT_FORMAT_YUV420_10 ||
-       (config->rt_format & VA_RT_FORMAT_YUV420 &&
-        config->entrypoint == PIPE_VIDEO_ENTRYPOINT_ENCODE)) {
+   if (config->rt_format & VA_RT_FORMAT_YUV420_10) {
       attribs[i].type = VASurfaceAttribPixelFormat;
       attribs[i].value.type = VAGenericValueTypeInteger;
       attribs[i].flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
@@ -1078,6 +1111,17 @@ vlVaHandleSurfaceAllocate(vlVaDriver *drv, vlVaSurface *surface,
    return VA_STATUS_SUCCESS;
 }
 
+struct pipe_video_buffer *
+vlVaGetSurfaceBuffer(vlVaDriver *drv, vlVaSurface *surface)
+{
+   if (!surface)
+      return NULL;
+   if (surface->buffer)
+      return surface->buffer;
+   vlVaHandleSurfaceAllocate(drv, surface, &surface->templat, NULL, 0);
+   return surface->buffer;
+}
+
 VAStatus
 vlVaCreateSurfaces2(VADriverContextP ctx, unsigned int format,
                     unsigned int width, unsigned int height,
@@ -1292,12 +1336,14 @@ vlVaCreateSurfaces2(VADriverContextP ctx, unsigned int format,
           */
          if (memory_attribute &&
              !(memory_attribute->flags & VA_SURFACE_EXTBUF_DESC_ENABLE_TILING))
-            templat.bind = PIPE_BIND_LINEAR | PIPE_BIND_SHARED;
+            surf->templat.bind = PIPE_BIND_LINEAR | PIPE_BIND_SHARED;
 
-	 vaStatus = vlVaHandleSurfaceAllocate(drv, surf, &templat, modifiers,
-                                              modifiers_count);
-         if (vaStatus != VA_STATUS_SUCCESS)
-            goto free_surf;
+         if (modifiers) {
+            vaStatus = vlVaHandleSurfaceAllocate(drv, surf, &surf->templat, modifiers,
+                                                 modifiers_count);
+            if (vaStatus != VA_STATUS_SUCCESS)
+               goto free_surf;
+         } /* Delayed allocation from vlVaGetSurfaceBuffer otherwise */
          break;
 
 #ifdef _WIN32
@@ -1339,7 +1385,8 @@ vlVaCreateSurfaces2(VADriverContextP ctx, unsigned int format,
    return VA_STATUS_SUCCESS;
 
 destroy_surf:
-   surf->buffer->destroy(surf->buffer);
+   if (surf->buffer)
+      surf->buffer->destroy(surf->buffer);
 
 free_surf:
    FREE(surf);
@@ -1512,12 +1559,17 @@ vlVaQueryVideoProcPipelineCaps(VADriverContextP ctx, VAContextID context,
    if (pipe_blend_modes & PIPE_VIDEO_VPP_BLEND_MODE_GLOBAL_ALPHA)
       pipeline_cap->blend_flags |= VA_BLEND_GLOBAL_ALPHA;
 
+   vlVaDriver *drv = VL_VA_DRIVER(ctx);
+
+   mtx_lock(&drv->mutex);
    for (i = 0; i < num_filters; i++) {
-      vlVaBuffer *buf = handle_table_get(VL_VA_DRIVER(ctx)->htab, filters[i]);
+      vlVaBuffer *buf = handle_table_get(drv->htab, filters[i]);
       VAProcFilterParameterBufferBase *filter;
 
-      if (!buf || buf->type != VAProcFilterParameterBufferType)
+      if (!buf || buf->type != VAProcFilterParameterBufferType) {
+         mtx_unlock(&drv->mutex);
          return VA_STATUS_ERROR_INVALID_BUFFER;
+      }
 
       filter = buf->data;
       switch (filter->type) {
@@ -1530,9 +1582,11 @@ vlVaQueryVideoProcPipelineCaps(VADriverContextP ctx, VAContextID context,
          break;
       }
       default:
+         mtx_unlock(&drv->mutex);
          return VA_STATUS_ERROR_UNIMPLEMENTED;
       }
    }
+   mtx_unlock(&drv->mutex);
 
    return VA_STATUS_SUCCESS;
 }
@@ -1611,6 +1665,7 @@ vlVaExportSurfaceHandle(VADriverContextP ctx,
    mtx_lock(&drv->mutex);
 
    surf = handle_table_get(drv->htab, surface_id);
+   vlVaGetSurfaceBuffer(drv, surf);
    if (!surf || !surf->buffer) {
       mtx_unlock(&drv->mutex);
       return VA_STATUS_ERROR_INVALID_SURFACE;

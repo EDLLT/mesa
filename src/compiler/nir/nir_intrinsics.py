@@ -747,6 +747,7 @@ image("store", src_comp=[4, 1, 0, 1], extra_indices=[SRC_TYPE])
 image("atomic",  src_comp=[4, 1, 1], dest_comp=1, extra_indices=[ATOMIC_OP])
 image("atomic_swap", src_comp=[4, 1, 1, 1], dest_comp=1, extra_indices=[ATOMIC_OP])
 image("size",    dest_comp=0, src_comp=[1], flags=[CAN_ELIMINATE, CAN_REORDER])
+image("levels",  dest_comp=1, flags=[CAN_ELIMINATE, CAN_REORDER])
 image("samples", dest_comp=1, flags=[CAN_ELIMINATE, CAN_REORDER])
 image("texel_address", dest_comp=1, src_comp=[4, 1],
       flags=[CAN_ELIMINATE, CAN_REORDER])
@@ -1922,7 +1923,7 @@ intrinsic("load_uvs_index_agx", dest_comp = 1, bit_sizes=[16],
 # converting between floating-point registers and normalized memory formats.
 #
 # The format is the pipe_format of the local memory (the source), see
-# agx_internal_formats.h for the supported list.
+# ail for the supported list.
 #
 # Logically, this loads/stores a single sample. The sample to load is
 # specified by the bitfield sample mask source. However, for stores multiple
@@ -1954,18 +1955,17 @@ intrinsic("store_zs_agx", [1, 1, 1], indices=[BASE], flags=[])
 # kernels.
 #
 # The format is the pipe_format of the local memory (the source), see
-# agx_internal_formats.h for the supported list. The image format is
+# ail for the supported list. The image format is
 # specified in the PBE descriptor.
 #
 # The image dimension is used to distinguish multisampled images from
 # non-multisampled images. It must be 2D or MS.
 #
-# src[] = { image index, logical offset within shared memory, coordinates/layer }
-intrinsic("block_image_store_agx", [1, 1, -1], bit_sizes=[32, 16, 0],
-          indices=[FORMAT, IMAGE_DIM, IMAGE_ARRAY, EXPLICIT_COORD], flags=[])
+# extra src[] = { logical offset within shared memory, coordinates/layer }
+image("store_block_agx", [1, -1], extra_indices=[EXPLICIT_COORD])
 
-# Formatted load/store. The format is the pipe_format in memory (see
-# agx_internal_formats.h for the supported list). This accesses:
+# Formatted load/store. The format is the pipe_format in memory (see ail for the
+# supported list). This accesses:
 #
 #     address + extend(index) << (format shift + shift)
 #
@@ -2155,16 +2155,6 @@ intrinsic("resource_intel", dest_comp=1, bit_sizes=[32],
           src_comp=[1, 1, 1, 1],
           indices=[DESC_SET, BINDING, RESOURCE_ACCESS_INTEL, RESOURCE_BLOCK_INTEL],
           flags=[CAN_ELIMINATE, CAN_REORDER])
-
-# 64-bit global address for a Vulkan descriptor set
-# src[0] = { set }
-intrinsic("load_desc_set_address_intel", dest_comp=1, bit_sizes=[64],
-          src_comp=[1], flags=[CAN_ELIMINATE, CAN_REORDER])
-
-# Base offset for a given set in the flatten array of dynamic offsets
-# src[0] = { set }
-intrinsic("load_desc_set_dynamic_index_intel", dest_comp=1, bit_sizes=[32],
-          src_comp=[1], flags=[CAN_ELIMINATE, CAN_REORDER])
 
 # OpSubgroupBlockReadINTEL and OpSubgroupBlockWriteINTEL from SPV_INTEL_subgroups.
 intrinsic("load_deref_block_intel", dest_comp=0, src_comp=[-1],

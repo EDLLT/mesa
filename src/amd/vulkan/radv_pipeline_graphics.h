@@ -91,14 +91,11 @@ struct radv_graphics_pipeline {
 
    struct radv_dynamic_state dynamic_state;
 
-   struct radv_vs_input_state vs_input_state;
+   struct radv_vertex_input_state vertex_input;
 
    struct radv_multisample_state ms;
    struct radv_ia_multi_vgt_param_helpers ia_multi_vgt_param;
    uint32_t binding_stride[MAX_VBS];
-   uint8_t attrib_bindings[MAX_VERTEX_ATTRIBS];
-   uint32_t attrib_ends[MAX_VERTEX_ATTRIBS];
-   uint32_t attrib_index_offset[MAX_VERTEX_ATTRIBS];
    uint32_t db_render_control;
 
    /* Last pre-PS API stage */

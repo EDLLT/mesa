@@ -259,14 +259,6 @@ fast_clear_color(struct iris_context *ice,
 
    iris_resource_set_clear_color(ice, res, color);
 
-   /* If the buffer is already in ISL_AUX_STATE_CLEAR, and the color hasn't
-    * changed, the clear is redundant and can be skipped.
-    */
-   const enum isl_aux_state aux_state =
-      iris_resource_get_aux_state(res, level, box->z);
-   if (!color_changed && box->depth == 1 && aux_state == ISL_AUX_STATE_CLEAR)
-      return;
-
    /* Ivybridge PRM Vol 2, Part 1, "11.7 MCS Buffer for Render Target(s)":
     *
     *    "Any transition from any value in {Clear, Render, Resolve} to a
@@ -278,92 +270,32 @@ fast_clear_color(struct iris_context *ice,
     * contents of the previous draw hit the render target before we resolve
     * and again afterwards to ensure that the resolve is complete before we
     * do any more regular drawing.
-    *
-    * On Xe2+:
-    * From Bspec 57340 (r59562):
-    *
-    *   Synchronization:
-    *      Due to interaction of scaled clearing rectangle with pixel
-    *      scoreboard, we require one of the following commands to be issued.
-    *
-    * Requiring tile cache flush bit has been dropped since Xe2.
     */
    iris_emit_end_of_pipe_sync(batch, "fast clear: pre-flush",
       PIPE_CONTROL_RENDER_TARGET_FLUSH |
-      (devinfo->verx10 < 200 ? PIPE_CONTROL_TILE_CACHE_FLUSH : 0) |
+      (devinfo->ver    == 12  ? PIPE_CONTROL_TEXTURE_CACHE_INVALIDATE |
+                                PIPE_CONTROL_TILE_CACHE_FLUSH : 0) |
       (devinfo->verx10 == 120 ? PIPE_CONTROL_DEPTH_STALL : 0) |
       (devinfo->verx10 == 125 ? PIPE_CONTROL_FLUSH_HDC |
                                 PIPE_CONTROL_DATA_CACHE_FLUSH : 0) |
       PIPE_CONTROL_PSS_STALL_SYNC);
 
-   /* From the ICL PRMs, Volume 9: Render Engine, State Caching :
-    *
-    *    "Any values referenced by pointers within the RENDER_SURFACE_STATE or
-    *     SAMPLER_STATE (e.g. Clear Color Pointer, Border Color or Indirect
-    *     State Pointer) are considered to be part of that state and any
-    *     changes to these referenced values requires an invalidation of the
-    *     L1 state cache to ensure the new values are being used as part of
-    *     the state. In the case of surface data pointed to by the Surface
-    *     Base Address in RENDER SURFACE STATE, the Texture Cache must be
-    *     invalidated if the surface data changes."
-    *
-    * and From the Render Target Fast Clear section,
-    *
-    *   "HwManaged FastClear allows SW to store FastClearValue in separate
-    *   graphics allocation, instead of keeping them in RENDER_SURFACE_STATE.
-    *   This behavior can be enabled by setting ClearValueAddressEnable in
-    *   RENDER_SURFACE_STATE.
-    *
-    *    Proper sequence of commands is as follows:
-    *
-    *       1. Storing clear color to allocation.
-    *       2. Ensuring that step 1. is finished and visible for TextureCache.
-    *       3. Performing FastClear.
-    *
-    *    Step 2. is required on products with ClearColorConversion feature.
-    *    This feature is enabled by setting ClearColorConversionEnable. This
-    *    causes HW to read stored color from ClearColorAllocation and write
-    *    back with the native format or RenderTarget - and clear color needs
-    *    to be present and visible. Reading is done from TextureCache, writing
-    *    is done to RenderCache."
-    *
-    * We're going to change the clear color. Invalidate the texture cache now
-    * to ensure the clear color conversion feature works properly. Although
-    * the docs seem to require invalidating the texture cache after updating
-    * the clear color allocation, we can do this beforehand so long as we
-    * ensure:
-    *
-    *    1. Step 1 is complete before the texture cache is accessed in step 3.
-    *    2. We don't access the texture cache between invalidation and step 3.
-    *
-    * The second requirement is satisfied because we'll be performing step 1
-    * and 3 right after invalidating. The first is satisfied because BLORP
-    * updates the clear color before performing the fast clear and it performs
-    * the synchronizations suggested by the Render Target Fast Clear section
-    * (not quoted here) to ensure its completion.
-    *
-    * While we're here, also invalidate the state cache as suggested.
-    *
-    * Due to a corruption reported in
-    * https://gitlab.freedesktop.org/mesa/mesa/-/issues/8853#note_2015707 when
-    * the clear color doesn´t change, we invalidate both caches always.
+   /* Update the clear color now that previous rendering is complete. */
+   if (color_changed && res->aux.clear_color_bo)
+      iris_resource_update_indirect_color(batch, res);
+
+   /* If the buffer is already in ISL_AUX_STATE_CLEAR, the clear is redundant
+    * and can be skipped.
     */
-   if (devinfo->ver >= 11) {
-      iris_emit_pipe_control_flush(batch, "fast clear: pre-flush",
-         PIPE_CONTROL_STATE_CACHE_INVALIDATE |
-         PIPE_CONTROL_TEXTURE_CACHE_INVALIDATE);
-   }
+   const enum isl_aux_state aux_state =
+      iris_resource_get_aux_state(res, level, box->z);
+   if (box->depth == 1 && aux_state == ISL_AUX_STATE_CLEAR)
+      return;
 
    iris_batch_sync_region_start(batch);
 
-   /* If we reach this point, we need to fast clear to change the state to
-    * ISL_AUX_STATE_CLEAR, or to update the fast clear color (or both).
-    */
-   enum blorp_batch_flags blorp_flags = 0;
-   blorp_flags |= color_changed ? 0 : BLORP_BATCH_NO_UPDATE_CLEAR_COLOR;
-
    struct blorp_batch blorp_batch;
-   blorp_batch_init(&ice->blorp, &blorp_batch, batch, blorp_flags);
+   blorp_batch_init(&ice->blorp, &blorp_batch, batch, 0);
 
    struct blorp_surf surf;
    iris_blorp_surf_for_resource(batch, &surf, p_res, res->aux.usage,
@@ -628,7 +560,8 @@ fast_clear_depth(struct iris_context *ice,
    }
 
    iris_resource_set_aux_state(ice, res, level, box->z, box->depth,
-                               ISL_AUX_STATE_CLEAR);
+                               devinfo->ver < 20 ? ISL_AUX_STATE_CLEAR :
+                               ISL_AUX_STATE_COMPRESSED_NO_CLEAR);
    ice->state.dirty |= IRIS_DIRTY_DEPTH_BUFFER;
    ice->state.stage_dirty |= IRIS_ALL_STAGE_DIRTY_BINDINGS;
 }

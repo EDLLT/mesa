@@ -304,7 +304,7 @@ typedef struct rvcn_enc_hevc_spec_misc_s {
    uint32_t cabac_init_flag;
    uint32_t half_pel_enabled;
    uint32_t quarter_pel_enabled;
-   uint32_t transform_skip_discarded;
+   uint32_t transform_skip_disabled;
    uint32_t cu_qp_delta_enabled_flag;
 } rvcn_enc_hevc_spec_misc_t;
 
@@ -494,6 +494,7 @@ typedef struct rvcn_enc_hevc_deblocking_filter_s {
    int32_t tc_offset_div2;
    int32_t cb_qp_offset;
    int32_t cr_qp_offset;
+   uint32_t disable_sao;
 } rvcn_enc_hevc_deblocking_filter_t;
 
 typedef struct rvcn_enc_intra_refresh_s {
@@ -533,13 +534,6 @@ typedef struct rvcn_enc_reconstructed_picture_s {
    };
    uint32_t encode_metadata_offset; /* vcn5 only */
 } rvcn_enc_reconstructed_picture_t;
-
-typedef struct rvcn_enc_picture_info_s
-{
-   bool in_use;
-   bool is_ltr;
-   uint32_t pic_num;
-} rvcn_enc_picture_info_t;
 
 typedef struct rvcn_enc_pre_encode_input_picture_s {
    union {
@@ -702,31 +696,6 @@ typedef struct rvcn_enc_quality_modes_s
    unsigned vbaq_mode;
    unsigned preset_mode;
 } rvcn_enc_quality_modes_t;
-
-typedef struct rvcn_enc_vui_info_s
-{
-   uint32_t vui_parameters_present_flag;
-   struct {
-      uint32_t aspect_ratio_info_present_flag : 1;
-      uint32_t timing_info_present_flag : 1;
-      uint32_t video_signal_type_present_flag : 1;
-      uint32_t colour_description_present_flag : 1;
-      uint32_t chroma_loc_info_present_flag : 1;
-   } flags;
-   uint32_t aspect_ratio_idc;
-   uint32_t sar_width;
-   uint32_t sar_height;
-   uint32_t num_units_in_tick;
-   uint32_t time_scale;
-   uint32_t video_format;
-   uint32_t video_full_range_flag;
-   uint32_t colour_primaries;
-   uint32_t transfer_characteristics;
-   uint32_t matrix_coefficients;
-   uint32_t chroma_sample_loc_type_top_field;
-   uint32_t chroma_sample_loc_type_bottom_field;
-   uint32_t max_num_reorder_frames;
-}rvcn_enc_vui_info;
 
 typedef struct rvcn_enc_input_format_s
 {

@@ -25,8 +25,6 @@
 #include "util/ralloc.h"
 #include "util/u_sampler.h"
 #include "util/u_surface.h"
-#include "agx_formats.h"
-#include "agx_internal_formats.h"
 #include "agx_state.h"
 #include "glsl_types.h"
 #include "nir.h"
@@ -105,9 +103,14 @@ asahi_blit_compute_shader(struct pipe_context *ctx, struct asahi_blit_key *key)
          nir_vector_insert_imm(b, nir_pad_vector(b, image_pos_nd, 3), layer, 2);
    }
 
-   nir_def *in_bounds = nir_ige(b, logical_id_el_2d, nir_imm_ivec2(b, 0, 0));
-   in_bounds =
-      nir_iand(b, in_bounds, nir_ilt(b, logical_id_el_2d, dimensions_el_2d));
+   nir_def *in_bounds;
+   if (key->aligned) {
+      in_bounds = nir_imm_true(b);
+   } else {
+      in_bounds = nir_ige(b, logical_id_el_2d, nir_imm_ivec2(b, 0, 0));
+      in_bounds =
+         nir_iand(b, in_bounds, nir_ilt(b, logical_id_el_2d, dimensions_el_2d));
+   }
 
    nir_def *colour0, *colour1;
    nir_push_if(b, nir_ball(b, in_bounds));
@@ -203,7 +206,7 @@ asahi_blit_compute_shader(struct pipe_context *ctx, struct asahi_blit_key *key)
     * flow of fragment and end-of-tile shaders.
     */
    enum pipe_format tib_format =
-      agx_pixel_format[effective_format(key->dst_format)].renderable;
+      ail_pixel_format[effective_format(key->dst_format)].renderable;
 
    nir_store_local_pixel_agx(b, color, nir_imm_int(b, 1), lid, .base = 0,
                              .write_mask = 0xf, .format = tib_format,
@@ -213,8 +216,8 @@ asahi_blit_compute_shader(struct pipe_context *ctx, struct asahi_blit_key *key)
 
    nir_push_if(b, nir_ball(b, nir_ieq_imm(b, lid, 0)));
    {
-      nir_def *pbe_index = nir_imm_int(b, 2);
-      nir_block_image_store_agx(
+      nir_def *pbe_index = nir_imm_intN_t(b, 2, 16);
+      nir_image_store_block_agx(
          b, pbe_index, local_offset, image_pos_nd, .format = tib_format,
          .image_dim = GLSL_SAMPLER_DIM_2D, .image_array = key->array,
          .explicit_coord = true);
@@ -330,14 +333,33 @@ asahi_compute_blit(struct pipe_context *ctx, const struct pipe_blit_info *info,
    struct pipe_resource *src = info->src.resource;
    struct pipe_resource *dst = info->dst.resource;
    struct pipe_sampler_view src_templ = {0}, *src_view;
-   unsigned width = info->dst.box.width;
-   unsigned height = info->dst.box.height;
 
    float src_width = (float)u_minify(src->width0, info->src.level);
    float src_height = (float)u_minify(src->height0, info->src.level);
 
-   float x_scale = (info->src.box.width / (float)width) / src_width;
-   float y_scale = (info->src.box.height / (float)height) / src_height;
+   float x_scale =
+      (info->src.box.width / (float)info->dst.box.width) / src_width;
+
+   float y_scale =
+      (info->src.box.height / (float)info->dst.box.height) / src_height;
+
+   /* Expand the grid so destinations are in tiles */
+   unsigned expanded_x0 = info->dst.box.x & ~(TILE_WIDTH - 1);
+   unsigned expanded_y0 = info->dst.box.y & ~(TILE_HEIGHT - 1);
+   unsigned expanded_x1 =
+      align(info->dst.box.x + info->dst.box.width, TILE_WIDTH);
+   unsigned expanded_y1 =
+      align(info->dst.box.y + info->dst.box.height, TILE_HEIGHT);
+
+   /* But clamp to the destination size to save some redundant threads */
+   expanded_x1 =
+      MIN2(expanded_x1, u_minify(info->dst.resource->width0, info->dst.level));
+   expanded_y1 =
+      MIN2(expanded_y1, u_minify(info->dst.resource->height0, info->dst.level));
+
+   /* Calculate the width/height based on the expanded grid */
+   unsigned width = expanded_x1 - expanded_x0;
+   unsigned height = expanded_y1 - expanded_y0;
 
    unsigned data[] = {
       fui(0.5f * x_scale + (float)info->src.box.x / src_width),
@@ -406,6 +428,7 @@ asahi_compute_blit(struct pipe_context *ctx, const struct pipe_blit_info *info,
       .src_format = info->src.format,
       .dst_format = info->dst.format,
       .array = array,
+      .aligned = info->dst.box.width == width && info->dst.box.height == height,
    };
    struct hash_entry *ent = _mesa_hash_table_search(blitter->blit_cs, &key);
    void *cs = NULL;
@@ -421,24 +444,6 @@ asahi_compute_blit(struct pipe_context *ctx, const struct pipe_blit_info *info,
 
    assert(cs != NULL);
    ctx->bind_compute_state(ctx, cs);
-
-   /* Expand the grid so destinations are in tiles */
-   unsigned expanded_x0 = info->dst.box.x & ~(TILE_WIDTH - 1);
-   unsigned expanded_y0 = info->dst.box.y & ~(TILE_HEIGHT - 1);
-   unsigned expanded_x1 =
-      align(info->dst.box.x + info->dst.box.width, TILE_WIDTH);
-   unsigned expanded_y1 =
-      align(info->dst.box.y + info->dst.box.height, TILE_HEIGHT);
-
-   /* But clamp to the destination size to save some redundant threads */
-   expanded_x1 =
-      MIN2(expanded_x1, u_minify(info->dst.resource->width0, info->dst.level));
-   expanded_y1 =
-      MIN2(expanded_y1, u_minify(info->dst.resource->height0, info->dst.level));
-
-   /* Recalculate the width/height based on the expanded grid */
-   width = expanded_x1 - expanded_x0;
-   height = expanded_y1 - expanded_y0;
 
    struct pipe_grid_info grid_info = {
       .block = {TILE_WIDTH, TILE_HEIGHT, 1},
@@ -510,13 +515,6 @@ agx_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
    if (info->render_condition_enable && !agx_render_condition_check(ctx))
       return;
 
-   if (!util_blitter_is_blit_supported(ctx->blitter, info)) {
-      fprintf(stderr, "\n");
-      util_dump_blit_info(stderr, info);
-      fprintf(stderr, "\n\n");
-      unreachable("Unsupported blit");
-   }
-
    /* Legalize compression /before/ calling into u_blitter to avoid recursion.
     * u_blitter bans recursive usage.
     */
@@ -529,6 +527,13 @@ agx_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
    if (asahi_compute_blit_supported(info)) {
       asahi_compute_blit(pipe, info, &ctx->compute_blitter);
       return;
+   }
+
+   if (!util_blitter_is_blit_supported(ctx->blitter, info)) {
+      fprintf(stderr, "\n");
+      util_dump_blit_info(stderr, info);
+      fprintf(stderr, "\n\n");
+      unreachable("Unsupported blit");
    }
 
    /* Handle self-blits */

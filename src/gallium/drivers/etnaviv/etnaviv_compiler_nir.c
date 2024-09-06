@@ -26,6 +26,7 @@
  *    Wladimir J. van der Laan <laanwj@gmail.com>
  */
 
+#include "etna_core_info.h"
 #include "etnaviv_compiler.h"
 #include "etnaviv_compiler_nir.h"
 #include "etnaviv_asm.h"
@@ -48,7 +49,7 @@
 static bool
 etna_alu_to_scalar_filter_cb(const nir_instr *instr, const void *data)
 {
-   const struct etna_specs *specs = data;
+   const struct etna_core_info *info = data;
 
    if (instr->type != nir_instr_type_alu)
       return false;
@@ -80,7 +81,7 @@ etna_alu_to_scalar_filter_cb(const nir_instr *instr, const void *data)
    case nir_op_b32any_inequal4:
       return true;
    case nir_op_fdot2:
-      if (!specs->has_halti2_instructions)
+      if (!etna_core_has_feature(info, ETNA_FEATURE_HALTI2))
          return true;
       break;
    default:
@@ -364,6 +365,7 @@ get_src(struct etna_compile *c, nir_src *src)
       switch (intr->intrinsic) {
       case nir_intrinsic_load_input:
       case nir_intrinsic_load_instance_id:
+      case nir_intrinsic_load_vertex_id:
       case nir_intrinsic_load_uniform:
       case nir_intrinsic_load_ubo:
       case nir_intrinsic_load_reg:
@@ -607,6 +609,7 @@ emit_intrinsic(struct etna_compile *c, nir_intrinsic_instr * intr)
       break;
    case nir_intrinsic_load_input:
    case nir_intrinsic_load_instance_id:
+   case nir_intrinsic_load_vertex_id:
    case nir_intrinsic_load_texture_scale:
    case nir_intrinsic_load_texture_size_etna:
    case nir_intrinsic_decl_reg:
@@ -1036,6 +1039,7 @@ emit_shader(struct etna_compile *c, unsigned *num_temps, unsigned *num_consts)
 static bool
 etna_compile_check_limits(struct etna_shader_variant *v)
 {
+   const struct etna_core_info *info = v->shader->info;
    const struct etna_specs *specs = v->shader->specs;
    int max_uniforms = (v->stage == MESA_SHADER_VERTEX)
                          ? specs->max_vs_uniforms
@@ -1047,9 +1051,9 @@ etna_compile_check_limits(struct etna_shader_variant *v)
       return false;
    }
 
-   if (v->num_temps > specs->max_registers) {
+   if (v->num_temps > info->gpu.max_registers) {
       DBG("Number of registers (%d) exceeds maximum %d", v->num_temps,
-          specs->max_registers);
+          info->gpu.max_registers);
       return false;
    }
 
@@ -1065,7 +1069,7 @@ etna_compile_check_limits(struct etna_shader_variant *v)
 static void
 fill_vs_mystery(struct etna_shader_variant *v)
 {
-   const struct etna_specs *specs = v->shader->specs;
+   const struct etna_core_info *info = v->shader->info;
 
    v->input_count_unk8 = DIV_ROUND_UP(v->infile.num_reg + 4, 16); /* XXX what is this */
 
@@ -1091,11 +1095,11 @@ fill_vs_mystery(struct etna_shader_variant *v)
    int half_out = v->outfile.num_reg / 2 + 1;
    assert(half_out);
 
-   uint32_t b = ((20480 / (specs->vertex_output_buffer_size -
-                           2 * half_out * specs->vertex_cache_size)) +
+   uint32_t b = ((20480 / (info->gpu.vertex_output_buffer_size -
+                           2 * half_out * info->gpu.vertex_cache_size)) +
                  9) /
                 10;
-   uint32_t a = (b + 256 / (specs->shader_core_count * half_out)) / 2;
+   uint32_t a = (b + 256 / (info->gpu.shader_core_count * half_out)) / 2;
    v->vs_load_balancing = VIVS_VS_LOAD_BALANCING_A(MIN2(a, 255)) |
                              VIVS_VS_LOAD_BALANCING_B(MIN2(b, 255)) |
                              VIVS_VS_LOAD_BALANCING_C(0x3f) |
@@ -1173,7 +1177,7 @@ etna_compile_shader(struct etna_shader_variant *v)
    NIR_PASS_V(s, nir_lower_indirect_derefs, nir_var_all, UINT32_MAX);
    NIR_PASS_V(s, etna_nir_lower_texture, &v->key);
 
-   NIR_PASS_V(s, nir_lower_alu_to_scalar, etna_alu_to_scalar_filter_cb, specs);
+   NIR_PASS_V(s, nir_lower_alu_to_scalar, etna_alu_to_scalar_filter_cb, c->info);
    if (c->info->halti >= 2) {
       nir_lower_idiv_options idiv_options = {
          .allow_fp16 = true,
@@ -1208,7 +1212,7 @@ etna_compile_shader(struct etna_shader_variant *v)
    }
 
    while( OPT(s, nir_opt_vectorize, NULL, NULL) );
-   NIR_PASS_V(s, nir_lower_alu_to_scalar, etna_alu_to_scalar_filter_cb, specs);
+   NIR_PASS_V(s, nir_lower_alu_to_scalar, etna_alu_to_scalar_filter_cb, c->info);
 
    NIR_PASS_V(s, nir_remove_dead_variables, nir_var_function_temp, NULL);
    NIR_PASS_V(s, nir_opt_algebraic_late);

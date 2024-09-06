@@ -172,8 +172,6 @@ glsl_to_nir(const struct gl_constants *consts,
       nir_print_shader(shader, stdout);
    }
 
-   shader->info.subgroup_size = SUBGROUP_SIZE_UNIFORM;
-
    return shader;
 }
 
@@ -849,6 +847,49 @@ deref_get_qualifier(nir_deref_instr *deref)
    return (gl_access_qualifier) qualifiers;
 }
 
+static nir_op
+get_reduction_op(enum ir_intrinsic_id id, const glsl_type *type)
+{
+#define IR_CASE(op) \
+   case ir_intrinsic_reduce_##op: \
+   case ir_intrinsic_inclusive_##op: \
+   case ir_intrinsic_exclusive_##op: \
+   case ir_intrinsic_clustered_##op: \
+      return CONV_OP(op);
+
+   switch (id) {
+
+#define CONV_OP(op) \
+      type->base_type == GLSL_TYPE_INT || type->base_type == GLSL_TYPE_UINT ? \
+         nir_op_i##op : nir_op_f##op
+
+   IR_CASE(add)
+   IR_CASE(mul)
+
+#undef CONV_OP
+#define CONV_OP(op) \
+      type->base_type == GLSL_TYPE_INT ? nir_op_i##op : \
+         (type->base_type == GLSL_TYPE_UINT ? nir_op_u##op : nir_op_f##op)
+
+   IR_CASE(min)
+   IR_CASE(max)
+
+#undef CONV_OP
+#define CONV_OP(op) nir_op_i##op
+
+   IR_CASE(and)
+   IR_CASE(or)
+   IR_CASE(xor)
+
+#undef CONV_OP
+
+   default:
+      unreachable("not reached");
+   }
+
+#undef IR_CASE
+}
+
 void
 nir_visitor::visit(ir_call *ir)
 {
@@ -1011,6 +1052,11 @@ nir_visitor::visit(ir_call *ir)
       case ir_intrinsic_memory_barrier_shared:
       case ir_intrinsic_memory_barrier_atomic_counter:
       case ir_intrinsic_group_memory_barrier:
+      case ir_intrinsic_subgroup_barrier:
+      case ir_intrinsic_subgroup_memory_barrier:
+      case ir_intrinsic_subgroup_memory_barrier_buffer:
+      case ir_intrinsic_subgroup_memory_barrier_shared:
+      case ir_intrinsic_subgroup_memory_barrier_image:
          op = nir_intrinsic_barrier;
          break;
       case ir_intrinsic_image_size:
@@ -1037,9 +1083,11 @@ nir_visitor::visit(ir_call *ir)
       case ir_intrinsic_vote_all:
          op = nir_intrinsic_vote_all;
          break;
-      case ir_intrinsic_vote_eq:
-         op = nir_intrinsic_vote_ieq;
+      case ir_intrinsic_vote_eq: {
+         ir_rvalue *rvalue = (ir_rvalue *) ir->actual_parameters.get_head();
+         op = glsl_type_is_integer(rvalue->type) ? nir_intrinsic_vote_ieq : nir_intrinsic_vote_feq;
          break;
+      }
       case ir_intrinsic_ballot:
          op = nir_intrinsic_ballot;
          break;
@@ -1054,6 +1102,88 @@ nir_visitor::visit(ir_call *ir)
          break;
       case ir_intrinsic_is_sparse_texels_resident:
          op = nir_intrinsic_is_sparse_texels_resident;
+         break;
+      case ir_intrinsic_elect:
+         op = nir_intrinsic_elect;
+         break;
+      case ir_intrinsic_inverse_ballot:
+         op = nir_intrinsic_inverse_ballot;
+         break;
+      case ir_intrinsic_ballot_bit_extract:
+         op = nir_intrinsic_ballot_bitfield_extract;
+         break;
+      case ir_intrinsic_ballot_bit_count:
+         op = nir_intrinsic_ballot_bit_count_reduce;
+         break;
+      case ir_intrinsic_ballot_inclusive_bit_count:
+         op = nir_intrinsic_ballot_bit_count_inclusive;
+         break;
+      case ir_intrinsic_ballot_exclusive_bit_count:
+         op = nir_intrinsic_ballot_bit_count_exclusive;
+         break;
+      case ir_intrinsic_ballot_find_lsb:
+         op = nir_intrinsic_ballot_find_lsb;
+         break;
+      case ir_intrinsic_ballot_find_msb:
+         op = nir_intrinsic_ballot_find_msb;
+         break;
+      case ir_intrinsic_shuffle:
+         op = nir_intrinsic_shuffle;
+         break;
+      case ir_intrinsic_shuffle_xor:
+         op = nir_intrinsic_shuffle_xor;
+         break;
+      case ir_intrinsic_shuffle_up:
+         op = nir_intrinsic_shuffle_up;
+         break;
+      case ir_intrinsic_shuffle_down:
+         op = nir_intrinsic_shuffle_down;
+         break;
+      case ir_intrinsic_reduce_add:
+      case ir_intrinsic_reduce_mul:
+      case ir_intrinsic_reduce_min:
+      case ir_intrinsic_reduce_max:
+      case ir_intrinsic_reduce_and:
+      case ir_intrinsic_reduce_or:
+      case ir_intrinsic_reduce_xor:
+      case ir_intrinsic_clustered_add:
+      case ir_intrinsic_clustered_mul:
+      case ir_intrinsic_clustered_min:
+      case ir_intrinsic_clustered_max:
+      case ir_intrinsic_clustered_and:
+      case ir_intrinsic_clustered_or:
+      case ir_intrinsic_clustered_xor:
+         op = nir_intrinsic_reduce;
+         break;
+      case ir_intrinsic_inclusive_add:
+      case ir_intrinsic_inclusive_mul:
+      case ir_intrinsic_inclusive_min:
+      case ir_intrinsic_inclusive_max:
+      case ir_intrinsic_inclusive_and:
+      case ir_intrinsic_inclusive_or:
+      case ir_intrinsic_inclusive_xor:
+         op = nir_intrinsic_inclusive_scan;
+         break;
+      case ir_intrinsic_exclusive_add:
+      case ir_intrinsic_exclusive_mul:
+      case ir_intrinsic_exclusive_min:
+      case ir_intrinsic_exclusive_max:
+      case ir_intrinsic_exclusive_and:
+      case ir_intrinsic_exclusive_or:
+      case ir_intrinsic_exclusive_xor:
+         op = nir_intrinsic_exclusive_scan;
+         break;
+      case ir_intrinsic_quad_broadcast:
+         op = nir_intrinsic_quad_broadcast;
+         break;
+      case ir_intrinsic_quad_swap_horizontal:
+         op = nir_intrinsic_quad_swap_horizontal;
+         break;
+      case ir_intrinsic_quad_swap_vertical:
+         op = nir_intrinsic_quad_swap_vertical;
+         break;
+      case ir_intrinsic_quad_swap_diagonal:
+         op = nir_intrinsic_quad_swap_diagonal;
          break;
       default:
          unreachable("not reached");
@@ -1274,6 +1404,12 @@ nir_visitor::visit(ir_call *ir)
           *
           *   https://www.khronos.org/registry/OpenGL/extensions/ARB/ARB_gl_spirv.txt
           */
+         if (ir->callee->intrinsic_id == ir_intrinsic_subgroup_barrier) {
+            nir_barrier(&b, SCOPE_SUBGROUP, SCOPE_SUBGROUP, NIR_MEMORY_ACQ_REL,
+                        nir_var_image | nir_var_mem_ssbo | nir_var_mem_shared | nir_var_mem_global);
+            break;
+         }
+
          mesa_scope scope;
          unsigned modes;
          switch (ir->callee->intrinsic_id) {
@@ -1315,6 +1451,26 @@ nir_visitor::visit(ir_call *ir)
             scope = SCOPE_DEVICE;
             modes = nir_var_mem_ssbo;
             break;
+         case ir_intrinsic_subgroup_memory_barrier:
+            scope = SCOPE_SUBGROUP;
+            modes = nir_var_image |
+                    nir_var_mem_ssbo |
+                    nir_var_mem_shared |
+                    nir_var_mem_global;
+            break;
+         case ir_intrinsic_subgroup_memory_barrier_buffer:
+            scope = SCOPE_SUBGROUP;
+            modes = nir_var_mem_ssbo |
+                    nir_var_mem_global;
+            break;
+         case ir_intrinsic_subgroup_memory_barrier_shared:
+            scope = SCOPE_SUBGROUP;
+            modes = nir_var_mem_shared;
+            break;
+         case ir_intrinsic_subgroup_memory_barrier_image:
+            scope = SCOPE_SUBGROUP;
+            modes = nir_var_image;
+            break;
          default:
                unreachable("invalid intrinsic id for memory barrier");
          }
@@ -1323,17 +1479,6 @@ nir_visitor::visit(ir_call *ir)
                                    (nir_variable_mode)modes);
          break;
       }
-      case nir_intrinsic_shader_clock:
-         nir_def_init(&instr->instr, &instr->def, 2, 32);
-         nir_intrinsic_set_memory_scope(instr, SCOPE_SUBGROUP);
-         nir_builder_instr_insert(&b, &instr->instr);
-         break;
-      case nir_intrinsic_begin_invocation_interlock:
-         nir_builder_instr_insert(&b, &instr->instr);
-         break;
-      case nir_intrinsic_end_invocation_interlock:
-         nir_builder_instr_insert(&b, &instr->instr);
-         break;
       case nir_intrinsic_store_ssbo: {
          exec_node *param = ir->actual_parameters.get_head();
          ir_rvalue *block = ((ir_instruction *)param)->as_rvalue();
@@ -1413,66 +1558,79 @@ nir_visitor::visit(ir_call *ir)
          nir_builder_instr_insert(&b, &instr->instr);
          break;
       }
-      case nir_intrinsic_vote_ieq:
-         instr->num_components = 1;
+      case nir_intrinsic_reduce:
+      case nir_intrinsic_inclusive_scan:
+      case nir_intrinsic_exclusive_scan: {
+         const glsl_type *type = ir->return_deref->type;
+         nir_def_init(&instr->instr, &instr->def, glsl_get_vector_elements(type),
+                      glsl_get_bit_size(type));
+         instr->num_components = instr->def.num_components;
+
+         exec_node *param = ir->actual_parameters.get_head();
+         ir_rvalue *value = ((ir_instruction *)param)->as_rvalue();
+         instr->src[0] = nir_src_for_ssa(evaluate_rvalue(value));
+
+         param = param->get_next();
+         if (!param->is_tail_sentinel()) {
+            ir_constant *size = ((ir_instruction *)param)->as_constant();
+            assert(size);
+
+            nir_intrinsic_set_cluster_size(instr, size->get_uint_component(0));
+         }
+
+         nir_intrinsic_set_reduction_op(instr, get_reduction_op(ir->callee->intrinsic_id, type));
+
+         nir_builder_instr_insert(&b, &instr->instr);
+         break;
+      }
+      case nir_intrinsic_shader_clock:
+         nir_intrinsic_set_memory_scope(instr, SCOPE_SUBGROUP);
          FALLTHROUGH;
+      case nir_intrinsic_begin_invocation_interlock:
+      case nir_intrinsic_end_invocation_interlock:
+      case nir_intrinsic_vote_ieq:
+      case nir_intrinsic_vote_feq:
       case nir_intrinsic_vote_any:
-      case nir_intrinsic_vote_all: {
-         nir_def_init(&instr->instr, &instr->def, 1, 1);
+      case nir_intrinsic_vote_all:
+      case nir_intrinsic_ballot:
+      case nir_intrinsic_read_invocation:
+      case nir_intrinsic_read_first_invocation:
+      case nir_intrinsic_is_helper_invocation:
+      case nir_intrinsic_is_sparse_texels_resident:
+      case nir_intrinsic_elect:
+      case nir_intrinsic_inverse_ballot:
+      case nir_intrinsic_ballot_bitfield_extract:
+      case nir_intrinsic_ballot_bit_count_reduce:
+      case nir_intrinsic_ballot_bit_count_inclusive:
+      case nir_intrinsic_ballot_bit_count_exclusive:
+      case nir_intrinsic_ballot_find_lsb:
+      case nir_intrinsic_ballot_find_msb:
+      case nir_intrinsic_shuffle:
+      case nir_intrinsic_shuffle_xor:
+      case nir_intrinsic_shuffle_up:
+      case nir_intrinsic_shuffle_down:
+      case nir_intrinsic_quad_broadcast:
+      case nir_intrinsic_quad_swap_horizontal:
+      case nir_intrinsic_quad_swap_vertical:
+      case nir_intrinsic_quad_swap_diagonal: {
+         if (ir->return_deref) {
+            const glsl_type *type = ir->return_deref->type;
+            nir_def_init(&instr->instr, &instr->def, glsl_get_vector_elements(type),
+                         glsl_get_bit_size(type));
 
-         ir_rvalue *value = (ir_rvalue *) ir->actual_parameters.get_head();
-         instr->src[0] = nir_src_for_ssa(evaluate_rvalue(value));
+            if (!nir_intrinsic_dest_components(instr))
+               instr->num_components = instr->def.num_components;
+         }
 
-         nir_builder_instr_insert(&b, &instr->instr);
-         break;
-      }
+         unsigned index = 0;
+         foreach_in_list(ir_rvalue, param, &ir->actual_parameters) {
+            instr->src[index] = nir_src_for_ssa(evaluate_rvalue(param));
 
-      case nir_intrinsic_ballot: {
-         nir_def_init(&instr->instr, &instr->def,
-                      ir->return_deref->type->vector_elements, 64);
-         instr->num_components = ir->return_deref->type->vector_elements;
+            if (!nir_intrinsic_src_components(instr, index))
+               instr->num_components = nir_src_num_components(instr->src[index]);
 
-         ir_rvalue *value = (ir_rvalue *) ir->actual_parameters.get_head();
-         instr->src[0] = nir_src_for_ssa(evaluate_rvalue(value));
-
-         nir_builder_instr_insert(&b, &instr->instr);
-         break;
-      }
-      case nir_intrinsic_read_invocation: {
-         nir_def_init(&instr->instr, &instr->def,
-                      ir->return_deref->type->vector_elements, 32);
-         instr->num_components = ir->return_deref->type->vector_elements;
-
-         ir_rvalue *value = (ir_rvalue *) ir->actual_parameters.get_head();
-         instr->src[0] = nir_src_for_ssa(evaluate_rvalue(value));
-
-         ir_rvalue *invocation = (ir_rvalue *) ir->actual_parameters.get_head()->next;
-         instr->src[1] = nir_src_for_ssa(evaluate_rvalue(invocation));
-
-         nir_builder_instr_insert(&b, &instr->instr);
-         break;
-      }
-      case nir_intrinsic_read_first_invocation: {
-         nir_def_init(&instr->instr, &instr->def,
-                      ir->return_deref->type->vector_elements, 32);
-         instr->num_components = ir->return_deref->type->vector_elements;
-
-         ir_rvalue *value = (ir_rvalue *) ir->actual_parameters.get_head();
-         instr->src[0] = nir_src_for_ssa(evaluate_rvalue(value));
-
-         nir_builder_instr_insert(&b, &instr->instr);
-         break;
-      }
-      case nir_intrinsic_is_helper_invocation: {
-         nir_def_init(&instr->instr, &instr->def, 1, 1);
-         nir_builder_instr_insert(&b, &instr->instr);
-         break;
-      }
-      case nir_intrinsic_is_sparse_texels_resident: {
-         nir_def_init(&instr->instr, &instr->def, 1, 1);
-
-         ir_rvalue *value = (ir_rvalue *) ir->actual_parameters.get_head();
-         instr->src[0] = nir_src_for_ssa(evaluate_rvalue(value));
+            index++;
+         }
 
          nir_builder_instr_insert(&b, &instr->instr);
          break;

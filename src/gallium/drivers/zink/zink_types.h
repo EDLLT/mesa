@@ -1288,6 +1288,7 @@ struct zink_resource {
    enum pipe_format internal_format:16;
 
    struct zink_resource_object *obj;
+   struct pipe_surface *surface; //for swapchain images
    uint32_t queue;
    union {
       struct {
@@ -1383,6 +1384,9 @@ struct zink_format_props {
 
 struct zink_screen {
    struct pipe_screen base;
+
+   const char *vendor_name;
+   const char *device_name;
 
    struct util_dl_library *loader_lib;
    PFN_vkGetInstanceProcAddr vk_GetInstanceProcAddr;

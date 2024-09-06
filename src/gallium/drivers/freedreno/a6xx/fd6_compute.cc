@@ -1,24 +1,6 @@
 /*
- * Copyright (C) 2019 Rob Clark <robclark@freedesktop.org>
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright © 2019 Rob Clark <robclark@freedesktop.org>
+ * SPDX-License-Identifier: MIT
  *
  * Authors:
  *    Rob Clark <robclark@freedesktop.org>
@@ -106,22 +88,19 @@ cs_program_emit(struct fd_context *ctx, struct fd_ringbuffer *ring,
                            A6XX_SP_CS_CNTL_1_THREADSIZE(thrsz));
       }
    } else {
-      enum a7xx_cs_yalign yalign = (v->local_size[1] % 8 == 0)   ? CS_YALIGN_8
-                                   : (v->local_size[1] % 4 == 0) ? CS_YALIGN_4
-                                   : (v->local_size[1] % 2 == 0) ? CS_YALIGN_2
-                                                                 : CS_YALIGN_1;
+      unsigned tile_height = (v->local_size[1] % 8 == 0)   ? 3
+                             : (v->local_size[1] % 4 == 0) ? 5
+                             : (v->local_size[1] % 2 == 0) ? 9
+                                                           : 17;
 
       OUT_REG(ring,
          HLSQ_CS_CNTL_1(
             CHIP,
             .linearlocalidregid = regid(63, 0),
             .threadsize = thrsz_cs,
-            /* A7XX TODO: blob either sets all of these unknowns
-             * together or doesn't set them at all.
-             */
-            .unk11 = true,
-            .unk22 = true,
-            .yalign = yalign,
+            .workgrouprastorderzfirsten = true,
+            .wgtilewidth = 4,
+            .wgtileheight = tile_height,
          )
       );
 
@@ -139,8 +118,9 @@ cs_program_emit(struct fd_context *ctx, struct fd_ringbuffer *ring,
             CHIP,
             .linearlocalidregid = INVALID_REG,
             .threadsize = thrsz_cs,
-            /* A7XX TODO: enable UNK15 when we don't use subgroup ops. */
-            .unk15 = false,
+            .workitemrastorder =
+               v->cs.force_linear_dispatch ? WORKITEMRASTORDER_LINEAR
+                                           : WORKITEMRASTORDER_TILED,
          )
       );
       OUT_REG(ring,

@@ -52,13 +52,6 @@ option(
 )
 
 option(
-  'dri3',
-  type : 'feature',
-  deprecated: {'true': 'enabled', 'false': 'disabled'},
-  description : 'enable support for dri3'
-)
-
-option(
   'dri-drivers-path',
   type : 'string',
   value : '',
@@ -311,7 +304,7 @@ option(
   'vulkan-layers',
   type : 'array',
   value : [],
-  choices : ['device-select', 'intel-nullhw', 'overlay'],
+  choices : ['device-select', 'intel-nullhw', 'overlay', 'screenshot'],
   description : 'List of vulkan layers to build'
 )
 

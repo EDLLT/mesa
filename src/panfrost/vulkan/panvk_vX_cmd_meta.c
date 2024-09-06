@@ -77,16 +77,13 @@ panvk_per_arch(cmd_meta_gfx_start)(
    save_ctx->push_constants = cmdbuf->state.push_constants;
    save_ctx->fs.shader = cmdbuf->state.gfx.fs.shader;
    save_ctx->fs.desc = cmdbuf->state.gfx.fs.desc;
-   save_ctx->fs.rsd = cmdbuf->state.gfx.fs.rsd;
    save_ctx->vs.shader = cmdbuf->state.gfx.vs.shader;
    save_ctx->vs.desc = cmdbuf->state.gfx.vs.desc;
-   save_ctx->vs.attribs = cmdbuf->state.gfx.vs.attribs;
-   save_ctx->vs.attrib_bufs = cmdbuf->state.gfx.vs.attrib_bufs;
+   save_ctx->vb0 = cmdbuf->state.gfx.vb.bufs[0];
 
-   save_ctx->dyn_state.all.vi = &save_ctx->dyn_state.vi;
-   save_ctx->dyn_state.all.ms.sample_locations = &save_ctx->dyn_state.sl;
-   vk_dynamic_graphics_state_copy(&save_ctx->dyn_state.all,
-                                  &cmdbuf->vk.dynamic_graphics_state);
+   save_ctx->dyn_state.all = cmdbuf->vk.dynamic_graphics_state;
+   save_ctx->dyn_state.vi = cmdbuf->state.gfx.dynamic.vi;
+   save_ctx->dyn_state.sl = cmdbuf->state.gfx.dynamic.sl;
 }
 
 void
@@ -114,14 +111,22 @@ panvk_per_arch(cmd_meta_gfx_end)(
 
    cmdbuf->state.gfx.fs.shader = save_ctx->fs.shader;
    cmdbuf->state.gfx.fs.desc = save_ctx->fs.desc;
-   cmdbuf->state.gfx.fs.rsd = save_ctx->fs.rsd;
    cmdbuf->state.gfx.vs.shader = save_ctx->vs.shader;
    cmdbuf->state.gfx.vs.desc = save_ctx->vs.desc;
-   cmdbuf->state.gfx.vs.attribs = save_ctx->vs.attribs;
-   cmdbuf->state.gfx.vs.attrib_bufs = save_ctx->vs.attrib_bufs;
+   cmdbuf->state.gfx.vb.bufs[0] = save_ctx->vb0;
 
-   vk_dynamic_graphics_state_copy(&cmdbuf->vk.dynamic_graphics_state,
-                                  &save_ctx->dyn_state.all);
+#if PAN_ARCH <= 7
+   cmdbuf->state.gfx.vs.attribs = 0;
+   cmdbuf->state.gfx.vs.attrib_bufs = 0;
+   cmdbuf->state.gfx.fs.rsd = 0;
+#endif
+
+   cmdbuf->vk.dynamic_graphics_state = save_ctx->dyn_state.all;
+   cmdbuf->state.gfx.dynamic.vi = save_ctx->dyn_state.vi;
+   cmdbuf->state.gfx.dynamic.sl = save_ctx->dyn_state.sl;
+   memcpy(cmdbuf->vk.dynamic_graphics_state.dirty,
+          cmdbuf->vk.dynamic_graphics_state.set,
+          sizeof(cmdbuf->vk.dynamic_graphics_state.set));
 }
 
 VKAPI_ATTR void VKAPI_CALL

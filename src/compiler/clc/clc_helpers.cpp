@@ -886,10 +886,16 @@ clc_compile_to_llvm_module(LLVMContext &llvm_ctx,
       return {};
    }
 
-   // GetResourcePath is a way to retrive the actual libclang resource dir based on a given binary
+   // GetResourcePath is a way to retrieve the actual libclang resource dir based on a given binary
    // or library.
-   auto clang_res_path =
-      fs::path(Driver::GetResourcesPath(std::string(clang_path), CLANG_RESOURCE_DIR)) / "include";
+   auto tmp_res_path =
+#if LLVM_VERSION_MAJOR >= 20
+      Driver::GetResourcesPath(std::string(clang_path));
+#else
+      Driver::GetResourcesPath(std::string(clang_path), CLANG_RESOURCE_DIR);
+#endif
+   auto clang_res_path = fs::path(tmp_res_path) / "include";
+
    free(clang_path);
 
    c->getHeaderSearchOpts().UseBuiltinIncludes = true;
@@ -944,6 +950,21 @@ clc_compile_to_llvm_module(LLVMContext &llvm_ctx,
    if (args->features.images_write_3d) {
       c->getTargetOpts().OpenCLExtensionsAsWritten.push_back("+cl_khr_3d_image_writes");
       c->getTargetOpts().OpenCLExtensionsAsWritten.push_back("+__opencl_c_3d_image_writes");
+   }
+   if (args->features.images_depth) {
+      c->getTargetOpts().OpenCLExtensionsAsWritten.push_back("+cl_khr_depth_images");
+   }
+   if (args->features.images_gl_depth) {
+      c->getPreprocessorOpts().addMacroDef("cl_khr_gl_depth_images=1");
+   }
+   if (args->features.images_mipmap) {
+      c->getTargetOpts().OpenCLExtensionsAsWritten.push_back("+cl_khr_mipmap_image");
+   }
+   if (args->features.images_mipmap_writes) {
+      c->getTargetOpts().OpenCLExtensionsAsWritten.push_back("+cl_khr_mipmap_image_writes");
+   }
+   if (args->features.images_gl_msaa) {
+      c->getTargetOpts().OpenCLExtensionsAsWritten.push_back("+cl_khr_gl_msaa_sharing");
    }
    if (args->features.intel_subgroups) {
       c->getTargetOpts().OpenCLExtensionsAsWritten.push_back("+cl_intel_subgroups");

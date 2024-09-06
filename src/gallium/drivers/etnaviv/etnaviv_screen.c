@@ -216,7 +216,7 @@ etna_screen_get_param(struct pipe_screen *pscreen, enum pipe_cap param)
    case PIPE_CAP_MAX_VERTEX_ELEMENT_SRC_OFFSET:
       return 255;
    case PIPE_CAP_MAX_VERTEX_BUFFERS:
-      return screen->specs.stream_count;
+      return screen->info->gpu.stream_count;
    case PIPE_CAP_VS_INSTANCEID:
    case PIPE_CAP_VERTEX_ELEMENT_INSTANCE_DIVISOR:
       return VIV_FEATURE(screen, ETNA_FEATURE_HALTI2);
@@ -805,18 +805,18 @@ etna_determine_uniform_limits(struct etna_screen *screen)
        (screen->info->revision == 0x5118 || screen->info->revision == 0x5140)) {
       screen->specs.max_vs_uniforms = 256;
       screen->specs.max_ps_uniforms = 64;
-   } else if (screen->specs.num_constants == 320) {
+   } else if (screen->info->gpu.num_constants == 320) {
       screen->specs.max_vs_uniforms = 256;
       screen->specs.max_ps_uniforms = 64;
-   } else if (screen->specs.num_constants > 256 &&
+   } else if (screen->info->gpu.num_constants > 256 &&
               screen->info->model == chipModel_GC1000) {
       /* All GC1000 series chips can only support 64 uniforms for ps on non-unified const mode. */
       screen->specs.max_vs_uniforms = 256;
       screen->specs.max_ps_uniforms = 64;
-   } else if (screen->specs.num_constants > 256) {
+   } else if (screen->info->gpu.num_constants > 256) {
       screen->specs.max_vs_uniforms = 256;
       screen->specs.max_ps_uniforms = 256;
-   } else if (screen->specs.num_constants == 256) {
+   } else if (screen->info->gpu.num_constants == 256) {
       screen->specs.max_vs_uniforms = 256;
       screen->specs.max_ps_uniforms = 256;
    } else {
@@ -852,13 +852,7 @@ etna_get_specs(struct etna_screen *screen)
    /* Copy all relevant limits from etna_core_info. */
    if (info->type == ETNA_CORE_GPU) {
       instruction_count = info->gpu.max_instructions;
-      screen->specs.vertex_output_buffer_size = info->gpu.vertex_output_buffer_size;
-      screen->specs.vertex_cache_size = info->gpu.vertex_cache_size;
-      screen->specs.shader_core_count = info->gpu.shader_core_count;
-      screen->specs.stream_count = info->gpu.stream_count;
-      screen->specs.max_registers = info->gpu.max_registers;
       screen->specs.pixel_pipes = info->gpu.pixel_pipes;
-      screen->specs.num_constants = info->gpu.num_constants;
       screen->specs.max_varyings = MIN2(info->gpu.max_varyings, ETNA_NUM_VARYINGS);
 
       if (screen->npu)
@@ -866,15 +860,6 @@ etna_get_specs(struct etna_screen *screen)
    }
 
    if (info->type == ETNA_CORE_NPU) {
-      screen->specs.nn_core_count = info->npu.nn_core_count;
-      screen->specs.nn_mad_per_core = info->npu.nn_mad_per_core;
-      screen->specs.tp_core_count = info->npu.tp_core_count;
-      screen->specs.on_chip_sram_size = info->npu.on_chip_sram_size;
-      screen->specs.axi_sram_size = info->npu.axi_sram_size;
-      screen->specs.nn_zrl_bits = info->npu.nn_zrl_bits;
-      screen->specs.nn_input_buffer_depth = info->npu.nn_input_buffer_depth;
-      screen->specs.nn_accum_buffer_depth = info->npu.nn_accum_buffer_depth;
-
       if (etna_core_has_feature(info, ETNA_FEATURE_NN_XYDP0))
          screen->specs.nn_core_version = 8;
       else if (etna_core_has_feature(info, ETNA_FEATURE_VIP_V7))
@@ -901,18 +886,10 @@ etna_get_specs(struct etna_screen *screen)
 
    screen->specs.vs_need_z_div =
       screen->info->model < 0x1000 && screen->info->model != 0x880;
-   screen->specs.has_sin_cos_sqrt =
-      VIV_FEATURE(screen, ETNA_FEATURE_HAS_SQRT_TRIG);
-   screen->specs.has_sign_floor_ceil =
-      VIV_FEATURE(screen, ETNA_FEATURE_HAS_SIGN_FLOOR_CEIL);
    screen->specs.has_shader_range_registers =
       screen->info->model >= 0x1000 || screen->info->model == 0x880;
-   screen->specs.npot_tex_any_wrap =
-      VIV_FEATURE(screen, ETNA_FEATURE_NON_POWER_OF_TWO);
    screen->specs.has_new_transcendentals =
       VIV_FEATURE(screen, ETNA_FEATURE_HAS_FAST_TRANSCENDENTALS);
-   screen->specs.has_halti2_instructions =
-      VIV_FEATURE(screen, ETNA_FEATURE_HALTI2);
    screen->specs.has_no_oneconst_limit =
       VIV_FEATURE(screen, ETNA_FEATURE_SH_NO_ONECONST_LIMIT);
    screen->specs.v4_compression =

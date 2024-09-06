@@ -1153,6 +1153,7 @@ Rusticl environment variables
 
    - ``allow_invalid_spirv`` disables validation of any input SPIR-V
    - ``clc`` dumps all OpenCL C source being compiled
+   - ``no_reuse_context`` pipe_contexts are not recycled
    - ``perf`` prints a warning when hitting slow paths once
    - ``perfspam`` same as perf, but doesn't skip same warnings
    - ``program`` dumps compilation logs to stderr
@@ -1366,8 +1367,6 @@ RADV driver environment variables
       disable FMASK compression on MSAA images (GFX6-GFX10.3)
    ``nogpl``
       disable VK_EXT_graphics_pipeline_library
-   ``nogsfastlaunch2``
-      disable GS_FAST_LAUNCH=2 for Mesh shaders (GFX11 only)
    ``nohiz``
       disable HIZ for depthstencil images
    ``noibs``

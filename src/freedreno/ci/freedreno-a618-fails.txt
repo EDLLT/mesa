@@ -296,14 +296,6 @@ spec@glsl-4.00@execution@built-in-functions@fs-op-div-double-dmat4,Fail
 spec@glsl-4.00@execution@built-in-functions@fs-inverse-dmat4,Fail
 spec@glsl-4.00@execution@built-in-functions@fs-op-div-dmat4-dmat4,Fail
 
-# skqp failure:
-# SRGBReadWritePixels FAILED (7 errors)
-# ../../tests/SRGBReadWritePixelsTest.cpp:214	Could not create sRGB surface context. [OpenGL]
-SRGBReadWritePixels,Fail
-
-spec@arb_vertex_attrib_64bit@execution@unused-sub-dvec4-01,Crash
-spec@arb_vertex_attrib_64bit@execution@unused-sub-dvec4-02,Crash
-
 # uprev Piglit in Mesa
 spec@glsl-1.30@execution@fs-uint-to-float-of-extract-int16,Fail
 spec@glsl-1.30@execution@fs-uint-to-float-of-extract-int8,Fail
@@ -315,9 +307,3 @@ spec@arb_gpu_shader_fp64@execution@arb_gpu_shader_fp64-gs-getuniformdv,Crash
 # GL tests above, Vulkan tests below
 
 
-# We can't support VK_EXT_sample_locations on pre-A650 GPUs
-# See https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/4665#note_473653
-dEQP-VK.info.device_mandatory_features,Fail
-
-# Can be fixed by https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/26154
-dEQP-VK.dynamic_rendering.primary_cmd_buff.basic.partial_binding_depth_stencil,Fail

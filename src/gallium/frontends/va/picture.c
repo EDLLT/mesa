@@ -38,7 +38,7 @@
 
 #include "va_private.h"
 
-static void
+void
 vlVaSetSurfaceContext(vlVaDriver *drv, vlVaSurface *surf, vlVaContext *context)
 {
    if (surf->ctx == context)
@@ -97,6 +97,7 @@ vlVaBeginPicture(VADriverContextP ctx, VAContextID context_id, VASurfaceID rende
    }
 
    surf = handle_table_get(drv->htab, render_target);
+   vlVaGetSurfaceBuffer(drv, surf);
    if (!surf || !surf->buffer) {
       mtx_unlock(&drv->mutex);
       return VA_STATUS_ERROR_INVALID_SURFACE;
@@ -174,7 +175,7 @@ vlVaGetReferenceFrame(vlVaDriver *drv, VASurfaceID surface_id,
 {
    vlVaSurface *surf = handle_table_get(drv->htab, surface_id);
    if (surf)
-      *ref_frame = surf->buffer;
+      *ref_frame = vlVaGetSurfaceBuffer(drv, surf);
    else
       *ref_frame = NULL;
 }
@@ -1161,6 +1162,7 @@ vlVaEndPicture(VADriverContextP ctx, VAContextID context_id)
 
    mtx_lock(&drv->mutex);
    surf = handle_table_get(drv->htab, output_id);
+   vlVaGetSurfaceBuffer(drv, surf);
    if (!surf || !surf->buffer) {
       mtx_unlock(&drv->mutex);
       return VA_STATUS_ERROR_INVALID_SURFACE;
@@ -1352,7 +1354,10 @@ vlVaEndPicture(VADriverContextP ctx, VAContextID context_id)
    if (context->desc.base.fence)
       context->desc.base.flush_flags = drv->has_external_handles ? 0 : PIPE_FLUSH_ASYNC;
 
-   context->decoder->end_frame(context->decoder, context->target, &context->desc.base);
+   if (context->decoder->end_frame(context->decoder, context->target, &context->desc.base) != 0) {
+      mtx_unlock(&drv->mutex);
+      return VA_STATUS_ERROR_OPERATION_FAILED;
+   }
 
    if (drv->pipe->screen->get_video_param(drv->pipe->screen,
                            context->decoder->profile,
@@ -1381,12 +1386,6 @@ vlVaEndPicture(VADriverContextP ctx, VAContextID context_id)
             surf->force_flushed = true;
          }
       }
-   }
-
-   if (context->decoder->get_feedback_fence &&
-       !context->decoder->get_feedback_fence(context->decoder, feedback)) {
-         mtx_unlock(&drv->mutex);
-         return VA_STATUS_ERROR_OPERATION_FAILED;
    }
 
    /* Update frame_num disregarding PIPE_VIDEO_CAP_REQUIRES_FLUSH_ON_END_FRAME check above */

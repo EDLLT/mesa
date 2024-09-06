@@ -1011,7 +1011,11 @@ radv_pipeline_init_dynamic_state(const struct radv_device *device, struct radv_g
 
    for (uint32_t i = 0; i < MAX_RTS; i++) {
       dynamic->vk.cal.color_map[i] = state->cal ? state->cal->color_map[i] : i;
+      dynamic->vk.ial.color_map[i] = state->ial ? state->ial->color_map[i] : i;
    }
+
+   dynamic->vk.ial.depth_att = state->ial ? state->ial->depth_att : MESA_VK_ATTACHMENT_UNUSED;
+   dynamic->vk.ial.stencil_att = state->ial ? state->ial->stencil_att : MESA_VK_ATTACHMENT_UNUSED;
 
    pipeline->dynamic_state.mask = states;
 }
@@ -2224,7 +2228,8 @@ radv_pipeline_import_retained_shaders(const struct radv_device *device, struct r
       const VkPipelineShaderStageCreateInfo *sinfo = &lib->stages[i];
       gl_shader_stage s = vk_to_mesa_shader_stage(sinfo->stage);
 
-      radv_pipeline_stage_init(sinfo, &lib->layout, &lib->stage_keys[s], &stages[s]);
+      radv_pipeline_stage_init(lib->base.base.create_flags, sinfo,
+                               &lib->layout, &lib->stage_keys[s], &stages[s]);
    }
 
    /* Import the NIR shaders (after SPIRV->NIR). */
@@ -2657,7 +2662,7 @@ radv_generate_graphics_pipeline_state(struct radv_device *device, const VkGraphi
          const VkPipelineShaderStageCreateInfo *sinfo = &pCreateInfo->pStages[i];
          gl_shader_stage stage = vk_to_mesa_shader_stage(sinfo->stage);
 
-         radv_pipeline_stage_init(sinfo, &gfx_state->layout, &gfx_state->key.stage_info[stage],
+         radv_pipeline_stage_init(create_flags, sinfo, &gfx_state->layout, &gfx_state->key.stage_info[stage],
                                   &gfx_state->stages[stage]);
       }
 
@@ -2912,75 +2917,70 @@ radv_pipeline_init_vertex_input_state(const struct radv_device *device, struct r
                                       const struct vk_graphics_pipeline_state *state)
 {
    const struct radv_physical_device *pdev = radv_device_physical(device);
-   const struct radv_shader_info *vs_info = &radv_get_shader(pipeline->base.shaders, MESA_SHADER_VERTEX)->info;
+   const struct radv_shader *vs = radv_get_shader(pipeline->base.shaders, MESA_SHADER_VERTEX);
 
-   if (state->vi) {
-      u_foreach_bit (i, state->vi->attributes_valid) {
-         uint32_t binding = state->vi->attributes[i].binding;
-         uint32_t offset = state->vi->attributes[i].offset;
-         VkFormat format = state->vi->attributes[i].format;
+   if (!state->vi)
+      return;
 
-         pipeline->attrib_ends[i] = offset + vk_format_get_blocksize(format);
-         pipeline->attrib_bindings[i] = binding;
-
-         if (state->vi->bindings[binding].stride) {
-            pipeline->attrib_index_offset[i] = offset / state->vi->bindings[binding].stride;
-         }
-      }
-
-      u_foreach_bit (i, state->vi->bindings_valid) {
-         pipeline->binding_stride[i] = state->vi->bindings[i].stride;
-      }
+   u_foreach_bit (i, state->vi->bindings_valid) {
+      pipeline->binding_stride[i] = state->vi->bindings[i].stride;
    }
 
-   /* Prepare the VS input state for prologs created inside a library. */
-   if (vs_info->vs.has_prolog && !(pipeline->dynamic_states & RADV_DYNAMIC_VERTEX_INPUT)) {
+   if (vs->info.vs.use_per_attribute_vb_descs) {
       const enum amd_gfx_level gfx_level = pdev->info.gfx_level;
       const enum radeon_family family = pdev->info.family;
       const struct ac_vtx_format_info *vtx_info_table = ac_get_vtx_format_info_table(gfx_level, family);
 
-      pipeline->vs_input_state.bindings_match_attrib = true;
+      pipeline->vertex_input.bindings_match_attrib = true;
 
       u_foreach_bit (i, state->vi->attributes_valid) {
          uint32_t binding = state->vi->attributes[i].binding;
          uint32_t offset = state->vi->attributes[i].offset;
 
-         pipeline->vs_input_state.attribute_mask |= BITFIELD_BIT(i);
-         pipeline->vs_input_state.bindings[i] = binding;
-         pipeline->vs_input_state.bindings_match_attrib &= binding == i;
+         pipeline->vertex_input.attribute_mask |= BITFIELD_BIT(i);
+         pipeline->vertex_input.bindings[i] = binding;
+         pipeline->vertex_input.bindings_match_attrib &= binding == i;
+
+         if (state->vi->bindings[binding].stride) {
+            pipeline->vertex_input.attrib_index_offset[i] = offset / state->vi->bindings[binding].stride;
+         }
 
          if (state->vi->bindings[binding].input_rate) {
-            pipeline->vs_input_state.instance_rate_inputs |= BITFIELD_BIT(i);
-            pipeline->vs_input_state.divisors[i] = state->vi->bindings[binding].divisor;
+            pipeline->vertex_input.instance_rate_inputs |= BITFIELD_BIT(i);
+            pipeline->vertex_input.divisors[i] = state->vi->bindings[binding].divisor;
 
             if (state->vi->bindings[binding].divisor == 0) {
-               pipeline->vs_input_state.zero_divisors |= BITFIELD_BIT(i);
+               pipeline->vertex_input.zero_divisors |= BITFIELD_BIT(i);
             } else if (state->vi->bindings[binding].divisor > 1) {
-               pipeline->vs_input_state.nontrivial_divisors |= BITFIELD_BIT(i);
+               pipeline->vertex_input.nontrivial_divisors |= BITFIELD_BIT(i);
             }
          }
 
-         pipeline->vs_input_state.offsets[i] = offset;
+         pipeline->vertex_input.offsets[i] = offset;
 
          enum pipe_format format = vk_format_to_pipe_format(state->vi->attributes[i].format);
          const struct ac_vtx_format_info *vtx_info = &vtx_info_table[format];
 
-         pipeline->vs_input_state.formats[i] = format;
+         pipeline->vertex_input.formats[i] = format;
          uint8_t format_align_req_minus_1 = vtx_info->chan_byte_size >= 4 ? 3 : (vtx_info->element_size - 1);
-         pipeline->vs_input_state.format_align_req_minus_1[i] = format_align_req_minus_1;
+         pipeline->vertex_input.format_align_req_minus_1[i] = format_align_req_minus_1;
          uint8_t component_align_req_minus_1 =
             MIN2(vtx_info->chan_byte_size ? vtx_info->chan_byte_size : vtx_info->element_size, 4) - 1;
-         pipeline->vs_input_state.component_align_req_minus_1[i] = component_align_req_minus_1;
-         pipeline->vs_input_state.format_sizes[i] = vtx_info->element_size;
-         pipeline->vs_input_state.alpha_adjust_lo |= (vtx_info->alpha_adjust & 0x1) << i;
-         pipeline->vs_input_state.alpha_adjust_hi |= (vtx_info->alpha_adjust >> 1) << i;
+         pipeline->vertex_input.component_align_req_minus_1[i] = component_align_req_minus_1;
+         pipeline->vertex_input.format_sizes[i] = vtx_info->element_size;
+         pipeline->vertex_input.alpha_adjust_lo |= (vtx_info->alpha_adjust & 0x1) << i;
+         pipeline->vertex_input.alpha_adjust_hi |= (vtx_info->alpha_adjust >> 1) << i;
          if (G_008F0C_DST_SEL_X(vtx_info->dst_sel) == V_008F0C_SQ_SEL_Z) {
-            pipeline->vs_input_state.post_shuffle |= BITFIELD_BIT(i);
+            pipeline->vertex_input.post_shuffle |= BITFIELD_BIT(i);
          }
 
          if (!(vtx_info->has_hw_format & BITFIELD_BIT(vtx_info->num_channels - 1))) {
-            pipeline->vs_input_state.nontrivial_formats |= BITFIELD_BIT(i);
+            pipeline->vertex_input.nontrivial_formats |= BITFIELD_BIT(i);
          }
+      }
+   } else {
+      u_foreach_bit (i, vs->info.vs.vb_desc_usage_mask) {
+         pipeline->vertex_input.bindings[i] = i;
       }
    }
 }

@@ -307,8 +307,6 @@ static void si_lower_nir(struct si_screen *sscreen, struct nir_shader *nir)
 
    NIR_PASS_V(nir, ac_nir_lower_sin_cos);
 
-   NIR_PASS_V(nir, nir_lower_subgroups, sscreen->nir_lower_subgroups_options);
-
    /* Lower load constants to scalar and then clean up the mess */
    NIR_PASS_V(nir, nir_lower_load_const_to_scalar);
    NIR_PASS_V(nir, nir_lower_var_copies);
@@ -343,16 +341,16 @@ static void si_lower_nir(struct si_screen *sscreen, struct nir_shader *nir)
        * divisible by 2.
        */
       options.lower_local_invocation_index =
-         nir->info.cs.derivative_group == DERIVATIVE_GROUP_QUADS ||
+         nir->info.derivative_group == DERIVATIVE_GROUP_QUADS ||
          (sscreen->info.gfx_level >= GFX12 &&
-          nir->info.cs.derivative_group == DERIVATIVE_GROUP_NONE &&
+          nir->info.derivative_group == DERIVATIVE_GROUP_NONE &&
           (nir->info.workgroup_size_variable ||
            (nir->info.workgroup_size[0] % 2 == 0 && nir->info.workgroup_size[1] % 2 == 0)));
       NIR_PASS_V(nir, nir_lower_compute_system_values, &options);
 
       /* Gfx12 supports this in hw. */
       if (sscreen->info.gfx_level < GFX12 &&
-          nir->info.cs.derivative_group == DERIVATIVE_GROUP_QUADS) {
+          nir->info.derivative_group == DERIVATIVE_GROUP_QUADS) {
          nir_opt_cse(nir); /* CSE load_local_invocation_id */
          memset(&options, 0, sizeof(options));
          options.shuffle_local_ids_for_quad_derivatives = true;

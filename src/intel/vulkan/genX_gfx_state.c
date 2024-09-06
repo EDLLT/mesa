@@ -1073,7 +1073,7 @@ genX(cmd_buffer_flush_gfx_runtime_state)(struct anv_cmd_buffer *cmd_buffer)
       const uint8_t color_writes = dyn->cb.color_write_enables;
       bool has_writeable_rt =
          anv_pipeline_has_stage(pipeline, MESA_SHADER_FRAGMENT) &&
-         (color_writes & ((1u << gfx->color_att_count) - 1)) != 0;
+         !anv_cmd_buffer_all_color_write_masked(cmd_buffer);
 
       SET(BLEND_STATE, blend.AlphaToCoverageEnable,
                        dyn->ms.alpha_to_coverage_enable);
@@ -1262,37 +1262,34 @@ genX(cmd_buffer_flush_gfx_runtime_state)(struct anv_cmd_buffer *cmd_buffer)
    }
 
    if ((gfx->dirty & ANV_CMD_DIRTY_RENDER_AREA) ||
-       (gfx->dirty & ANV_CMD_DIRTY_PIPELINE) ||
        BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VP_VIEWPORTS) ||
        BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VP_SCISSORS) ||
        BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_RS_DEPTH_CLAMP_ENABLE) ||
        BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VP_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE)) {
-      bool last_raster_stage_write_viewport;
-      if (anv_pipeline_is_primitive(pipeline)) {
-         const struct brw_vue_prog_data *last =
-            anv_pipeline_get_last_vue_prog_data(pipeline);
-         last_raster_stage_write_viewport =
-            (last->vue_map.slots_valid & VARYING_BIT_VIEWPORT) != 0;
-      } else {
-         const struct brw_mesh_prog_data *mesh_prog_data = get_mesh_prog_data(pipeline);
-         last_raster_stage_write_viewport =
-            mesh_prog_data->map.start_dw[VARYING_SLOT_VIEWPORT] >= 0;
-      }
-
-      /* From the Vulkan 1.0.45 spec:
-       *
-       *    "If the last active vertex processing stage shader entry
-       *    point's interface does not include a variable decorated with
-       *    ViewportIndex, then the first viewport is used."
-       */
-      SET(CLIP, clip.MaximumVPIndex, (last_raster_stage_write_viewport &&
-                                      dyn->vp.viewport_count > 0) ?
-                                     dyn->vp.viewport_count - 1 : 0);
-
       struct anv_instance *instance = cmd_buffer->device->physical->instance;
       const VkViewport *viewports = dyn->vp.viewports;
 
       const float scale = dyn->vp.depth_clip_negative_one_to_one ? 0.5f : 1.0f;
+
+      /* From the Vulkan 1.0.45 spec:
+       *
+       *    "If the last active vertex processing stage shader entry point's
+       *     interface does not include a variable decorated with
+       *     ViewportIndex, then the first viewport is used."
+       *
+       * This could mean that we might need to set the MaximumVPIndex based on
+       * the pipeline's last stage, but if the last shader doesn't write the
+       * viewport index and the VUE header is used, the compiler will force
+       * the value to 0 (which is what the spec requires above). Otherwise it
+       * seems like the HW should be pulling 0 if the VUE header is not
+       * present.
+       *
+       * Avoiding a check on the pipeline seems to prevent additional
+       * emissions of 3DSTATE_CLIP which appear to impact performance on
+       * Assassin's Creed Valhalla..
+       */
+      SET(CLIP, clip.MaximumVPIndex, dyn->vp.viewport_count > 0 ?
+                                     dyn->vp.viewport_count - 1 : 0);
 
       for (uint32_t i = 0; i < dyn->vp.viewport_count; i++) {
          const VkViewport *vp = &viewports[i];
@@ -2341,7 +2338,7 @@ genX(cmd_buffer_flush_gfx_hw_state)(struct anv_cmd_buffer *cmd_buffer)
     * https://gitlab.freedesktop.org/mesa/mesa/-/issues/9781
     */
 #if GFX_VER == 11
-   if (BITSET_TEST(hw_state->dirty, ANV_GFX_STATE_WM))
+   if (BITSET_TEST(hw_state->dirty, ANV_GFX_STATE_BLEND_STATE))
       BITSET_SET(hw_state->dirty, ANV_GFX_STATE_MULTISAMPLE);
 #endif
 

@@ -143,11 +143,6 @@ typedef struct {
     */
    bool tcs_pass_tessfactors_by_reg;
 
-   /* Whether all TCS inputs are accessed using gl_InvocationID and passed via VGPRs.
-    * In that case, no LDS is allocated for TCS inputs.
-    */
-   bool tcs_no_inputs_in_lds;
-
    /* Save TCS tess factor for tess factor writer. */
    nir_variable *tcs_tess_level_outer;
    nir_variable *tcs_tess_level_inner;
@@ -286,7 +281,8 @@ lower_ls_output_store(nir_builder *b,
    nir_def *vertex_idx = nir_load_local_invocation_index(b);
    nir_def *base_off_var = nir_imul(b, vertex_idx, nir_load_lshs_vertex_stride_amd(b));
 
-   unsigned mapped = ac_nir_map_io_location(io_sem.location, st->tcs_inputs_read, st->map_io);
+   unsigned mapped = ac_nir_map_io_location(io_sem.location, st->tcs_inputs_read & ~st->tcs_temp_only_inputs,
+                                            st->map_io);
    nir_def *io_off = ac_nir_calc_io_off(b, intrin, nir_imm_int(b, 16u), 4u, mapped);
    unsigned write_mask = nir_intrinsic_write_mask(intrin);
 
@@ -325,11 +321,21 @@ filter_load_tcs_per_vertex_input(const nir_instr *instr,
    nir_src *vertex_index_src = nir_get_io_arrayed_index_src(intrin);
    nir_instr *vertex_index_instr = vertex_index_src->ssa->parent_instr;
 
-   bool can_use_temps = nir_src_is_const(*off_src) &&
-                        vertex_index_instr->type == nir_instr_type_intrinsic &&
-                        nir_instr_as_intrinsic(vertex_index_instr)->intrinsic == nir_intrinsic_load_invocation_id;
 
-   return !can_use_temps;
+   const nir_io_semantics io_sem = nir_intrinsic_io_semantics(intrin);
+
+   /* If this is a temp-only TCS input, we don't need to use shared memory at all. */
+   if (st->tcs_temp_only_inputs & BITFIELD64_BIT(io_sem.location)) {
+      ASSERTED bool can_use_temps =
+         nir_src_is_const(*off_src) &&
+         vertex_index_instr->type == nir_instr_type_intrinsic &&
+         nir_instr_as_intrinsic(vertex_index_instr)->intrinsic == nir_intrinsic_load_invocation_id;
+
+      assert(can_use_temps);
+      return false;
+   }
+
+   return true;
 }
 
 static nir_def *
@@ -348,7 +354,8 @@ hs_per_vertex_input_lds_offset(nir_builder *b,
    nir_def *tcs_in_current_patch_offset = nir_imul(b, rel_patch_id, tcs_in_patch_stride);
 
    const nir_io_semantics io_sem = nir_intrinsic_io_semantics(instr);
-   const unsigned mapped = ac_nir_map_io_location(io_sem.location, st->tcs_inputs_read, st->map_io);
+   const unsigned mapped = ac_nir_map_io_location(io_sem.location, st->tcs_inputs_read & ~st->tcs_temp_only_inputs,
+                                                  st->map_io);
    nir_def *io_offset = ac_nir_calc_io_off(b, instr, nir_imm_int(b, 16u), 4u, mapped);
 
    return nir_iadd_nuw(b, nir_iadd_nuw(b, tcs_in_current_patch_offset, vertex_index_off), io_offset);
@@ -410,17 +417,11 @@ hs_output_lds_offset(nir_builder *b,
    nir_def *rel_patch_id = nir_load_tess_rel_patch_id_amd(b);
    nir_def *patch_offset = nir_imul_imm(b, rel_patch_id, output_patch_stride);
 
-   nir_def *output_patch_offset;
-   if (st->tcs_no_inputs_in_lds)
-      output_patch_offset = patch_offset;
-   else {
-      nir_def *tcs_in_vtxcnt = nir_load_patch_vertices_in(b);
-      nir_def *tcs_num_patches = nir_load_tcs_num_patches_amd(b);
-      nir_def *input_patch_size =
-         nir_imul(b, tcs_in_vtxcnt, nir_load_lshs_vertex_stride_amd(b));
-      nir_def *output_patch0_offset = nir_imul(b, input_patch_size, tcs_num_patches);
-      output_patch_offset = nir_iadd_nuw(b, patch_offset, output_patch0_offset);
-   }
+   nir_def *tcs_in_vtxcnt = nir_load_patch_vertices_in(b);
+   nir_def *tcs_num_patches = nir_load_tcs_num_patches_amd(b);
+   nir_def *input_patch_size = nir_imul(b, tcs_in_vtxcnt, nir_load_lshs_vertex_stride_amd(b));
+   nir_def *output_patch0_offset = nir_imul(b, input_patch_size, tcs_num_patches);
+   nir_def *output_patch_offset = nir_iadd_nuw(b, patch_offset, output_patch0_offset);
 
    if (per_vertex) {
       nir_def *vertex_index = nir_get_io_arrayed_index_src(intrin)->ssa;
@@ -986,13 +987,15 @@ ac_nir_lower_ls_outputs_to_mem(nir_shader *shader,
 void
 ac_nir_lower_hs_inputs_to_mem(nir_shader *shader,
                               ac_nir_map_io_driver_location map,
-                              bool tcs_in_out_eq)
+                              bool tcs_in_out_eq,
+                              uint64_t tcs_temp_only_inputs)
 {
    assert(shader->info.stage == MESA_SHADER_TESS_CTRL);
 
    lower_tess_io_state state = {
       .tcs_inputs_read = shader->info.inputs_read,
       .tcs_in_out_eq = tcs_in_out_eq,
+      .tcs_temp_only_inputs = tcs_in_out_eq ? tcs_temp_only_inputs : 0,
       .map_io = map,
    };
 
@@ -1009,7 +1012,6 @@ ac_nir_lower_hs_outputs_to_mem(nir_shader *shader,
                                uint64_t tes_inputs_read,
                                uint32_t tes_patch_inputs_read,
                                unsigned wave_size,
-                               bool no_inputs_in_lds,
                                bool pass_tessfactors_by_reg)
 {
    assert(shader->info.stage == MESA_SHADER_TESS_CTRL);
@@ -1020,7 +1022,6 @@ ac_nir_lower_hs_outputs_to_mem(nir_shader *shader,
       .tes_patch_inputs_read = tes_patch_inputs_read,
       .tcs_out_patch_fits_subgroup = wave_size % shader->info.tess.tcs_vertices_out == 0,
       .tcs_pass_tessfactors_by_reg = pass_tessfactors_by_reg,
-      .tcs_no_inputs_in_lds = no_inputs_in_lds,
       .map_io = map,
    };
 

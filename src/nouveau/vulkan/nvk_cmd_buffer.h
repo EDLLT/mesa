@@ -159,6 +159,8 @@ struct nvk_rendering_state {
    struct nvk_attachment color_att[NVK_MAX_RTS];
    struct nvk_attachment depth_att;
    struct nvk_attachment stencil_att;
+
+   bool all_linear;
 };
 
 struct nvk_graphics_state {
@@ -344,6 +346,13 @@ uint64_t
 nvk_cmd_buffer_get_cbuf_descriptor_addr(struct nvk_cmd_buffer *cmd,
                                         const struct nvk_descriptor_state *desc,
                                         const struct nvk_cbuf *cbuf);
+
+void nvk_cmd_dispatch_shader(struct nvk_cmd_buffer *cmd,
+                             struct nvk_shader *shader,
+                             const void *push_data, size_t push_size,
+                             uint32_t groupCountX,
+                             uint32_t groupCountY,
+                             uint32_t groupCountZ);
 
 void nvk_meta_resolve_rendering(struct nvk_cmd_buffer *cmd,
                                 const VkRenderingInfo *pRenderingInfo);

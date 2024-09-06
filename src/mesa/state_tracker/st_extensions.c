@@ -73,6 +73,30 @@ static int _clamp(int a, int min, int max)
       return a;
 }
 
+static unsigned mesa_to_gl_stages(unsigned stages)
+{
+   unsigned ret = 0;
+
+   if (stages & BITFIELD_BIT(MESA_SHADER_VERTEX))
+      ret |= GL_VERTEX_SHADER_BIT;
+
+   if (stages & BITFIELD_BIT(MESA_SHADER_TESS_CTRL))
+      ret |= GL_TESS_CONTROL_SHADER_BIT;
+
+   if (stages & BITFIELD_BIT(MESA_SHADER_TESS_EVAL))
+      ret |= GL_TESS_EVALUATION_SHADER_BIT;
+
+   if (stages & BITFIELD_BIT(MESA_SHADER_GEOMETRY))
+      ret |= GL_GEOMETRY_SHADER_BIT;
+
+   if (stages & BITFIELD_BIT(MESA_SHADER_FRAGMENT))
+      ret |= GL_FRAGMENT_SHADER_BIT;
+
+   if (stages & BITFIELD_BIT(MESA_SHADER_COMPUTE))
+      ret |= GL_COMPUTE_SHADER_BIT;
+
+   return ret;
+}
 
 /**
  * Query driver to get implementation limits.
@@ -624,6 +648,15 @@ void st_init_limits(struct pipe_screen *screen,
 
    c->HasDrawVertexState =
       screen->get_param(screen, PIPE_CAP_DRAW_VERTEX_STATE);
+
+   c->ShaderSubgroupSize =
+      screen->get_param(screen, PIPE_CAP_SHADER_SUBGROUP_SIZE);
+   c->ShaderSubgroupSupportedStages =
+      mesa_to_gl_stages(screen->get_param(screen, PIPE_CAP_SHADER_SUBGROUP_SUPPORTED_STAGES));
+   c->ShaderSubgroupSupportedFeatures =
+      screen->get_param(screen, PIPE_CAP_SHADER_SUBGROUP_SUPPORTED_FEATURES);
+   c->ShaderSubgroupQuadAllStages =
+      screen->get_param(screen, PIPE_CAP_SHADER_SUBGROUP_QUAD_ALL_STAGES);
 }
 
 
@@ -842,6 +875,8 @@ void st_init_extensions(struct pipe_screen *screen,
       { o(EXT_texture_swizzle),              PIPE_CAP_TEXTURE_SWIZZLE                  },
       { o(EXT_transform_feedback),           PIPE_CAP_MAX_STREAM_OUTPUT_BUFFERS        },
       { o(EXT_window_rectangles),            PIPE_CAP_MAX_WINDOW_RECTANGLES            },
+
+      { o(KHR_shader_subgroup),              PIPE_CAP_SHADER_SUBGROUP_SIZE             },
 
       { o(AMD_depth_clamp_separate),         PIPE_CAP_DEPTH_CLIP_DISABLE_SEPARATE      },
       { o(AMD_framebuffer_multisample_advanced), PIPE_CAP_FRAMEBUFFER_MSAA_CONSTRAINTS },

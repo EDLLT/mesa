@@ -568,7 +568,8 @@ tu_get_features(struct tu_physical_device *pdevice,
    features->extendedDynamicState3LineRasterizationMode = true;
    features->extendedDynamicState3LineStippleEnable = false;
    features->extendedDynamicState3ProvokingVertexMode = true;
-   features->extendedDynamicState3SampleLocationsEnable = true;
+   features->extendedDynamicState3SampleLocationsEnable =
+      pdevice->info->a6xx.has_sample_locations;
    features->extendedDynamicState3ColorBlendEnable = true;
    features->extendedDynamicState3ColorBlendEquation = true;
    features->extendedDynamicState3ColorWriteMask = true;
@@ -1024,11 +1025,8 @@ tu_get_properties(struct tu_physical_device *pdevice,
    props->transformFeedbackDraw = true;
 
    /* VK_EXT_sample_locations */
-   props->sampleLocationSampleCounts = 0;
-   if (pdevice->vk.supported_extensions.EXT_sample_locations) {
-      props->sampleLocationSampleCounts =
-         VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT;
-   }
+   props->sampleLocationSampleCounts =
+      pdevice->vk.supported_extensions.EXT_sample_locations ? sample_counts : 0;
    props->maxSampleLocationGridSize = (VkExtent2D) { 1 , 1 };
    props->sampleLocationCoordinateRange[0] = SAMPLE_LOCATION_MIN;
    props->sampleLocationCoordinateRange[1] = SAMPLE_LOCATION_MAX;
@@ -1396,6 +1394,8 @@ tu_init_dri_options(struct tu_instance *instance)
          driQueryOptionb(&instance->dri_options, "tu_disable_d24s8_border_color_workaround");
 }
 
+static uint32_t instance_count = 0;
+
 VKAPI_ATTR VkResult VKAPI_CALL
 tu_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
                   const VkAllocationCallbacks *pAllocator,
@@ -1437,6 +1437,7 @@ tu_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
    instance->vk.physical_devices.enumerate = tu_enumerate_devices;
    instance->vk.physical_devices.destroy = tu_destroy_physical_device;
 
+   instance->instance_idx = p_atomic_fetch_add(&instance_count, 1);
    if (TU_DEBUG(STARTUP))
       mesa_logi("Created an instance");
 
@@ -2166,9 +2167,9 @@ tu_init_cmdbuf_start_a725_quirk(struct tu_device *device)
    tu_cs_emit_regs(&sub_cs, HLSQ_CS_CNTL_1(A7XX,
             .linearlocalidregid = regid(63, 0),
             .threadsize = THREAD128,
-            .unk11 = true,
-            .unk22 = true,
-            .yalign = CS_YALIGN_1));
+            .workgrouprastorderzfirsten = true,
+            .wgtilewidth = 4,
+            .wgtileheight = 17));
    tu_cs_emit_regs(&sub_cs, A6XX_SP_CS_CNTL_0(
             .wgidconstid = regid(51, 3),
             .wgsizeconstid = regid(48, 0),
@@ -2177,7 +2178,7 @@ tu_init_cmdbuf_start_a725_quirk(struct tu_device *device)
    tu_cs_emit_regs(&sub_cs, SP_CS_CNTL_1(A7XX,
             .linearlocalidregid = regid(63, 0),
             .threadsize = THREAD128,
-            .unk15 = true));
+            .workitemrastorder = WORKITEMRASTORDER_TILED));
    tu_cs_emit_regs(&sub_cs, A7XX_SP_CS_UNKNOWN_A9BE(0));
 
    tu_cs_emit_regs(&sub_cs,
@@ -2585,8 +2586,9 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
       snprintf(engine_name, sizeof(engine_name), "%s", engine_name_str);
 
       char output_name[128];
-      snprintf(output_name, sizeof(output_name), "tu_%s.%s_device%u",
-               app_name, engine_name, device->device_idx);
+      snprintf(output_name, sizeof(output_name), "tu_%s.%s_instance%u_device%u",
+               app_name, engine_name, device->instance->instance_idx,
+               device->device_idx);
 
       fd_rd_output_init(&device->rd_output, output_name);
    }

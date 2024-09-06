@@ -123,17 +123,23 @@ llvmpipe_get_name(struct pipe_screen *screen)
 static int
 llvmpipe_get_param(struct pipe_screen *screen, enum pipe_cap param)
 {
-#ifdef HAVE_LINUX_UDMABUF_H
+#ifdef HAVE_LIBDRM
    struct llvmpipe_screen *lscreen = llvmpipe_screen(screen);
 #endif
-
    switch (param) {
-#ifdef HAVE_LINUX_UDMABUF_H
    case PIPE_CAP_DMABUF:
+#ifdef HAVE_LIBDRM
+      if (lscreen->winsys->get_fd)
+         return DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT;
+#ifdef HAVE_LINUX_UDMABUF_H
       if (lscreen->udmabuf_fd != -1)
          return DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT;
       else
          return DRM_PRIME_CAP_IMPORT;
+#endif
+#endif
+      return 0;
+#if defined(HAVE_LIBDRM) && defined(HAVE_LINUX_UDMABUF_H)
    case PIPE_CAP_NATIVE_FENCE_FD:
       return lscreen->dummy_sync_fd != -1;
 #endif
@@ -1177,7 +1183,7 @@ llvmpipe_create_screen(struct sw_winsys *winsys)
                                               screen->num_threads);
    screen->num_threads = MIN2(screen->num_threads, LP_MAX_THREADS);
 
-#ifdef HAVE_LINUX_UDMABUF_H
+#if defined(HAVE_LIBDRM) && defined(HAVE_LINUX_UDMABUF_H)
    screen->udmabuf_fd = open("/dev/udmabuf", O_RDWR);
    llvmpipe_init_screen_fence_funcs(&screen->base);
 #endif

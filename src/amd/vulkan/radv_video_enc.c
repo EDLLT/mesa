@@ -118,6 +118,12 @@ radv_probe_video_encode(struct radv_physical_device *pdev)
          return;
       if (pdev->info.vcn_enc_minor_version < RENCODE_V4_FW_INTERFACE_MINOR_VERSION)
          return;
+
+      /* VCN 4 FW 1.22 has all the necessary pieces to pass CTS */
+      if (pdev->info.vcn_enc_minor_version >= 22) {
+         pdev->video_encode_enabled = true;
+         return;
+      }
    } else if (pdev->info.vcn_ip_version >= VCN_3_0_0) {
       if (pdev->info.vcn_enc_major_version != RENCODE_V3_FW_INTERFACE_MAJOR_VERSION)
          return;
@@ -2012,7 +2018,7 @@ radv_video_enc_begin_coding(struct radv_cmd_buffer *cmd_buffer)
    radeon_check_space(device->ws, cmd_buffer->cs, 1024);
 
    if (pdev->enc_hw_ver >= RADV_VIDEO_ENC_HW_4)
-      radv_vcn_sq_header(cmd_buffer->cs, &cmd_buffer->video.sq, true);
+      radv_vcn_sq_header(cmd_buffer->cs, &cmd_buffer->video.sq, RADEON_VCN_ENGINE_TYPE_ENCODE);
 }
 
 void

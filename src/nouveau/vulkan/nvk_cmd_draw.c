@@ -575,6 +575,9 @@ nvk_cmd_buffer_dirty_render_pass(struct nvk_cmd_buffer *cmd)
 
    /* This may depend on render targets for ESO */
    BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES);
+
+   /* This may depend on render targets */
+   BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_COLOR_ATTACHMENT_MAP);
 }
 
 static void
@@ -646,6 +649,18 @@ nvk_cmd_buffer_begin_graphics(struct nvk_cmd_buffer *cmd,
             inheritance_info->depthAttachmentFormat;
          render->stencil_att.vk_format =
             inheritance_info->stencilAttachmentFormat;
+
+         const VkRenderingAttachmentLocationInfoKHR att_loc_info_default = {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO_KHR,
+            .colorAttachmentCount = inheritance_info->colorAttachmentCount,
+         };
+         const VkRenderingAttachmentLocationInfoKHR *att_loc_info =
+            vk_get_command_buffer_rendering_attachment_location_info(
+               cmd->vk.level, pBeginInfo);
+         if (att_loc_info == NULL)
+            att_loc_info = &att_loc_info_default;
+
+         vk_cmd_set_rendering_attachment_locations(&cmd->vk, att_loc_info);
 
          nvk_cmd_buffer_dirty_render_pass(cmd);
       }
@@ -782,11 +797,17 @@ nvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    nvk_attachment_init(&render->stencil_att,
                        pRenderingInfo->pStencilAttachment);
 
+   render->all_linear = nvk_rendering_all_linear(render);
+
+   const VkRenderingAttachmentLocationInfoKHR ral_info = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO_KHR,
+      .colorAttachmentCount = pRenderingInfo->colorAttachmentCount,
+   };
+   vk_cmd_set_rendering_attachment_locations(&cmd->vk, &ral_info);
+
    nvk_cmd_buffer_dirty_render_pass(cmd);
 
-   /* Always emit at least one color attachment, even if it's just a dummy. */
-   uint32_t color_att_count = MAX2(1, render->color_att_count);
-   struct nv_push *p = nvk_cmd_buffer_push(cmd, color_att_count * 12 + 29);
+   struct nv_push *p = nvk_cmd_buffer_push(cmd, NVK_MAX_RTS * 12 + 29);
 
    P_IMMD(p, NV9097, SET_MME_SHADOW_SCRATCH(NVK_MME_SCRATCH_VIEW_MASK),
           render->view_mask);
@@ -801,10 +822,15 @@ nvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
       .height  = render->area.extent.height,
    });
 
-   const bool all_linear = nvk_rendering_all_linear(render);
-
    enum nil_sample_layout sample_layout = NIL_SAMPLE_LAYOUT_INVALID;
-   for (uint32_t i = 0; i < color_att_count; i++) {
+
+   /* We always emit SET_COLOR_TARGET_A(i) for every color target, regardless
+    * of the number of targets in the render pass.  This ensures that we have
+    * no left over pointers from previous render passes in the hardware.  This
+    * also allows us to point at any render target with SET_CT_SELECT and know
+    * that it's either a valid render target or NULL.
+    */
+   for (uint32_t i = 0; i < NVK_MAX_RTS; i++) {
       if (render->color_att[i].iview) {
          const struct nvk_image_view *iview = render->color_att[i].iview;
          const struct nvk_image *image = (struct nvk_image *)iview->vk.image;
@@ -816,14 +842,8 @@ nvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
          const uint8_t ip = iview->planes[0].image_plane;
          const struct nvk_image_plane *plane = &image->planes[ip];
 
-         const VkAttachmentLoadOp load_op =
-            pRenderingInfo->pColorAttachments[i].loadOp;
-         if (!all_linear && !plane->nil.levels[0].tiling.is_tiled) {
-            if (load_op == VK_ATTACHMENT_LOAD_OP_LOAD)
-               nvk_linear_render_copy(cmd, iview, render->area, true);
-
+         if (!render->all_linear && !plane->nil.levels[0].tiling.is_tiled)
             plane = &image->linear_tiled_shadow;
-         }
 
          const struct nil_image *nil_image = &plane->nil;
          const struct nil_image_level *level =
@@ -842,9 +862,11 @@ nvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
             addr += nil_image_level_z_offset_B(nil_image,
                                                iview->vk.base_mip_level,
                                                iview->vk.base_array_layer);
+            assert(layer_count <= iview->vk.extent.depth);
          } else {
             addr += iview->vk.base_array_layer *
                     (uint64_t)nil_image->array_stride_B;
+            assert(layer_count <= iview->vk.layer_count);
          }
 
          P_MTHD(p, NV9097, SET_COLOR_TARGET_A(i));
@@ -930,18 +952,6 @@ nvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
       }
    }
 
-   P_IMMD(p, NV9097, SET_CT_SELECT, {
-      .target_count = color_att_count,
-      .target0 = 0,
-      .target1 = 1,
-      .target2 = 2,
-      .target3 = 3,
-      .target4 = 4,
-      .target5 = 5,
-      .target6 = 6,
-      .target7 = 7,
-   });
-
    if (render->depth_att.iview || render->stencil_att.iview) {
       struct nvk_image_view *iview = render->depth_att.iview ?
                                      render->depth_att.iview :
@@ -955,7 +965,6 @@ nvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
       uint64_t addr = nvk_image_base_address(image, ip);
       uint32_t mip_level = iview->vk.base_mip_level;
       uint32_t base_array_layer = iview->vk.base_array_layer;
-      uint32_t layer_count = iview->vk.layer_count;
 
       if (nil_image.dim == NIL_IMAGE_DIM_3D) {
          uint64_t level_offset_B;
@@ -964,7 +973,9 @@ nvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
          addr += level_offset_B;
          mip_level = 0;
          base_array_layer = 0;
-         layer_count = iview->vk.extent.depth;
+         assert(layer_count <= iview->vk.extent.depth);
+      } else {
+         assert(layer_count <= iview->vk.layer_count);
       }
 
       const struct nil_image_level *level = &nil_image.levels[mip_level];
@@ -1050,6 +1061,23 @@ nvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    if (render->flags & VK_RENDERING_RESUMING_BIT)
       return;
 
+   for (uint32_t i = 0; i < pRenderingInfo->colorAttachmentCount; i++) {
+      const struct nvk_image_view *iview = render->color_att[i].iview;
+      if (iview == NULL)
+         continue;
+
+      const struct nvk_image *image = (struct nvk_image *)iview->vk.image;
+      assert(iview->plane_count == 1);
+      const uint8_t ip = iview->planes[0].image_plane;
+      const struct nvk_image_plane *plane = &image->planes[ip];
+
+      const VkAttachmentLoadOp load_op =
+         pRenderingInfo->pColorAttachments[i].loadOp;
+      if (!render->all_linear && !plane->nil.levels[0].tiling.is_tiled &&
+          load_op == VK_ATTACHMENT_LOAD_OP_LOAD)
+         nvk_linear_render_copy(cmd, iview, render->area, true);
+   }
+
    uint32_t clear_count = 0;
    VkClearAttachment clear_att[NVK_MAX_RTS + 1];
    for (uint32_t i = 0; i < pRenderingInfo->colorAttachmentCount; i++) {
@@ -1110,18 +1138,19 @@ nvk_CmdEndRendering(VkCommandBuffer commandBuffer)
    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
    struct nvk_rendering_state *render = &cmd->state.gfx.render;
 
-   const bool all_linear = nvk_rendering_all_linear(render);
-   for (uint32_t i = 0; i < render->color_att_count; i++) {
-      struct nvk_image_view *iview = render->color_att[i].iview;
-      if (iview == NULL)
-         continue;
+   if (!(render->flags & VK_RENDERING_SUSPENDING_BIT)) {
+      for (uint32_t i = 0; i < render->color_att_count; i++) {
+         struct nvk_image_view *iview = render->color_att[i].iview;
+         if (iview == NULL)
+            continue;
 
-      struct nvk_image *image = (struct nvk_image *)iview->vk.image;
-      const uint8_t ip = iview->planes[0].image_plane;
-      const struct nvk_image_plane *plane = &image->planes[ip];
-      if (!all_linear && !plane->nil.levels[0].tiling.is_tiled &&
-          render->color_att[i].store_op == VK_ATTACHMENT_STORE_OP_STORE)
-         nvk_linear_render_copy(cmd, iview, render->area, false);
+         struct nvk_image *image = (struct nvk_image *)iview->vk.image;
+         const uint8_t ip = iview->planes[0].image_plane;
+         const struct nvk_image_plane *plane = &image->planes[ip];
+         if (!render->all_linear && !plane->nil.levels[0].tiling.is_tiled &&
+             render->color_att[i].store_op == VK_ATTACHMENT_STORE_OP_STORE)
+            nvk_linear_render_copy(cmd, iview, render->area, false);
+      }
    }
 
    bool need_resolve = false;
@@ -2150,7 +2179,7 @@ static uint32_t
 nvk_mme_anti_alias_init(void)
 {
    /* This is a valid value but we never set it so it ensures that the macro
-    * will actuallryn the first time we set anything.
+    * will actually run the first time we set anything.
     */
    return 0xf;
 }
@@ -2203,9 +2232,9 @@ nvk_mme_set_anti_alias(struct mme_builder *b)
       nvk_mme_store_scratch(b, ANTI_ALIAS, anti_alias);
 
       struct mme_value rcp_mss_log2 =
-         mme_merge(b, mme_zero(), anti_alias, 0, 3, 0);
+         mme_merge(b, mme_zero(), anti_alias, 0, 4, 0);
       struct mme_value samples_log2 =
-         mme_merge(b, mme_zero(), anti_alias, 0, 3, 4);
+         mme_merge(b, mme_zero(), anti_alias, 0, 4, 4);
       mme_free_reg(b, anti_alias);
 
       /* We've already done all the hard work on the CPU in
@@ -2780,7 +2809,7 @@ nvk_flush_cb_state(struct nvk_cmd_buffer *cmd)
       &cmd->vk.dynamic_graphics_state;
 
    struct nv_push *p =
-      nvk_cmd_buffer_push(cmd, 13 + 10 * render->color_att_count);
+      nvk_cmd_buffer_push(cmd, 15 + 10 * render->color_att_count);
 
    if (BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_CB_LOGIC_OP_ENABLE))
       P_IMMD(p, NV9097, SET_LOGIC_OP, dyn->cb.logic_op_enable);
@@ -2819,7 +2848,8 @@ nvk_flush_cb_state(struct nvk_cmd_buffer *cmd)
 
    if (BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_CB_WRITE_MASKS) ||
        BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_CB_COLOR_WRITE_ENABLES) ||
-       BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_RP_ATTACHMENTS)) {
+       BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_RP_ATTACHMENTS) ||
+       BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_COLOR_ATTACHMENT_MAP)) {
       uint32_t color_write_enables = 0x0;
       for (uint8_t a = 0; a < render->color_att_count; a++) {
          if (dyn->cb.color_write_enables & BITFIELD_BIT(a))
@@ -2836,11 +2866,62 @@ nvk_flush_cb_state(struct nvk_cmd_buffer *cmd)
             rp_att_write_mask |= 0xf << (4 * a);
       }
 
+      uint32_t att_has_loc_mask = 0x0;
+      for (uint8_t a = 0; a < MESA_VK_MAX_COLOR_ATTACHMENTS; a++) {
+         if (dyn->cal.color_map[a] != MESA_VK_ATTACHMENT_UNUSED)
+            att_has_loc_mask |= 0xf << (4 * a);
+      }
+
       P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_SET_WRITE_MASK));
       P_INLINE_DATA(p, render->color_att_count);
       P_INLINE_DATA(p, color_write_enables &
                        cb_att_write_mask &
-                       rp_att_write_mask);
+                       rp_att_write_mask &
+                       att_has_loc_mask);
+   }
+
+   if (BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_COLOR_ATTACHMENT_MAP)) {
+      int8_t loc_att[NVK_MAX_RTS] = { -1, -1, -1, -1, -1, -1, -1, -1};
+      uint8_t max_loc = 0;
+      uint32_t att_used = 0;
+      for (uint8_t a = 0; a < MESA_VK_MAX_COLOR_ATTACHMENTS; a++) {
+         if (dyn->cal.color_map[a] == MESA_VK_ATTACHMENT_UNUSED)
+            continue;
+
+         att_used |= BITFIELD_BIT(a);
+
+         assert(dyn->cal.color_map[a] < NVK_MAX_RTS);
+         loc_att[dyn->cal.color_map[a]] = a;
+         max_loc = MAX2(max_loc, dyn->cal.color_map[a]);
+      }
+
+      for (uint8_t l = 0; l < NVK_MAX_RTS; l++) {
+         if (loc_att[l] >= 0)
+            continue;
+
+         /* Just grab any color attachment.  The way we set up color targets
+          * in BeginRenderPass ensures that every color target is either the
+          * valid color target referenced by this render pass or a valid NULL
+          * target.  If we end up mapping to some other target in this render
+          * pass, the handling of att_has_loc_mask above will ensure that no
+          * color writes actually happen.
+          */
+         uint8_t a = ffs(~att_used) - 1;
+         att_used |= BITFIELD_BIT(a);
+         loc_att[l] = a;
+      }
+
+      P_IMMD(p, NV9097, SET_CT_SELECT, {
+         .target_count = max_loc + 1,
+         .target0 = loc_att[0],
+         .target1 = loc_att[1],
+         .target2 = loc_att[2],
+         .target3 = loc_att[3],
+         .target4 = loc_att[4],
+         .target5 = loc_att[5],
+         .target6 = loc_att[6],
+         .target7 = loc_att[7],
+      });
    }
 
    if (BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_CB_BLEND_CONSTANTS)) {
@@ -3070,6 +3151,12 @@ nvk_mme_bind_ib(struct mme_builder *b)
    struct mme_value64 addr = mme_load_addr64(b);
    struct mme_value size_B = mme_load(b);
 
+   struct mme_value addr_or = mme_or(b, addr.lo, addr.hi);
+   mme_if(b, ieq, addr_or, mme_zero()) {
+      mme_mov_to(b, size_B, mme_zero());
+   }
+   mme_free_reg(b, addr_or);
+
    if (b->devinfo->cls_eng3d < TURING_A) {
       mme_if(b, ieq, size_B, mme_zero()) {
          nvk_mme_load_scratch_to(b, addr.hi, ZERO_ADDR_HI);
@@ -3168,6 +3255,12 @@ nvk_mme_bind_vb(struct mme_builder *b)
    struct mme_value64 addr = mme_load_addr64(b);
    struct mme_value size_B = mme_load(b);
 
+   struct mme_value addr_or = mme_or(b, addr.lo, addr.hi);
+   mme_if(b, ieq, addr_or, mme_zero()) {
+      mme_mov_to(b, size_B, mme_zero());
+   }
+   mme_free_reg(b, addr_or);
+
    if (b->devinfo->cls_eng3d < TURING_A) {
       mme_if(b, ieq, size_B, mme_zero()) {
          nvk_mme_load_scratch_to(b, addr.hi, ZERO_ADDR_HI);
@@ -3203,27 +3296,34 @@ nvk_mme_bind_vb_test_check(const struct nv_device_info *devinfo,
                            const struct nvk_mme_test_case *test,
                            const struct nvk_mme_mthd_data *results)
 {
-   assert(results[0].mthd == NV9097_SET_VERTEX_STREAM_A_LOCATION_A(3));
-   assert(results[1].mthd == NV9097_SET_VERTEX_STREAM_A_LOCATION_B(3));
+   const uint32_t vb_idx = test->params[0];
+   const uint32_t addr_hi = test->params[1];
+   const uint32_t addr_lo = test->params[2];
+
+   uint32_t size_B = test->params[3];
+   if (addr_hi == 0 && addr_lo == 0)
+      size_B = 0;
+
+   assert(results[0].mthd == NV9097_SET_VERTEX_STREAM_A_LOCATION_A(vb_idx));
+   assert(results[1].mthd == NV9097_SET_VERTEX_STREAM_A_LOCATION_B(vb_idx));
 
    if (devinfo->cls_eng3d >= TURING_A) {
-      assert(results[0].data == test->params[1]);
-      assert(results[1].data == test->params[2]);
+      assert(results[0].data == addr_hi);
+      assert(results[1].data == addr_lo);
 
       assert(results[2].mthd == NVC597_SET_VERTEX_STREAM_SIZE_A(3));
       assert(results[3].mthd == NVC597_SET_VERTEX_STREAM_SIZE_B(3));
       assert(results[2].data == 0);
-      assert(results[3].data == test->params[3]);
+      assert(results[3].data == size_B);
    } else {
-      uint64_t vb_addr = ((uint64_t)test->params[1] << 32) | test->params[2];
-      const uint32_t size = test->params[3];
-      if (size == 0)
-         vb_addr = ((uint64_t)test->init[0].data << 32) | test->init[1].data;
+      uint64_t addr = ((uint64_t)addr_hi << 32) | addr_lo;
+      if (size_B == 0)
+         addr = ((uint64_t)test->init[0].data << 32) | test->init[1].data;
 
-      assert(results[0].data == vb_addr >> 32);
-      assert(results[1].data == (uint32_t)vb_addr);
+      assert(results[0].data == addr >> 32);
+      assert(results[1].data == (uint32_t)addr);
 
-      const uint64_t limit = (vb_addr + size) - 1;
+      const uint64_t limit = (addr + size_B) - 1;
       assert(results[2].mthd == NV9097_SET_VERTEX_STREAM_LIMIT_A_A(3));
       assert(results[3].mthd == NV9097_SET_VERTEX_STREAM_LIMIT_A_B(3));
       assert(results[2].data == limit >> 32);
@@ -3241,6 +3341,14 @@ const struct nvk_mme_test_case nvk_mme_bind_vb_tests[] = {{
       { }
    },
    .params = (uint32_t[]) { 3, 0xff3, 0xff4ab000, 0 },
+   .check = nvk_mme_bind_vb_test_check,
+}, {
+   .init = (struct nvk_mme_mthd_data[]) {
+      { NVK_SET_MME_SCRATCH(ZERO_ADDR_HI), 0xff3 },
+      { NVK_SET_MME_SCRATCH(ZERO_ADDR_LO), 0xff356000 },
+      { }
+   },
+   .params = (uint32_t[]) { 3, 0, 0, 0x800 },
    .check = nvk_mme_bind_vb_test_check,
 }, {}};
 

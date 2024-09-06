@@ -229,7 +229,7 @@ static enum vpe_status vpe_allocate_cm_memory(struct vpe_priv *vpe_priv, const s
     struct output_ctx  *output_ctx;
     enum vpe_status     status = VPE_STATUS_OK;
 
-    for (uint32_t stream_idx = 0; stream_idx < param->num_streams; stream_idx++) {
+    for (uint32_t stream_idx = 0; stream_idx < vpe_priv->num_streams; stream_idx++) {
         stream_ctx = &vpe_priv->stream_ctx[stream_idx];
 
         if (!stream_ctx->input_cs) {
@@ -640,7 +640,7 @@ enum vpe_status vpe_color_update_color_space_and_tf(
         vpe_update_geometric_scaling(vpe_priv, param, &geometric_update, &geometric_scaling);
         color_check_output_cm_update(vpe_priv, &vpe_priv->output_ctx.surface.cs, geometric_update);
 
-        for (stream_idx = 0; stream_idx < param->num_streams; stream_idx++) {
+        for (stream_idx = 0; stream_idx < vpe_priv->num_streams; stream_idx++) {
 
             new_matrix_scaling_factor = vpe_fixpt_one;
             stream_ctx = &vpe_priv->stream_ctx[stream_idx];
@@ -652,7 +652,7 @@ enum vpe_status vpe_color_update_color_space_and_tf(
             }
             bool is_3dlut_enable =
                 stream_ctx->stream.tm_params.UID != 0 || stream_ctx->stream.tm_params.enable_3dlut;
-            bool require_update = stream_ctx->UID_3DLUT != param->streams[stream_idx].tm_params.UID;
+            bool require_update = stream_ctx->uid_3dlut != param->streams[stream_idx].tm_params.UID;
 
             color_check_input_cm_update(vpe_priv, stream_ctx,
                 &param->streams[stream_idx].surface_info.cs, &param->streams[stream_idx].color_adj,
@@ -757,12 +757,12 @@ enum vpe_status vpe_color_update_movable_cm(
     struct stream_ctx *stream_ctx;
     struct output_ctx *output_ctx = &vpe_priv->output_ctx;
 
-    for (stream_idx = 0; stream_idx < param->num_streams; stream_idx++) {
+    for (stream_idx = 0; stream_idx < vpe_priv->num_streams; stream_idx++) {
         stream_ctx = &vpe_priv->stream_ctx[stream_idx];
 
         bool enable_3dlut = stream_ctx->stream.tm_params.UID != 0 || stream_ctx->stream.tm_params.enable_3dlut;
 
-        if (stream_ctx->UID_3DLUT != stream_ctx->stream.tm_params.UID) {
+        if (stream_ctx->uid_3dlut != stream_ctx->stream.tm_params.UID) {
 
             uint32_t                 shaper_norm_factor;
             struct vpe_color_space   tm_out_cs;
@@ -796,6 +796,19 @@ enum vpe_status vpe_color_update_movable_cm(
                 }
             }
 
+            if (enable_3dlut) {
+                if (!stream_ctx->lut3d_cache) { // setup cache if needed
+                    stream_ctx->lut3d_cache = vpe_zalloc(sizeof(struct vpe_3dlut_cache));
+                    if (!stream_ctx->lut3d_cache) {
+                        vpe_log("err: out of memory for 3d lut cache!");
+                        ret = VPE_STATUS_NO_MEMORY;
+                        goto exit;
+                    }
+                    stream_ctx->lut3d_cache->uid = 0;
+                }
+                // 3D Lut updated, invalid cache
+            }
+
             if (!output_ctx->gamut_remap) {
                 output_ctx->gamut_remap = vpe_zalloc(sizeof(struct colorspace_transform));
                 if (!output_ctx->gamut_remap) {
@@ -807,8 +820,7 @@ enum vpe_status vpe_color_update_movable_cm(
 
             //Blendgam is updated by output vpe_update_output_gamma_sequence
 
-            get_shaper_norm_factor(
-                &param->streams[stream_idx].tm_params, stream_ctx, &shaper_norm_factor);
+            get_shaper_norm_factor(&stream_ctx->stream.tm_params, stream_ctx, &shaper_norm_factor);
 
             vpe_color_tm_update_hdr_mult(SHAPER_EXP_MAX_IN, shaper_norm_factor,
                 &stream_ctx->lut3d_func->hdr_multiplier, enable_3dlut);
@@ -822,10 +834,12 @@ enum vpe_status vpe_color_update_movable_cm(
             vpe_color_update_gamut(vpe_priv, out_lut_cs, vpe_priv->output_ctx.cs,
                 output_ctx->gamut_remap, !enable_3dlut);
 
-            vpe_convert_to_tetrahedral(vpe_priv, param->streams[stream_idx].tm_params.lut_data,
-                stream_ctx->lut3d_func, enable_3dlut);
+            if ((enable_3dlut && !stream_ctx->stream.tm_params.UID) ||
+                    stream_ctx->lut3d_cache->uid != stream_ctx->stream.tm_params.UID)
+                vpe_convert_to_tetrahedral(vpe_priv, stream_ctx->stream.tm_params.lut_data,
+                    stream_ctx->lut3d_func, enable_3dlut);
 
-            stream_ctx->UID_3DLUT = param->streams[stream_idx].tm_params.UID;
+            stream_ctx->uid_3dlut = stream_ctx->stream.tm_params.UID;
         }
     }
 exit:

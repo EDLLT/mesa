@@ -11,6 +11,8 @@
   # A few exception are made, see `timeout:` overrides in the rest of this
   # file.
   timeout: 30m
+  # We don't want to download any previous job's artifacts
+  dependencies: []
   artifacts:
     name: "mesa_${CI_JOB_NAME}"
     when: always
@@ -54,16 +56,37 @@
   extends:
     - .build-linux
     - .use-debian/x86_64_build
-  stage: build-x86_64
+  stage: build-only
   variables:
     LLVM_VERSION: 15
   script:
     - .gitlab-ci/meson/build.sh
 
+
+# Make sure this list stays the same as all the jobs with
+# `stage: build-for-tests`
+.build-for-tests-jobs:
+  - job: debian-testing
+    optional: true
+  - job: debian-testing-asan
+    optional: true
+  - job: debian-arm32
+    optional: true
+  - job: debian-arm32-asan
+    optional: true
+  - job: debian-arm64
+    optional: true
+  - job: debian-arm64-asan
+    optional: true
+  - job: windows-msvc
+    optional: true
+
+
 debian-testing:
   extends:
     - .meson-build
     - .ci-deqp-artifacts
+  stage: build-for-tests
   variables:
     UNWIND: "enabled"
     DRI_LOADERS: >
@@ -73,7 +96,6 @@ debian-testing:
       -D glvnd=disabled
       -D platforms=x11,wayland
     GALLIUM_ST: >
-      -D dri3=enabled
       -D gallium-nine=true
       -D gallium-va=enabled
       -D gallium-rusticl=true
@@ -97,6 +119,7 @@ debian-testing:
 debian-testing-asan:
   extends:
     - debian-testing
+  stage: build-for-tests
   variables:
     C_ARGS: >
       -Wno-error=stringop-truncation
@@ -126,6 +149,7 @@ debian-testing-msan:
   # msan cannot fully work until it's used together with msan libc
   extends:
     - debian-clang
+  # `needs:` inherited from debian-clang
   variables:
     # l_undef is incompatible with msan
     EXTRA_OPTION:
@@ -158,6 +182,9 @@ debian-testing-msan:
 # Should be re-enabled once this problem has been fixed.
 .debian-build-testing:
   extends: .meson-build
+  needs:
+    - !reference [.meson-build, needs]
+    - !reference [.build-for-tests-jobs]
   variables:
     BUILDTYPE: debug
     UNWIND: "enabled"
@@ -168,7 +195,6 @@ debian-testing-msan:
       -D glvnd=disabled
       -D platforms=x11,wayland
     GALLIUM_ST: >
-      -D dri3=enabled
       -D gallium-extra-hud=true
       -D gallium-vdpau=enabled
       -D gallium-omx=bellagio
@@ -219,6 +245,9 @@ debian-testing-msan:
 # Test a release build with -Werror so new warnings don't sneak in.
 debian-release:
   extends: .meson-build
+  needs:
+    - !reference [.meson-build, needs]
+    - !reference [.build-for-tests-jobs]
   variables:
     LLVM_VERSION: 15
     UNWIND: "enabled"
@@ -231,7 +260,6 @@ debian-release:
       -D glvnd=disabled
       -D platforms=x11,wayland
     GALLIUM_ST: >
-      -D dri3=enabled
       -D gallium-extra-hud=true
       -D gallium-vdpau=enabled
       -D gallium-omx=disabled
@@ -259,7 +287,9 @@ alpine-build-testing:
   extends:
     - .meson-build
     - .use-alpine/x86_64_build
-  stage: build-x86_64
+  needs:
+    - !reference [.use-alpine/x86_64_build, needs]
+    - !reference [.build-for-tests-jobs]
   variables:
     BUILDTYPE: "release"
     C_ARGS: >
@@ -274,7 +304,6 @@ alpine-build-testing:
       -D platforms=wayland
     GALLIUM_DRIVERS: "crocus,etnaviv,freedreno,iris,lima,nouveau,panfrost,r300,r600,radeonsi,svga,llvmpipe,softpipe,tegra,v3d,vc4,virgl,zink"
     GALLIUM_ST: >
-      -D dri3=enabled
       -D gallium-extra-hud=true
       -D gallium-vdpau=disabled
       -D gallium-omx=disabled
@@ -295,6 +324,9 @@ fedora-release:
   extends:
     - .meson-build
     - .use-fedora/x86_64_build
+  needs:
+    - !reference [.use-fedora/x86_64_build, needs]
+    - !reference [.build-for-tests-jobs]
   variables:
     BUILDTYPE: "release"
     C_LINK_ARGS: >
@@ -323,7 +355,6 @@ fedora-release:
       -D teflon=true
     GALLIUM_DRIVERS: "crocus,etnaviv,freedreno,i915,iris,lima,nouveau,panfrost,r300,r600,radeonsi,svga,llvmpipe,softpipe,tegra,v3d,vc4,virgl,zink"
     GALLIUM_ST: >
-      -D dri3=enabled
       -D gallium-extra-hud=true
       -D gallium-vdpau=enabled
       -D gallium-omx=disabled
@@ -345,6 +376,9 @@ debian-android:
     - .meson-cross
     - .use-debian/android_build
     - .ci-deqp-artifacts
+  needs:
+    - !reference [.use-debian/android_build, needs]
+    - !reference [.build-for-tests-jobs]
   variables:
     BUILDTYPE: debug
     UNWIND: "disabled"
@@ -373,7 +407,6 @@ debian-android:
       -D android-libbacktrace=disabled
       -D intel-clc=system
     GALLIUM_ST: >
-      -D dri3=disabled
       -D gallium-vdpau=disabled
       -D gallium-omx=disabled
       -D gallium-va=disabled
@@ -408,7 +441,6 @@ debian-android:
 .meson-cross:
   extends:
     - .meson-build
-  stage: build-misc
   variables:
     UNWIND: "disabled"
     DRI_LOADERS: >
@@ -418,7 +450,6 @@ debian-android:
       -D platforms=x11,wayland
       -D osmesa=false
     GALLIUM_ST: >
-      -D dri3=enabled
       -D gallium-vdpau=disabled
       -D gallium-omx=disabled
       -D gallium-va=disabled
@@ -442,6 +473,7 @@ debian-arm32:
   extends:
     - .meson-arm
     - .ci-deqp-artifacts
+  stage: build-for-tests
   variables:
     CROSS: armhf
     DRI_LOADERS:
@@ -463,6 +495,7 @@ debian-arm32:
 debian-arm32-asan:
   extends:
     - debian-arm32
+  stage: build-for-tests
   variables:
     DRI_LOADERS:
       -D glvnd=disabled
@@ -479,6 +512,7 @@ debian-arm64:
   extends:
     - .meson-arm
     - .ci-deqp-artifacts
+  stage: build-for-tests
   variables:
     C_ARGS: >
       -Wno-error=array-bounds
@@ -502,6 +536,7 @@ debian-arm64:
 debian-arm64-asan:
   extends:
     - debian-arm64
+  stage: build-for-tests
   variables:
     DRI_LOADERS:
       -D glvnd=disabled
@@ -517,6 +552,9 @@ debian-arm64-build-test:
   extends:
     - .meson-arm
     - .ci-deqp-artifacts
+  needs:
+    - !reference [.meson-arm, needs]
+    - !reference [.build-for-tests-jobs]
   variables:
     VULKAN_DRIVERS: "amd,nouveau"
     DRI_LOADERS:
@@ -527,6 +565,10 @@ debian-arm64-build-test:
 debian-arm64-release:
   extends:
     - debian-arm64
+  stage: build-only
+  needs:
+    - !reference [debian-arm64, needs]
+    - !reference [.build-for-tests-jobs]
   variables:
     BUILDTYPE: release
     S3_ARTIFACT_NAME: mesa-arm64-default-${BUILDTYPE}
@@ -540,6 +582,9 @@ debian-arm64-release:
 
 debian-clang:
   extends: .meson-build
+  needs:
+    - !reference [.meson-build, needs]
+    - !reference [.build-for-tests-jobs]
   variables:
     BUILDTYPE: debug
     LLVM_VERSION: 15
@@ -562,7 +607,6 @@ debian-clang:
       -D glvnd=enabled
       -D platforms=x11,wayland
     GALLIUM_ST: >
-      -D dri3=enabled
       -D gallium-extra-hud=true
       -D gallium-vdpau=enabled
       -D gallium-omx=bellagio
@@ -594,13 +638,13 @@ debian-clang:
 
 debian-clang-release:
   extends: debian-clang
+  # `needs:` inherited from debian-clang
   variables:
     BUILDTYPE: "release"
     DRI_LOADERS: >
       -D glx=xlib
       -D platforms=x11,wayland
     GALLIUM_ST: >
-      -D dri3=enabled
       -D gallium-extra-hud=true
       -D gallium-vdpau=enabled
       -D gallium-omx=bellagio
@@ -620,7 +664,7 @@ windows-msvc:
     - .build-windows
     - .use-windows_build_msvc
     - .windows-build-rules
-  stage: build-misc
+  stage: build-for-tests
   script:
     - pwsh -ExecutionPolicy RemoteSigned .\.gitlab-ci\windows\mesa_build.ps1
   artifacts:
@@ -630,6 +674,9 @@ windows-msvc:
 
 debian-vulkan:
   extends: .meson-build
+  needs:
+    - !reference [.meson-build, needs]
+    - !reference [.build-for-tests-jobs]
   variables:
     BUILDTYPE: debug
     LLVM_VERSION: 15
@@ -645,7 +692,6 @@ debian-vulkan:
       -D platforms=x11,wayland
       -D osmesa=false
     GALLIUM_ST: >
-      -D dri3=enabled
       -D gallium-vdpau=disabled
       -D gallium-omx=disabled
       -D gallium-va=disabled
@@ -667,6 +713,9 @@ debian-x86_32:
   extends:
     - .meson-cross
     - .use-debian/x86_32_build
+  needs:
+    - !reference [.use-debian/x86_32_build, needs]
+    - !reference [.build-for-tests-jobs]
   variables:
     BUILDTYPE: debug
     CROSS: i386
@@ -695,16 +744,19 @@ debian-x86_32:
 # In case of issues with this job, contact @ajax
 debian-s390x:
   extends:
-    - debian-ppc64el
+    - .meson-cross
     - .use-debian/s390x_build
-    - .s390x-rules
+  needs:
+    - !reference [.use-debian/s390x_build, needs]
+    - !reference [.build-for-tests-jobs]
   tags:
     - kvm
   variables:
+    BUILDTYPE: debug
     CROSS: s390x
-    GALLIUM_DRIVERS: "llvmpipe,zink"
+    GALLIUM_DRIVERS: "llvmpipe,virgl,zink"
     LLVM_VERSION: 15
-    VULKAN_DRIVERS: "swrast"
+    VULKAN_DRIVERS: "swrast,virtio"
     DRI_LOADERS:
       -D glvnd=disabled
 
@@ -712,7 +764,9 @@ debian-ppc64el:
   extends:
     - .meson-cross
     - .use-debian/ppc64el_build
-    - .ppc64el-rules
+  needs:
+    - !reference [.use-debian/ppc64el_build, needs]
+    - !reference [.build-for-tests-jobs]
   variables:
     BUILDTYPE: debug
     CROSS: ppc64el

@@ -532,8 +532,11 @@ print_instr_format_specific(enum amd_gfx_level gfx_level, const Instruction* ins
    }
    case Format::MIMG: {
       const MIMG_instruction& mimg = instr->mimg();
-      unsigned identity_dmask =
-         !instr->definitions.empty() ? (1 << instr->definitions[0].size()) - 1 : 0xf;
+      unsigned identity_dmask = 0xf;
+      if (!instr->definitions.empty()) {
+         unsigned num_channels = instr->definitions[0].bytes() / (mimg.d16 ? 2 : 4);
+         identity_dmask = (1 << num_channels) - 1;
+      }
       if ((mimg.dmask & identity_dmask) != identity_dmask)
          fprintf(output, " dmask:%s%s%s%s", mimg.dmask & 0x1 ? "x" : "",
                  mimg.dmask & 0x2 ? "y" : "", mimg.dmask & 0x4 ? "z" : "",
@@ -1022,7 +1025,9 @@ aco_print_instr(enum amd_gfx_level gfx_level, const Instruction* instr, FILE* ou
             fprintf(output, " ");
 
          if (i < 3) {
-            if (neg[i])
+            if (neg[i] && instr->operands[i].isConstant())
+               fprintf(output, "neg(");
+            else if (neg[i])
                fprintf(output, "-");
             if (abs[i])
                fprintf(output, "|");
@@ -1043,6 +1048,8 @@ aco_print_instr(enum amd_gfx_level gfx_level, const Instruction* instr, FILE* ou
             if (opsel_lo[i] || !opsel_hi[i])
                fprintf(output, ".%c%c", opsel_lo[i] ? 'y' : 'x', opsel_hi[i] ? 'y' : 'x');
 
+            if (neg[i] && instr->operands[i].isConstant())
+               fprintf(output, ")");
             if (neg_lo[i])
                fprintf(output, "*[-1,1]");
             if (neg_hi[i])
